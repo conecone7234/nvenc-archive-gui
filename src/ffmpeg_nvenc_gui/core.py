@@ -112,6 +112,7 @@ class EncodeProfile:
     preset: str = "p7"
     cpu_preset: str = "medium"
     tune: str = "hq"
+    cpu_tune: str = "none"
     rate_mode: str = "CQ"
     cq_value: int = 18
     bitrate: str = "25000k"
@@ -133,6 +134,7 @@ class EncodeProfile:
         self.preset = str(self.preset or "p7").strip()
         self.cpu_preset = str(self.cpu_preset or "medium").strip()
         self.tune = str(self.tune or "hq").strip()
+        self.cpu_tune = str(self.cpu_tune or "none").strip()
         self.rate_mode = str(self.rate_mode or "CQ").strip().upper()
         self.bitrate = str(self.bitrate or "").strip()
         self.maxrate = str(self.maxrate or "").strip()
@@ -185,14 +187,21 @@ class EncodeProfile:
         base_paths = paths or build_paths()
         default_gpus = [] if gpus is None else gpus
         base = asdict(default_profile(base_paths, default_gpus))
-        base.update(dataclass_values(EncodeProfile, data))
+        explicit_values = dataclass_values(EncodeProfile, data)
+        base.update(explicit_values)
         raw_outputs = base.get("outputs")
         if not isinstance(raw_outputs, list):
             raw_outputs = []
         base["outputs"] = [OutputVariant.from_dict(x) for x in raw_outputs]
         if not base["outputs"]:
             base["outputs"] = default_outputs()
-        return normalize_profile_gpu(EncodeProfile(**base), default_gpus)
+        profile = normalize_profile_gpu(EncodeProfile(**base), default_gpus)
+        if not profile.use_gpu:
+            cpu_defaults = default_profile(base_paths, [])
+            for key in ("max_parallel_jobs", "cq_value", "bitrate", "maxrate", "bufsize", "cpu_preset", "cpu_tune"):
+                if key not in explicit_values:
+                    setattr(profile, key, getattr(cpu_defaults, key))
+        return profile
 
 
 @dataclass
@@ -385,6 +394,12 @@ def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> En
         gpu_name=gpu.name if gpu else "",
         codec="hevc_nvenc",
         cpu_codec="libx264",
+        cpu_preset="medium",
+        cpu_tune="none",
+        cq_value=18 if gpu else 23,
+        bitrate="25000k" if gpu else "8000k",
+        maxrate="40000k" if gpu else "12000k",
+        bufsize="80000k" if gpu else "24000k",
         outputs=default_outputs(),
     )
 
@@ -545,6 +560,8 @@ def build_video_encoder_args(profile: EncodeProfile) -> List[str]:
             cmd += ["-tune:v", profile.tune]
     else:
         cmd += ["-preset:v", profile.cpu_preset]
+        if profile.cpu_tune != "none":
+            cmd += ["-tune:v", profile.cpu_tune]
 
     mode_name = profile.rate_mode.upper()
     if is_nvenc_codec(codec):
@@ -760,6 +777,7 @@ def job_fingerprint(profile: EncodeProfile, variant: OutputVariant) -> str:
         "preset": profile.preset,
         "cpu_preset": profile.cpu_preset,
         "tune": profile.tune,
+        "cpu_tune": profile.cpu_tune,
         "rate_mode": profile.rate_mode,
         "cq_value": profile.cq_value,
         "bitrate": profile.bitrate,

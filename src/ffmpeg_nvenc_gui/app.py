@@ -941,7 +941,12 @@ class EncoderApp:
             self.render_scan_rows(profile)
             self.log(f"{profile.name}: フォルダ設定が不足しています: {profile_dir_label_text(missing_dirs)}")
             return
-        self.files = scan_profile_files(profile)
+        files = self.scan_profile_files_or_show_error(profile)
+        if files is None:
+            self.files = []
+            self.render_scan_rows(profile)
+            return
+        self.files = files
         self.render_scan_rows(profile)
         if not profile_input_dir(profile).exists():
             self.log(f"入力フォルダはまだありません: {profile.input_dir}")
@@ -1025,13 +1030,34 @@ class EncoderApp:
             return False
         return True
 
+    def ensure_profile_dirs_or_show_error(self, profile: EncodeProfile) -> bool:
+        try:
+            ensure_profile_dirs(profile)
+        except OSError as exc:
+            messagebox.showerror("フォルダ作成エラー", f"入出力フォルダを作成できませんでした。\n{exc}")
+            self.log(f"Profile folder setup failed: {exc}")
+            return False
+        return True
+
+    def scan_profile_files_or_show_error(self, profile: EncodeProfile) -> Optional[List[FileStatus]]:
+        try:
+            return scan_profile_files(profile)
+        except OSError as exc:
+            messagebox.showerror("フォルダ読み込みエラー", f"入力フォルダを読み込めませんでした。\n{exc}")
+            self.log(f"Profile scan failed: {exc}")
+            return None
+
     def start_current_profile(self) -> None:
         profile = normalize_profile_gpu(self.current_profile(), self.gpus)
         if not self.validate_profile_before_run(profile):
             return
 
-        ensure_profile_dirs(profile)
-        self.files = scan_profile_files(profile)
+        if not self.ensure_profile_dirs_or_show_error(profile):
+            return
+        files = self.scan_profile_files_or_show_error(profile)
+        if files is None:
+            return
+        self.files = files
         if not self.files:
             messagebox.showwarning("対象なし", "入力フォルダに動画ファイルがありません。")
             self.scan_files()
@@ -1057,6 +1083,8 @@ class EncoderApp:
         profile = normalize_profile_gpu(profile_from_state(data, self.paths, self.gpus), self.gpus)
         if not self.validate_profile_before_run(profile):
             return
+        if not self.ensure_profile_dirs_or_show_error(profile):
+            return
         specs = resumable_specs(profile, data)
         if not specs:
             clear_state(self.paths)
@@ -1067,7 +1095,6 @@ class EncoderApp:
         if not self.ensure_ffmpeg_before_run():
             return
 
-        ensure_profile_dirs(profile)
         self.start_specs(profile, specs, save=True)
 
     def start_specs(self, profile: EncodeProfile, specs: List[JobSpec], save: bool) -> None:
@@ -1425,9 +1452,14 @@ class EncoderApp:
         moved = 0
         kept = 0
         archive_dir = profile_archive_dir(profile)
-        archive_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            statuses = scan_profile_files(profile)
+        except OSError as exc:
+            self.log(f"Move skipped: profile folder access failed / {exc}")
+            return
 
-        for status in scan_profile_files(profile):
+        for status in statuses:
             src = status.path
             missing = []
             for variant in profile.outputs:

@@ -111,34 +111,30 @@ def extract_ffmpeg_exe(zip_path: Path, ffmpeg_path: Path, progress: ProgressCall
     extract_binary_exe(zip_path, "ffmpeg.exe", ffmpeg_path, progress)
 
 
-def verify_ffmpeg_basic(ffmpeg_path: Path) -> None:
-    result = subprocess.run(
-        [str(ffmpeg_path), "-hide_banner", "-version"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=20,
-        check=False,
-    )
+def verify_binary_basic(binary_path: Path, binary_name: str) -> None:
+    try:
+        result = subprocess.run(
+            [str(binary_path), "-hide_banner", "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise FfmpegDownloadError(f"{binary_name} exists, but it could not run: {exc}") from exc
     if result.returncode != 0:
-        raise FfmpegDownloadError("ffmpeg.exe exists, but it did not run.")
+        raise FfmpegDownloadError(f"{binary_name} exists, but it did not run.")
+
+
+def verify_ffmpeg_basic(ffmpeg_path: Path) -> None:
+    verify_binary_basic(ffmpeg_path, "ffmpeg.exe")
 
 
 def verify_ffprobe_basic(ffprobe_path: Path) -> None:
-    result = subprocess.run(
-        [str(ffprobe_path), "-hide_banner", "-version"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=20,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise FfmpegDownloadError("ffprobe.exe exists, but it did not run.")
+    verify_binary_basic(ffprobe_path, "ffprobe.exe")
 
 
 def verify_nvenc(ffmpeg_path: Path) -> bool:

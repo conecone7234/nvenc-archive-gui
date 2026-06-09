@@ -3,6 +3,8 @@ import sys
 import threading
 from pathlib import Path
 
+import ffmpeg_nvenc_gui.app as app_module
+import ffmpeg_nvenc_gui.ffmpeg_downloader as downloader
 from ffmpeg_nvenc_gui.core import (
     EncodeProfile,
     GpuInfo,
@@ -35,7 +37,14 @@ from ffmpeg_nvenc_gui.core import (
     write_concat_file,
 )
 from ffmpeg_nvenc_gui.app import EncoderApp, RuntimeJob
-from ffmpeg_nvenc_gui.ffmpeg_downloader import find_binary_member, find_ffmpeg_member, missing_binaries
+from ffmpeg_nvenc_gui.ffmpeg_downloader import (
+    FfmpegDownloadError,
+    find_binary_member,
+    find_ffmpeg_member,
+    missing_binaries,
+    verify_ffmpeg_basic,
+    verify_ffprobe_basic,
+)
 
 
 def make_profile(tmp_path: Path) -> EncodeProfile:
@@ -558,3 +567,64 @@ def test_missing_binaries_preserves_existing_ffmpeg(tmp_path: Path):
 
     assert "ffmpeg.exe" not in missing
     assert missing == {"ffprobe.exe": paths.ffprobe_path}
+
+
+def test_verify_binaries_wrap_oserror():
+    original_run = downloader.subprocess.run
+
+    def raise_oserror(*args, **kwargs):
+        raise OSError("permission denied")
+
+    downloader.subprocess.run = raise_oserror
+    try:
+        for verify, binary_name in (
+            (verify_ffmpeg_basic, "ffmpeg.exe"),
+            (verify_ffprobe_basic, "ffprobe.exe"),
+        ):
+            try:
+                verify(Path(binary_name))
+            except FfmpegDownloadError as exc:
+                text = str(exc)
+                assert binary_name in text
+                assert "permission denied" in text
+            else:
+                raise AssertionError(f"{binary_name} OSError was not wrapped")
+    finally:
+        downloader.subprocess.run = original_run
+
+
+def test_encoder_app_filesystem_errors_show_messagebox(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    app.log_messages = []
+    app.log = app.log_messages.append
+    profile = make_profile(tmp_path)
+    messages = []
+
+    original_ensure = app_module.ensure_profile_dirs
+    original_scan = app_module.scan_profile_files
+    original_showerror = app_module.messagebox.showerror
+
+    def showerror(title, message):
+        messages.append((title, message))
+
+    def raise_setup_error(profile):
+        raise OSError("setup denied")
+
+    def raise_scan_error(profile):
+        raise OSError("scan denied")
+
+    app_module.messagebox.showerror = showerror
+    app_module.ensure_profile_dirs = raise_setup_error
+    app_module.scan_profile_files = raise_scan_error
+    try:
+        assert app.ensure_profile_dirs_or_show_error(profile) is False
+        assert app.scan_profile_files_or_show_error(profile) is None
+        app.move_finished_sources(profile)
+    finally:
+        app_module.ensure_profile_dirs = original_ensure
+        app_module.scan_profile_files = original_scan
+        app_module.messagebox.showerror = original_showerror
+
+    assert any("setup denied" in message for _, message in messages)
+    assert any("scan denied" in message for _, message in messages)
+    assert any("Move skipped" in message for message in app.log_messages)

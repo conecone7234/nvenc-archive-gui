@@ -1310,20 +1310,27 @@ class EncoderApp:
             bufsize=1,
             creationflags=creationflags,
         )
-        job.process = process
+        with self.lock:
+            job.process = process
+            stop_requested = self.stop_requested
+        if stop_requested and process.poll() is None:
+            process.kill()
 
-        if process.stdout is not None:
-            for raw_line in process.stdout:
-                line = raw_line.rstrip("\r\n")
-                if line:
-                    log_fp.write(line + "\n")
-                    log_fp.flush()
-                    self.log(f"job {job.job_id}: {line}")
-                    self._update_job_progress_from_line(job, line, segment_duration)
+        try:
+            if process.stdout is not None:
+                for raw_line in process.stdout:
+                    line = raw_line.rstrip("\r\n")
+                    if line:
+                        log_fp.write(line + "\n")
+                        log_fp.flush()
+                        self.log(f"job {job.job_id}: {line}")
+                        self._update_job_progress_from_line(job, line, segment_duration)
 
-        ret = process.wait()
-        job.process = None
-        return ret
+            return process.wait()
+        finally:
+            with self.lock:
+                if job.process is process:
+                    job.process = None
 
     def _update_job_progress_from_line(
         self,
@@ -1405,9 +1412,11 @@ class EncoderApp:
                     break
 
         for job in jobs:
-            if job.process is not None and job.process.poll() is None:
+            with self.lock:
+                process = job.process
+            if process is not None and process.poll() is None:
                 try:
-                    job.process.kill()
+                    process.kill()
                 except Exception:
                     pass
         self.log("中断を送信しました。完了済みセグメントは保持します。")

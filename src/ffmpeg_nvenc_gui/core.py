@@ -377,7 +377,7 @@ def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> En
 def read_json_object(path: Path) -> Optional[Dict[str, Any]]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict):
         return None

@@ -1,4 +1,6 @@
 import json
+import sys
+import threading
 from pathlib import Path
 
 from ffmpeg_nvenc_gui.core import (
@@ -31,8 +33,8 @@ from ffmpeg_nvenc_gui.core import (
     segment_ranges,
     write_concat_file,
 )
-from ffmpeg_nvenc_gui.app import EncoderApp
-from ffmpeg_nvenc_gui.ffmpeg_downloader import find_binary_member, find_ffmpeg_member
+from ffmpeg_nvenc_gui.app import EncoderApp, RuntimeJob
+from ffmpeg_nvenc_gui.ffmpeg_downloader import find_binary_member, find_ffmpeg_member, missing_binaries
 
 
 def make_profile(tmp_path: Path) -> EncodeProfile:
@@ -350,6 +352,9 @@ def test_corrupt_json_files_fall_back_safely(tmp_path: Path):
     paths.config_file.write_text(json.dumps({"profiles": {"bad": "shape"}}), encoding="utf-8")
     assert len(load_profiles(paths, [])) == 1
 
+    paths.state_file.write_bytes(b"\xff\xfe{not utf8")
+    assert load_state(paths) is None
+
 
 def test_ensure_profile_dirs_uses_resolved_profile_paths(tmp_path: Path):
     profile = make_profile(tmp_path)
@@ -440,6 +445,29 @@ def test_encoder_app_profile_helpers_use_ids_for_duplicates(tmp_path: Path):
     assert EncoderApp.unique_profile_name(app, "Profile") == "Profile 5"
 
 
+def test_run_process_publishes_process_under_lock_and_honors_stop(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    app.stop_requested = True
+    app.log = lambda _text: None
+    profile = make_profile(tmp_path)
+    job = RuntimeJob(
+        job_id=1,
+        spec=JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=profile.outputs[0].id),
+        profile=profile,
+        variant=profile.outputs[0],
+        tmp_out=tmp_path / "tmp.mp4",
+        out_file=tmp_path / "out.mp4",
+        log_file=tmp_path / "job.log",
+    )
+
+    with open(job.log_file, "w", encoding="utf-8") as log_fp:
+        ret = app.run_process(job, [sys.executable, "-c", "import time; time.sleep(5)"], log_fp, None)
+
+    assert ret != 0
+    assert job.process is None
+
+
 def test_state_resume_filters_completed_jobs(tmp_path: Path):
     paths = build_paths(tmp_path)
     profile = make_profile(tmp_path)
@@ -491,3 +519,14 @@ def test_find_ffmpeg_and_ffprobe_members():
     ]
     assert find_ffmpeg_member(names) == "ffmpeg-2026-essentials_build/bin/ffmpeg.exe"
     assert find_binary_member(names, "ffprobe.exe") == "ffmpeg-2026-essentials_build/bin/ffprobe.exe"
+
+
+def test_missing_binaries_preserves_existing_ffmpeg(tmp_path: Path):
+    paths = build_paths(tmp_path)
+    paths.ffmpeg_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.ffmpeg_path.write_bytes(b"custom ffmpeg")
+
+    missing = missing_binaries(paths)
+
+    assert "ffmpeg.exe" not in missing
+    assert missing == {"ffprobe.exe": paths.ffprobe_path}

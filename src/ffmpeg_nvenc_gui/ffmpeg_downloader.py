@@ -45,6 +45,14 @@ def check_ffmpeg_exists(paths: AppPaths) -> bool:
     return paths.ffmpeg_path.exists() and paths.ffprobe_path.exists()
 
 
+def missing_binaries(paths: AppPaths) -> dict[str, Path]:
+    targets = {
+        "ffmpeg.exe": paths.ffmpeg_path,
+        "ffprobe.exe": paths.ffprobe_path,
+    }
+    return {name: path for name, path in targets.items() if not path.exists()}
+
+
 def download_file(url: str, dest: Path, progress: ProgressCallback = None) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
@@ -170,9 +178,10 @@ def ensure_ffmpeg_available(
         raise FfmpegDownloadError("Auto download is supported only on Windows.")
 
     zip_path = paths.download_dir / "ffmpeg-release-essentials.zip"
+    missing = missing_binaries(paths)
     download_file(url, zip_path, progress)
-    extract_ffmpeg_exe(zip_path, paths.ffmpeg_path, progress)
-    extract_binary_exe(zip_path, "ffprobe.exe", paths.ffprobe_path, progress)
+    for binary_name, dest_path in missing.items():
+        extract_binary_exe(zip_path, binary_name, dest_path, progress)
     verify_ffmpeg_basic(paths.ffmpeg_path)
     verify_ffprobe_basic(paths.ffprobe_path)
 

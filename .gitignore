@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.spec
+OBSData/
+SourceData/
+SourceData(MP4)/
+SourceData(4K)/
+tmp/
+ffmpeg/

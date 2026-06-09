@@ -19,11 +19,11 @@ class FfmpegDownloadError(RuntimeError):
     pass
 
 
-def find_ffmpeg_member(names: Iterable[str]) -> Optional[str]:
+def find_binary_member(names: Iterable[str], binary_name: str) -> Optional[str]:
     candidates = []
     for name in names:
         normalized = name.replace("\\", "/")
-        if normalized.lower().endswith("/bin/ffmpeg.exe"):
+        if normalized.lower().endswith(f"/bin/{binary_name.lower()}"):
             candidates.append(name)
 
     if not candidates:
@@ -33,12 +33,24 @@ def find_ffmpeg_member(names: Iterable[str]) -> Optional[str]:
     return candidates[0]
 
 
+def find_ffmpeg_member(names: Iterable[str]) -> Optional[str]:
+    return find_binary_member(names, "ffmpeg.exe")
+
+
 def is_windows() -> bool:
     return os.name == "nt"
 
 
 def check_ffmpeg_exists(paths: AppPaths) -> bool:
-    return paths.ffmpeg_path.exists()
+    return paths.ffmpeg_path.exists() and paths.ffprobe_path.exists()
+
+
+def missing_binaries(paths: AppPaths) -> dict[str, Path]:
+    targets = {
+        "ffmpeg.exe": paths.ffmpeg_path,
+        "ffprobe.exe": paths.ffprobe_path,
+    }
+    return {name: path for name, path in targets.items() if not path.exists()}
 
 
 def download_file(url: str, dest: Path, progress: ProgressCallback = None) -> None:
@@ -74,40 +86,55 @@ def download_file(url: str, dest: Path, progress: ProgressCallback = None) -> No
         progress(f"Download finished: {dest}")
 
 
-def extract_ffmpeg_exe(zip_path: Path, ffmpeg_path: Path, progress: ProgressCallback = None) -> None:
+def extract_binary_exe(zip_path: Path, binary_name: str, dest_path: Path, progress: ProgressCallback = None) -> None:
     if progress:
-        progress("Extract ffmpeg.exe")
+        progress(f"Extract {binary_name}")
 
     with zipfile.ZipFile(zip_path, "r") as zf:
-        member = find_ffmpeg_member(zf.namelist())
+        member = find_binary_member(zf.namelist(), binary_name)
         if member is None:
-            raise FfmpegDownloadError("ffmpeg.exe was not found in zip.")
+            raise FfmpegDownloadError(f"{binary_name} was not found in zip.")
 
-        ffmpeg_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_exe = ffmpeg_path.with_suffix(".exe.tmp")
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_exe = dest_path.with_suffix(".exe.tmp")
 
         with zf.open(member, "r") as src, open(tmp_exe, "wb") as dst:
             shutil.copyfileobj(src, dst)
 
-        tmp_exe.replace(ffmpeg_path)
+        tmp_exe.replace(dest_path)
 
     if progress:
-        progress(f"Installed: {ffmpeg_path}")
+        progress(f"Installed: {dest_path}")
+
+
+def extract_ffmpeg_exe(zip_path: Path, ffmpeg_path: Path, progress: ProgressCallback = None) -> None:
+    extract_binary_exe(zip_path, "ffmpeg.exe", ffmpeg_path, progress)
+
+
+def verify_binary_basic(binary_path: Path, binary_name: str) -> None:
+    try:
+        result = subprocess.run(
+            [str(binary_path), "-hide_banner", "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise FfmpegDownloadError(f"{binary_name} exists, but it could not run: {exc}") from exc
+    if result.returncode != 0:
+        raise FfmpegDownloadError(f"{binary_name} exists, but it did not run.")
 
 
 def verify_ffmpeg_basic(ffmpeg_path: Path) -> None:
-    result = subprocess.run(
-        [str(ffmpeg_path), "-hide_banner", "-version"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=20,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise FfmpegDownloadError("ffmpeg.exe exists, but it did not run.")
+    verify_binary_basic(ffmpeg_path, "ffmpeg.exe")
+
+
+def verify_ffprobe_basic(ffprobe_path: Path) -> None:
+    verify_binary_basic(ffprobe_path, "ffprobe.exe")
 
 
 def verify_nvenc(ffmpeg_path: Path) -> bool:
@@ -137,6 +164,7 @@ def ensure_ffmpeg_available(
 
     if check_ffmpeg_exists(paths):
         verify_ffmpeg_basic(paths.ffmpeg_path)
+        verify_ffprobe_basic(paths.ffprobe_path)
         return True
 
     if not auto_download:
@@ -146,9 +174,12 @@ def ensure_ffmpeg_available(
         raise FfmpegDownloadError("Auto download is supported only on Windows.")
 
     zip_path = paths.download_dir / "ffmpeg-release-essentials.zip"
+    missing = missing_binaries(paths)
     download_file(url, zip_path, progress)
-    extract_ffmpeg_exe(zip_path, paths.ffmpeg_path, progress)
+    for binary_name, dest_path in missing.items():
+        extract_binary_exe(zip_path, binary_name, dest_path, progress)
     verify_ffmpeg_basic(paths.ffmpeg_path)
+    verify_ffprobe_basic(paths.ffprobe_path)
 
     if progress:
         if verify_nvenc(paths.ffmpeg_path):

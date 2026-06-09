@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -23,6 +23,13 @@ RESOLUTION_PRESETS: Dict[str, Optional[int]] = {
 }
 SAFE_CONTAINER_RE = re.compile(r"^[a-z0-9]{1,8}$")
 FASTSTART_CONTAINERS = {"mp4", "m4v", "mov", "ismv"}
+
+
+def dataclass_values(cls: Any, data: object) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    names = {item.name for item in fields(cls)}
+    return {key: value for key, value in data.items() if key in names}
 
 
 @dataclass
@@ -53,8 +60,24 @@ class OutputVariant:
     enabled: bool = True
 
     def __post_init__(self) -> None:
+        self.id = str(self.id or "").strip()
+        self.name = str(self.name or "").strip()
+        self.folder_name = str(self.folder_name or "").strip()
         if not self.id:
             self.id = new_id("variant")
+        if self.height in ("", None):
+            self.height = None
+        else:
+            try:
+                self.height = int(self.height)
+            except (TypeError, ValueError):
+                self.height = None
+            if self.height is not None and self.height < 1:
+                self.height = None
+        if isinstance(self.enabled, str):
+            self.enabled = self.enabled.strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            self.enabled = bool(self.enabled)
         self.folder_name = safe_folder_name(self.folder_name or self.name or self.id)
         self.container = normalize_container_extension(self.container)
 
@@ -68,7 +91,7 @@ class OutputVariant:
             "container": "mp4",
             "enabled": True,
         }
-        base.update(data or {})
+        base.update(dataclass_values(OutputVariant, data))
         return OutputVariant(**base)
 
 
@@ -98,6 +121,61 @@ class EncodeProfile:
     scale_flags: str = "lanczos+accurate_rnd"
     outputs: List[OutputVariant] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.id = str(self.id or "").strip() or new_id("profile")
+        self.name = str(self.name or "").strip() or self.id
+        self.input_dir = str(self.input_dir or "").strip()
+        self.output_dir = str(self.output_dir or "").strip()
+        self.archive_dir = str(self.archive_dir or "").strip()
+        self.gpu_name = str(self.gpu_name or "").strip()
+        self.codec = str(self.codec or "hevc_nvenc").strip()
+        self.cpu_codec = str(self.cpu_codec or "libx264").strip()
+        self.preset = str(self.preset or "p7").strip()
+        self.cpu_preset = str(self.cpu_preset or "medium").strip()
+        self.tune = str(self.tune or "hq").strip()
+        self.rate_mode = str(self.rate_mode or "CQ").strip().upper()
+        self.bitrate = str(self.bitrate or "").strip()
+        self.maxrate = str(self.maxrate or "").strip()
+        self.bufsize = str(self.bufsize or "").strip()
+        self.pix_fmt = str(self.pix_fmt or "nv12").strip()
+        self.scale_flags = str(self.scale_flags or "lanczos+accurate_rnd").strip()
+
+        try:
+            self.max_parallel_jobs = max(1, int(self.max_parallel_jobs))
+        except (TypeError, ValueError):
+            self.max_parallel_jobs = 1
+        try:
+            self.segment_minutes = max(1, int(self.segment_minutes))
+        except (TypeError, ValueError):
+            self.segment_minutes = 10
+        try:
+            self.gpu_index = max(0, int(self.gpu_index))
+        except (TypeError, ValueError):
+            self.gpu_index = 0
+        try:
+            self.cq_value = int(self.cq_value)
+        except (TypeError, ValueError):
+            self.cq_value = 18
+
+        if isinstance(self.use_gpu, str):
+            self.use_gpu = self.use_gpu.strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            self.use_gpu = bool(self.use_gpu)
+
+        raw_outputs = self.outputs if isinstance(self.outputs, list) else []
+        normalized_outputs: List[OutputVariant] = []
+        seen_output_ids: set[str] = set()
+        for output in raw_outputs:
+            if isinstance(output, OutputVariant):
+                variant = output
+            else:
+                variant = OutputVariant.from_dict(output)
+            while variant.id in seen_output_ids:
+                variant.id = new_id("variant")
+            seen_output_ids.add(variant.id)
+            normalized_outputs.append(variant)
+        self.outputs = normalized_outputs
+
     @staticmethod
     def from_dict(
         data: Dict[str, Any],
@@ -107,8 +185,11 @@ class EncodeProfile:
         base_paths = paths or build_paths()
         default_gpus = [] if gpus is None else gpus
         base = asdict(default_profile(base_paths, default_gpus))
-        base.update(data or {})
-        base["outputs"] = [OutputVariant.from_dict(x) for x in base.get("outputs", [])]
+        base.update(dataclass_values(EncodeProfile, data))
+        raw_outputs = base.get("outputs")
+        if not isinstance(raw_outputs, list):
+            raw_outputs = []
+        base["outputs"] = [OutputVariant.from_dict(x) for x in raw_outputs]
         if not base["outputs"]:
             base["outputs"] = default_outputs()
         return EncodeProfile(**base)
@@ -171,7 +252,23 @@ def ensure_dirs(paths: AppPaths) -> None:
     paths.ffmpeg_path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def missing_profile_dirs(profile: EncodeProfile) -> List[str]:
+    required = [
+        ("input_dir", profile.input_dir),
+        ("output_dir", profile.output_dir),
+        ("archive_dir", profile.archive_dir),
+    ]
+    return [name for name, value in required if not str(value or "").strip()]
+
+
+def validate_profile_dirs(profile: EncodeProfile) -> None:
+    missing = missing_profile_dirs(profile)
+    if missing:
+        raise ValueError(f"profile requires: {', '.join(missing)}")
+
+
 def ensure_profile_dirs(profile: EncodeProfile) -> None:
+    validate_profile_dirs(profile)
     input_dir = profile_input_dir(profile)
     output_dir = profile_output_dir(profile)
     archive_dir = profile_archive_dir(profile)
@@ -277,12 +374,27 @@ def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> En
     )
 
 
+def read_json_object(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
 def load_profiles(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> List[EncodeProfile]:
     if not paths.config_file.exists():
         return [default_profile(paths, gpus)]
 
-    data = json.loads(paths.config_file.read_text(encoding="utf-8"))
-    profiles = [EncodeProfile.from_dict(item, paths, gpus) for item in data.get("profiles", [])]
+    data = read_json_object(paths.config_file)
+    if data is None:
+        return [default_profile(paths, gpus)]
+    raw_profiles = data.get("profiles")
+    if not isinstance(raw_profiles, list):
+        return [default_profile(paths, gpus)]
+    profiles = [EncodeProfile.from_dict(item, paths, gpus) for item in raw_profiles if isinstance(item, dict)]
     return profiles or [default_profile(paths, gpus)]
 
 
@@ -323,6 +435,8 @@ def output_path_for(profile: EncodeProfile, src: Path, variant: OutputVariant) -
 
 
 def scan_profile_files(profile: EncodeProfile) -> List[FileStatus]:
+    if missing_profile_dirs(profile):
+        return []
     input_dir = profile_input_dir(profile)
     if not input_dir.exists():
         return []
@@ -352,6 +466,24 @@ def build_job_specs(profile: EncodeProfile, files: Iterable[Path]) -> List[JobSp
     return specs
 
 
+def duplicate_output_targets_for_outputs(outputs: Iterable[OutputVariant]) -> List[str]:
+    seen: set[Tuple[str, str]] = set()
+    duplicates: List[str] = []
+    for variant in outputs:
+        if not variant.enabled:
+            continue
+        key = (variant.folder_name.lower(), normalize_container_extension(variant.container))
+        if key in seen:
+            duplicates.append(f"{variant.folder_name}.{key[1]}")
+        else:
+            seen.add(key)
+    return duplicates
+
+
+def duplicate_output_targets(profile: EncodeProfile) -> List[str]:
+    return duplicate_output_targets_for_outputs(profile.outputs)
+
+
 def is_nvenc_codec(codec: str) -> bool:
     return codec.lower().endswith("_nvenc")
 
@@ -368,7 +500,26 @@ def output_pix_fmt(profile: EncodeProfile) -> str:
     return "yuv420p"
 
 
+def missing_rate_fields(profile: EncodeProfile) -> List[str]:
+    mode_name = profile.rate_mode.upper()
+    required: List[Tuple[str, str]] = []
+    if mode_name == "VBR":
+        required = [("bitrate", profile.bitrate), ("maxrate", profile.maxrate), ("bufsize", profile.bufsize)]
+    elif mode_name == "ABR":
+        required = [("bitrate", profile.bitrate)]
+    elif mode_name == "CBR":
+        required = [("bitrate", profile.bitrate), ("bufsize", profile.bufsize)]
+    return [name for name, value in required if not str(value or "").strip()]
+
+
+def validate_rate_settings(profile: EncodeProfile) -> None:
+    missing = missing_rate_fields(profile)
+    if missing:
+        raise ValueError(f"{profile.rate_mode} requires: {', '.join(missing)}")
+
+
 def build_video_encoder_args(profile: EncodeProfile) -> List[str]:
+    validate_rate_settings(profile)
     codec = encoder_codec(profile)
     cmd: List[str] = ["-c:v", codec]
 
@@ -450,15 +601,16 @@ def build_ffmpeg_command(
         "1",
     ]
 
-    if start_seconds is not None and start_seconds > 0:
-        cmd += ["-ss", format_seconds(start_seconds)]
-    if duration_seconds is not None and duration_seconds > 0:
-        cmd += ["-t", format_seconds(duration_seconds)]
-
     cmd += [
         "-i",
         str(src),
         "-y",
+    ]
+    if start_seconds is not None and start_seconds > 0:
+        cmd += ["-ss", format_seconds(start_seconds)]
+    if duration_seconds is not None and duration_seconds > 0:
+        cmd += ["-t", format_seconds(duration_seconds)]
+    cmd += [
         "-map",
         "0",
         "-pix_fmt",
@@ -578,32 +730,83 @@ def segment_ranges(duration: Optional[float], segment_seconds: int) -> List[Tupl
     return ranges
 
 
-def job_key(src: Path, variant: OutputVariant) -> str:
-    digest = hashlib.sha1(str(src.resolve()).encode("utf-8", errors="ignore")).hexdigest()[:10]
-    return safe_folder_name(f"{src.stem}-{variant.id}-{digest}")
+def job_fingerprint(profile: EncodeProfile, variant: OutputVariant) -> str:
+    data = {
+        "profile_id": profile.id,
+        "variant_id": variant.id,
+        "variant_name": variant.name,
+        "variant_folder": variant.folder_name,
+        "variant_height": variant.height,
+        "variant_container": variant.container,
+        "segment_minutes": profile.segment_minutes,
+        "use_gpu": profile.use_gpu,
+        "gpu_index": profile.gpu_index,
+        "codec": profile.codec,
+        "cpu_codec": profile.cpu_codec,
+        "preset": profile.preset,
+        "cpu_preset": profile.cpu_preset,
+        "tune": profile.tune,
+        "rate_mode": profile.rate_mode,
+        "cq_value": profile.cq_value,
+        "bitrate": profile.bitrate,
+        "maxrate": profile.maxrate,
+        "bufsize": profile.bufsize,
+        "pix_fmt": profile.pix_fmt,
+        "scale_flags": profile.scale_flags,
+    }
+    encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:10]
 
 
-def segment_dir_for(paths: AppPaths, src: Path, variant: OutputVariant) -> Path:
-    return paths.tmp_dir / "segments" / job_key(src, variant)
+def source_fingerprint(src: Path) -> str:
+    data: Dict[str, Any] = {"path": str(src.resolve())}
+    try:
+        stat = src.stat()
+    except OSError:
+        pass
+    else:
+        data["size"] = stat.st_size
+        data["mtime_ns"] = stat.st_mtime_ns
+    encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(encoded.encode("utf-8", errors="ignore")).hexdigest()[:10]
 
 
-def segment_path_for(paths: AppPaths, src: Path, variant: OutputVariant, index: int) -> Path:
+def short_path_label(value: str, limit: int) -> str:
+    label = safe_folder_name(value)
+    if len(label) <= limit:
+        return label
+    return label[:limit].rstrip(".- ") or "item"
+
+
+def job_key(src: Path, profile: EncodeProfile, variant: OutputVariant) -> str:
+    src_digest = source_fingerprint(src)
+    settings_digest = job_fingerprint(profile, variant)
+    stem = short_path_label(src.stem, 80)
+    variant_id = short_path_label(variant.id, 40)
+    return f"{stem}-{variant_id}-{src_digest}-{settings_digest}"
+
+
+def segment_dir_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant) -> Path:
+    return paths.tmp_dir / "segments" / job_key(src, profile, variant)
+
+
+def segment_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant, index: int) -> Path:
     container = normalize_container_extension(variant.container)
-    return segment_dir_for(paths, src, variant) / f"segment-{index:05d}.{container}"
+    return segment_dir_for(paths, src, profile, variant) / f"segment-{index:05d}.{container}"
 
 
-def partial_segment_path_for(paths: AppPaths, src: Path, variant: OutputVariant, index: int) -> Path:
+def partial_segment_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant, index: int) -> Path:
     container = normalize_container_extension(variant.container)
-    return segment_dir_for(paths, src, variant) / f"segment-{index:05d}.partial.{container}"
+    return segment_dir_for(paths, src, profile, variant) / f"segment-{index:05d}.partial.{container}"
 
 
-def temp_output_path_for(paths: AppPaths, src: Path, variant: OutputVariant) -> Path:
+def temp_output_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant) -> Path:
     container = normalize_container_extension(variant.container)
-    return paths.tmp_dir / f"{job_key(src, variant)}.final.{container}"
+    return paths.tmp_dir / f"{job_key(src, profile, variant)}.final.{container}"
 
 
-def concat_list_path_for(paths: AppPaths, src: Path, variant: OutputVariant) -> Path:
-    return segment_dir_for(paths, src, variant) / "concat.txt"
+def concat_list_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant) -> Path:
+    return segment_dir_for(paths, src, profile, variant) / "concat.txt"
 
 
 def write_concat_file(list_path: Path, segments: List[Path]) -> None:
@@ -635,7 +838,7 @@ def save_state(paths: AppPaths, profile: EncodeProfile, specs: List[JobSpec]) ->
 def load_state(paths: AppPaths) -> Optional[Dict[str, Any]]:
     if not paths.state_file.exists():
         return None
-    return json.loads(paths.state_file.read_text(encoding="utf-8"))
+    return read_json_object(paths.state_file)
 
 
 def clear_state(paths: AppPaths) -> None:

@@ -32,10 +32,14 @@ try:
         concat_list_path_for,
         default_profile,
         detect_nvidia_gpus,
+        duplicate_output_targets,
+        duplicate_output_targets_for_outputs,
         ensure_dirs,
         ensure_profile_dirs,
         load_profiles,
         load_state,
+        missing_profile_dirs,
+        missing_rate_fields,
         new_id,
         normalize_container_extension,
         output_path_for,
@@ -76,10 +80,14 @@ except ModuleNotFoundError:
         concat_list_path_for,
         default_profile,
         detect_nvidia_gpus,
+        duplicate_output_targets,
+        duplicate_output_targets_for_outputs,
         ensure_dirs,
         ensure_profile_dirs,
         load_profiles,
         load_state,
+        missing_profile_dirs,
+        missing_rate_fields,
         new_id,
         normalize_container_extension,
         output_path_for,
@@ -102,6 +110,17 @@ except ModuleNotFoundError:
         write_concat_file,
     )
     from ffmpeg_downloader import FfmpegDownloadError, ensure_ffmpeg_available  # type: ignore
+
+
+PROFILE_DIR_LABELS = {
+    "input_dir": "入力先",
+    "output_dir": "出力先",
+    "archive_dir": "処理済み退避先",
+}
+
+
+def profile_dir_label_text(fields: List[str]) -> str:
+    return ", ".join(PROFILE_DIR_LABELS.get(field, field) for field in fields)
 
 
 @dataclass
@@ -674,7 +693,7 @@ class EncoderApp:
             return None
 
         use_gpu, gpu_index, gpu_name = self._parse_gpu_choice()
-        return EncodeProfile(
+        profile = EncodeProfile(
             id=current.id,
             name=self.profile_name_var.get().strip() or current.name,
             input_dir=input_dir,
@@ -696,6 +715,16 @@ class EncoderApp:
             bufsize=self.bufsize_var.get().strip(),
             outputs=[OutputVariant.from_dict(asdict(item)) for item in self.editing_outputs],
         )
+        missing = missing_rate_fields(profile)
+        if missing:
+            labels = ", ".join(missing)
+            messagebox.showerror("入力エラー", f"{profile.rate_mode} では {labels} を入力してください。")
+            return None
+        duplicates = duplicate_output_targets(profile)
+        if duplicates:
+            messagebox.showerror("入力エラー", f"同じ出力先が重複しています: {', '.join(duplicates)}")
+            return None
+        return profile
 
     def save_current_profile(self) -> None:
         profile = self.collect_profile_from_form()
@@ -821,12 +850,23 @@ class EncoderApp:
             enabled=True,
         )
 
-        for index, existing in enumerate(self.editing_outputs):
+        next_outputs: List[OutputVariant] = []
+        replaced = False
+        for existing in self.editing_outputs:
             if existing.id == variant.id:
-                self.editing_outputs[index] = variant
-                break
-        else:
-            self.editing_outputs.append(variant)
+                next_outputs.append(variant)
+                replaced = True
+            else:
+                next_outputs.append(existing)
+        if not replaced:
+            next_outputs.append(variant)
+
+        duplicates = duplicate_output_targets_for_outputs(next_outputs)
+        if duplicates:
+            messagebox.showerror("入力エラー", f"同じ出力先が重複しています: {', '.join(duplicates)}")
+            return
+
+        self.editing_outputs = next_outputs
 
         self.selected_output_id = variant.id
         self.refresh_outputs_tree()
@@ -894,11 +934,17 @@ class EncoderApp:
         if self.running:
             return
         profile = self.current_profile()
+        missing_dirs = missing_profile_dirs(profile)
+        variants = ", ".join(variant.name for variant in profile.outputs if variant.enabled)
+        self.input_summary_var.set(f"入力: {profile.input_dir}")
+        self.output_summary_var.set(f"出力: {profile.output_dir} / {variants or '未設定'}")
+        if missing_dirs:
+            self.files = []
+            self.render_scan_rows(profile)
+            self.log(f"{profile.name}: フォルダ設定が不足しています: {profile_dir_label_text(missing_dirs)}")
+            return
         self.files = scan_profile_files(profile)
         self.render_scan_rows(profile)
-        self.input_summary_var.set(f"入力: {profile.input_dir}")
-        variants = ", ".join(variant.name for variant in profile.outputs if variant.enabled)
-        self.output_summary_var.set(f"出力: {profile.output_dir} / {variants or '未設定'}")
         if not profile_input_dir(profile).exists():
             self.log(f"入力フォルダはまだありません: {profile.input_dir}")
         else:
@@ -965,8 +1011,26 @@ class EncoderApp:
             messagebox.showerror("FFmpeg install failed", str(exc))
             return False
 
+    def validate_profile_before_run(self, profile: EncodeProfile) -> bool:
+        missing_dirs = missing_profile_dirs(profile)
+        if missing_dirs:
+            messagebox.showerror("入力エラー", f"{profile_dir_label_text(missing_dirs)} を入力してください。")
+            return False
+        missing = missing_rate_fields(profile)
+        if missing:
+            labels = ", ".join(missing)
+            messagebox.showerror("入力エラー", f"{profile.rate_mode} では {labels} を入力してください。")
+            return False
+        duplicates = duplicate_output_targets(profile)
+        if duplicates:
+            messagebox.showerror("入力エラー", f"同じ出力先が重複しています: {', '.join(duplicates)}")
+            return False
+        return True
+
     def start_current_profile(self) -> None:
         profile = self.current_profile()
+        if not self.validate_profile_before_run(profile):
+            return
 
         ensure_profile_dirs(profile)
         self.files = scan_profile_files(profile)
@@ -993,6 +1057,8 @@ class EncoderApp:
             return
 
         profile = profile_from_state(data, self.paths, self.gpus)
+        if not self.validate_profile_before_run(profile):
+            return
         specs = resumable_specs(profile, data)
         if not specs:
             clear_state(self.paths)
@@ -1045,7 +1111,7 @@ class EncoderApp:
         self.job_counter += 1
         src = Path(spec.src)
         variant = variant_by_id(profile, spec.variant_id)
-        tmp_out = temp_output_path_for(self.paths, src, variant)
+        tmp_out = temp_output_path_for(self.paths, src, profile, variant)
         out_file = output_path_for(profile, src, variant)
         log_file = self.paths.log_dir / f"job_{self.job_counter}_{variant.folder_name}.log"
         return RuntimeJob(
@@ -1124,7 +1190,7 @@ class EncoderApp:
         self.log(f"Start {job.variant.name}: {src.name}")
         self.log(f"Log file: {job.log_file}")
 
-        segment_dir_for(self.paths, src, job.variant).mkdir(parents=True, exist_ok=True)
+        segment_dir_for(self.paths, src, job.profile, job.variant).mkdir(parents=True, exist_ok=True)
 
         try:
             with open(job.log_file, "w", encoding="utf-8", errors="replace") as log_fp:
@@ -1138,8 +1204,8 @@ class EncoderApp:
 
                 segment_files: List[Path] = []
                 for index, (start, duration_seconds) in enumerate(ranges):
-                    final_segment = segment_path_for(self.paths, src, job.variant, index)
-                    partial_segment = partial_segment_path_for(self.paths, src, job.variant, index)
+                    final_segment = segment_path_for(self.paths, src, job.profile, job.variant, index)
+                    partial_segment = partial_segment_path_for(self.paths, src, job.profile, job.variant, index)
                     segment_files.append(final_segment)
 
                     if final_segment.exists():
@@ -1187,7 +1253,7 @@ class EncoderApp:
                     self._mark_job_cancelled(job)
                     return
 
-                concat_file = concat_list_path_for(self.paths, src, job.variant)
+                concat_file = concat_list_path_for(self.paths, src, job.profile, job.variant)
                 write_concat_file(concat_file, segment_files)
                 if job.tmp_out.exists():
                     job.tmp_out.unlink(missing_ok=True)
@@ -1213,7 +1279,7 @@ class EncoderApp:
                 if job.out_file.exists():
                     job.out_file.unlink()
                 shutil.move(str(job.tmp_out), str(job.out_file))
-                shutil.rmtree(segment_dir_for(self.paths, src, job.variant), ignore_errors=True)
+                shutil.rmtree(segment_dir_for(self.paths, src, job.profile, job.variant), ignore_errors=True)
                 with self.lock:
                     job.status = "完了"
                     job.progress = 100.0

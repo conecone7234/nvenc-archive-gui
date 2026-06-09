@@ -112,6 +112,8 @@ def test_build_cpu_cq_uses_crf_and_hides_bitrate(tmp_path: Path):
     profile = make_profile(tmp_path)
     profile.use_gpu = False
     profile.cpu_codec = "libx264"
+    profile.cpu_preset = "slow"
+    profile.cpu_tune = "film"
     profile.rate_mode = "CQ"
     variant = profile.outputs[1]
     cmd = build_ffmpeg_command(
@@ -124,6 +126,10 @@ def test_build_cpu_cq_uses_crf_and_hides_bitrate(tmp_path: Path):
 
     assert "libx264" in cmd
     assert "yuv420p" in cmd
+    assert "-preset:v" in cmd
+    assert "slow" in cmd
+    assert "-tune:v" in cmd
+    assert "film" in cmd
     assert "-crf" in cmd
     assert "-cq:v" not in cmd
     assert "-b:v" not in cmd
@@ -339,6 +345,10 @@ def test_encode_profile_from_dict_uses_supplied_paths_and_gpus(tmp_path: Path):
     assert gpu_profile.gpu_name == "RTX Test"
     assert cpu_profile.use_gpu is False
     assert cpu_profile.max_parallel_jobs == 1
+    assert cpu_profile.cq_value == 23
+    assert cpu_profile.bitrate == "8000k"
+    assert cpu_profile.cpu_preset == "medium"
+    assert cpu_profile.cpu_tune == "none"
     assert stale_gpu_profile.use_gpu is False
     assert stale_gpu_profile.gpu_index == 0
     assert stale_gpu_profile.gpu_name == ""

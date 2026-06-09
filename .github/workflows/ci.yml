@@ -4,10 +4,12 @@ on:
   push:
     branches:
       - main
+      - preview
       - develop
   pull_request:
     branches:
       - main
+      - preview
       - develop
   workflow_dispatch:
 
@@ -46,7 +48,7 @@ jobs:
     name: Build Windows exe
     runs-on: windows-latest
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && contains(fromJSON('["main","preview","develop"]'), github.ref_name)
 
     steps:
       - name: Checkout
@@ -80,21 +82,132 @@ jobs:
           NvencArchiveGui.exe
 
           Put this exe in your work folder.
-          If .\ffmpeg\ffmpeg.exe does not exist, the app can download FFmpeg on first run.
+          If .\ffmpeg\ffmpeg.exe or .\ffmpeg\ffprobe.exe does not exist, the app can download FFmpeg on first run.
 
-          Folder example:
+          Default profile example:
           .\NvencArchiveGui.exe
           .\ffmpeg\ffmpeg.exe
-          .\OBSData\
-          .\SourceData\
-          .\SourceData(MP4)\
-          .\SourceData(4K)\
+          .\ffmpeg\ffprobe.exe
+          .\Incoming\
+          .\Encoded\
+          .\SourceArchive\
           .\tmp\
           "@ | Set-Content artifact\README_Run.txt -Encoding UTF8
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NvencArchiveGui-windows-${{ github.sha }}
+          name: NvencArchiveGui-windows-${{ github.ref_name }}-${{ github.sha }}
           path: artifact
           if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: windows-latest
+    needs: build-windows-exe
+    if: github.event_name == 'push' && contains(fromJSON('["main","preview","develop"]'), github.ref_name)
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: NvencArchiveGui-windows-${{ github.ref_name }}-${{ github.sha }}
+          path: artifact
+
+      - name: Prepare release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          $branch = "${{ github.ref_name }}"
+          $run = "${{ github.run_number }}.${{ github.run_attempt }}"
+
+          switch ($branch) {
+            "main" {
+              $tag = "v$version"
+              $channel = "stable"
+              $title = "NvencArchiveGui $tag"
+              $prerelease = "false"
+              $latest = "true"
+            }
+            "preview" {
+              $tag = "v$version-preview.$run"
+              $channel = "preview"
+              $title = "NvencArchiveGui $tag Preview"
+              $prerelease = "true"
+              $latest = "false"
+            }
+            "develop" {
+              $tag = "v$version-nightly.$run"
+              $channel = "nightly"
+              $title = "NvencArchiveGui $tag Nightly"
+              $prerelease = "true"
+              $latest = "false"
+            }
+            default {
+              throw "Unsupported release branch: $branch"
+            }
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "channel=$channel" >> $env:GITHUB_OUTPUT
+          "title=$title" >> $env:GITHUB_OUTPUT
+          "prerelease=$prerelease" >> $env:GITHUB_OUTPUT
+          "latest=$latest" >> $env:GITHUB_OUTPUT
+
+          @"
+          Channel: $channel
+          Branch: $branch
+          Commit: ${{ github.sha }}
+
+          This release was generated automatically from the $branch branch.
+          The ZIP contains NvencArchiveGui.exe and a short run README.
+          "@ | Set-Content release-notes.md -Encoding UTF8
+
+      - name: Package release asset
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          Compress-Archive -Path artifact\* -DestinationPath "NvencArchiveGui-windows-$tag.zip" -Force
+
+      - name: Create release
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $title = "${{ steps.meta.outputs.title }}"
+
+          if (gh release view $tag --json tagName 2>$null) {
+            Write-Error "Release tag '$tag' already exists. Bump project.version in pyproject.toml before releasing this branch again."
+            exit 1
+          }
+
+          $ghArgs = @(
+            "release", "create", $tag,
+            "artifact\NvencArchiveGui.exe",
+            "NvencArchiveGui-windows-$tag.zip",
+            "--target", "${{ github.sha }}",
+            "--title", $title,
+            "--notes-file", "release-notes.md"
+          )
+
+          if ("${{ steps.meta.outputs.prerelease }}" -eq "true") {
+            $ghArgs += "--prerelease"
+          }
+
+          if ("${{ steps.meta.outputs.latest }}" -eq "true") {
+            $ghArgs += "--latest"
+          }
+
+          gh @ghArgs

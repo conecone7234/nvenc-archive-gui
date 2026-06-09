@@ -1,40 +1,53 @@
 # NvencArchiveGui
 
-Windows native GUI encoder for OBS recording archive jobs.
+Windows native GUI encoder for profile-based FFmpeg/NVENC archive jobs.
 
 ## Features
 
-- Scan `OBSData`
-- Select multiple videos
-- Create 4K output and MP4 output
-- Run up to two FFmpeg/NVENC jobs in parallel
-- Start / Pause / Resume / Stop
-- Show live logs
-- Save job logs to `tmp/logs`
-- Save resume state to `tmp/encoder_state.json`
-- Skip already finished outputs
-- Move source files to `SourceData` only when requested outputs are complete
-- Download FFmpeg automatically when `ffmpeg\ffmpeg.exe` is missing
+- Home screen focused on Start / Pause / Stop, logs, and file-by-file progress
+- Profile-based input, output, and source archive folders
+- Multiple output variants per source file, such as `Master 2160p` and `Reference 1080p`
+- Resolution presets plus custom output height
+- CQ/CRF, VBR, ABR, and CBR modes, with irrelevant bitrate fields disabled in the UI
+- Manual GPU selection with CPU-only fallback when no NVIDIA GPU is detected
+- Parallel job count per profile
+- Automatic FFmpeg and FFprobe install when the bundled executables are missing
+- Segment-based fault tolerance: completed time slices are kept and unfinished work can be resumed
+- Source files move to the profile archive folder only after all requested outputs are complete
 
-## Folder layout
+## Folder Layout
 
-Place the exe in your work folder.
+The app no longer depends on fixed folders named `OBSData`, `SourceData(MP4)`, or `SourceData(4K)`.
+Profiles define their own folders. A fresh profile defaults to:
 
 ```text
 work-folder
-├─ NvencArchiveGui.exe
-├─ ffmpeg
-│  └─ ffmpeg.exe
-├─ OBSData
-├─ SourceData
-├─ SourceData(MP4)
-├─ SourceData(4K)
-└─ tmp
+|-- NvencArchiveGui.exe
+|-- ffmpeg
+|   |-- ffmpeg.exe
+|   `-- ffprobe.exe
+|-- Incoming
+|-- Encoded
+|   |-- master-2160p
+|   `-- reference-1080p
+|-- SourceArchive
+|-- profiles.json
+`-- tmp
+    |-- encoder_state.json
+    |-- logs
+    `-- segments
 ```
 
-If `ffmpeg\ffmpeg.exe` does not exist, the app can download FFmpeg on first run.
+Profile folders are created when the profile is executed, not at app startup.
 
-## Run from source
+## Resume Behavior
+
+The app does not pause an active video encoder process in the middle of a write.
+Instead, each output is encoded as fixed-duration segments. Pause waits until the
+current segment finishes, and Stop leaves completed segments in `tmp/segments`.
+Use `保存状態から再開` to continue after an app crash, forced shutdown, or manual stop.
+
+## Run From Source
 
 ```powershell
 py -m pip install -r requirements-dev.txt
@@ -47,7 +60,7 @@ or:
 py src\ffmpeg_nvenc_gui\app.py
 ```
 
-## Build exe locally
+## Build Exe Locally
 
 ```powershell
 py -m pip install -r requirements-dev.txt
@@ -60,14 +73,19 @@ The exe will be created at:
 dist\NvencArchiveGui.exe
 ```
 
-## Resume behavior
-
-This app does not resume an incomplete MP4 from the middle.
-It safely restarts only unfinished jobs.
-Already completed outputs are skipped.
-
 ## CI/CD
 
-- Push to `develop`: tests only
-- Push to `main`: tests + Windows exe build + artifact upload
-- Pull request to `main` or `develop`: tests only
+- Pull request to `main`, `preview`, or `develop`: tests only
+- Push or merge to `main`: tests + Windows exe build + stable GitHub Release
+- Push or merge to `preview`: tests + Windows exe build + preview pre-release
+- Push or merge to `develop`: tests + Windows exe build + nightly pre-release
+
+Release channels:
+
+- `main`: stable release, tag `vX.X.X`, marked as GitHub Latest
+- `preview`: preview release, tag `vX.X.X-preview.<run>`, marked as pre-release
+- `develop`: nightly release, tag `vX.X.X-nightly.<run>`, marked as pre-release
+
+`pyproject.toml` is the source of the base version. Bump `project.version`
+before creating another stable release from `main`; the workflow intentionally
+fails if the stable tag already exists.

@@ -6,57 +6,98 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-
-try:
-    import psutil
-except ImportError:
-    psutil = None
 
 try:
     from ffmpeg_nvenc_gui.core import (
         AppPaths,
-        EncodeSettings,
+        EncodeProfile,
         FileStatus,
+        GpuInfo,
         JobSpec,
+        OutputVariant,
+        RESOLUTION_PRESETS,
+        build_concat_command,
         build_ffmpeg_command,
         build_job_specs,
         build_paths,
         clear_state,
         command_to_text,
+        concat_list_path_for,
+        default_profile,
+        detect_nvidia_gpus,
         ensure_dirs,
+        ensure_profile_dirs,
+        load_profiles,
         load_state,
+        new_id,
         output_path_for,
+        parse_ffmpeg_time,
+        partial_segment_path_for,
+        probe_duration,
+        profile_archive_dir,
+        profile_from_state,
+        profile_input_dir,
         resumable_specs,
+        safe_folder_name,
+        save_profiles,
         save_state,
-        scan_obs_files,
-        temp_path_for,
+        scan_profile_files,
+        segment_dir_for,
+        segment_path_for,
+        segment_ranges,
+        temp_output_path_for,
+        variant_by_id,
+        write_concat_file,
     )
     from ffmpeg_nvenc_gui.ffmpeg_downloader import FfmpegDownloadError, ensure_ffmpeg_available
 except ModuleNotFoundError:
     from core import (  # type: ignore
         AppPaths,
-        EncodeSettings,
+        EncodeProfile,
         FileStatus,
+        GpuInfo,
         JobSpec,
+        OutputVariant,
+        RESOLUTION_PRESETS,
+        build_concat_command,
         build_ffmpeg_command,
         build_job_specs,
         build_paths,
         clear_state,
         command_to_text,
+        concat_list_path_for,
+        default_profile,
+        detect_nvidia_gpus,
         ensure_dirs,
+        ensure_profile_dirs,
+        load_profiles,
         load_state,
+        new_id,
         output_path_for,
+        parse_ffmpeg_time,
+        partial_segment_path_for,
+        probe_duration,
+        profile_archive_dir,
+        profile_from_state,
+        profile_input_dir,
         resumable_specs,
+        safe_folder_name,
+        save_profiles,
         save_state,
-        scan_obs_files,
-        temp_path_for,
+        scan_profile_files,
+        segment_dir_for,
+        segment_path_for,
+        segment_ranges,
+        temp_output_path_for,
+        variant_by_id,
+        write_concat_file,
     )
     from ffmpeg_downloader import FfmpegDownloadError, ensure_ffmpeg_available  # type: ignore
 
@@ -65,28 +106,41 @@ except ModuleNotFoundError:
 class RuntimeJob:
     job_id: int
     spec: JobSpec
+    profile: EncodeProfile
+    variant: OutputVariant
     tmp_out: Path
     out_file: Path
     log_file: Path
-    command: List[str]
     process: Optional[subprocess.Popen] = None
     status: str = "waiting"
+    message: str = ""
+    total_segments: int = 1
+    completed_segments: int = 0
+    current_segment: int = 0
+    progress: float = 0.0
 
 
 class EncoderApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("FFmpeg NVENC GUI Encoder")
-        self.root.geometry("1280x840")
+        self.root.title("NVEnc Archive Studio")
+        self.root.geometry("1220x820")
+        self.root.minsize(1060, 700)
 
         self.paths: AppPaths = build_paths()
         ensure_dirs(self.paths)
 
+        self.gpus: List[GpuInfo] = detect_nvidia_gpus()
+        self.profiles: List[EncodeProfile] = load_profiles(self.paths, self.gpus)
         self.files: List[FileStatus] = []
+        self.editing_outputs: List[OutputVariant] = []
+        self.selected_output_id: Optional[str] = None
+
         self.job_counter = 0
         self.pending_jobs: queue.Queue[RuntimeJob] = queue.Queue()
         self.active_jobs: Dict[int, RuntimeJob] = {}
         self.all_jobs: Dict[int, RuntimeJob] = {}
+        self.job_rows: Dict[int, str] = {}
 
         self.lock = threading.Lock()
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -97,111 +151,623 @@ class EncoderApp:
         self.scheduler_thread: Optional[threading.Thread] = None
 
         self._build_ui()
+        self.refresh_profile_choices()
+        self.load_profile_into_form(self.current_profile())
         self._poll_log_queue()
         self.scan_files()
+        self._announce_resume_state()
+
+    def _configure_style(self) -> None:
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        self.colors = {
+            "bg": "#f4f6f8",
+            "surface": "#ffffff",
+            "text": "#1f2937",
+            "muted": "#667085",
+            "line": "#d7dde5",
+            "accent": "#2563eb",
+            "danger": "#b42318",
+            "ok": "#067647",
+        }
+
+        self.root.configure(bg=self.colors["bg"])
+        style.configure("App.TFrame", background=self.colors["bg"])
+        style.configure("Surface.TFrame", background=self.colors["surface"], relief="flat")
+        style.configure("TFrame", background=self.colors["bg"])
+        style.configure("TLabel", background=self.colors["bg"], foreground=self.colors["text"])
+        style.configure("Surface.TLabel", background=self.colors["surface"], foreground=self.colors["text"])
+        style.configure("Muted.TLabel", background=self.colors["surface"], foreground=self.colors["muted"])
+        style.configure("Title.TLabel", background=self.colors["bg"], foreground=self.colors["text"], font=("Segoe UI", 18, "bold"))
+        style.configure("Subtitle.TLabel", background=self.colors["bg"], foreground=self.colors["muted"], font=("Segoe UI", 10))
+        style.configure("Section.TLabel", background=self.colors["surface"], foreground=self.colors["text"], font=("Segoe UI", 11, "bold"))
+        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        style.configure("Danger.TButton", foreground=self.colors["danger"], font=("Segoe UI", 10, "bold"))
+        style.configure("TNotebook", background=self.colors["bg"], borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(18, 8), font=("Segoe UI", 10))
+        style.configure("Treeview", rowheight=28, font=("Segoe UI", 9))
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        style.configure("Horizontal.TProgressbar", thickness=12)
 
     def _build_ui(self) -> None:
-        main = ttk.Frame(self.root, padding=8)
+        self._configure_style()
+
+        self.active_profile_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="待機中")
+        self.progress_text_var = tk.StringVar(value="0%")
+        self.input_summary_var = tk.StringVar(value="")
+        self.output_summary_var = tk.StringVar(value="")
+
+        main = ttk.Frame(self.root, padding=(20, 18), style="App.TFrame")
         main.pack(fill=tk.BOTH, expand=True)
 
-        path_frame = ttk.LabelFrame(main, text="Paths", padding=8)
-        path_frame.pack(fill=tk.X)
+        header = ttk.Frame(main, style="App.TFrame")
+        header.pack(fill=tk.X)
+        title_block = ttk.Frame(header, style="App.TFrame")
+        title_block.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(title_block, text="NVEnc Archive Studio", style="Title.TLabel").pack(anchor=tk.W)
+        ttk.Label(
+            title_block,
+            text="プロファイルで入力先と複数出力を定義し、実行画面は進捗確認に集中します。",
+            style="Subtitle.TLabel",
+        ).pack(anchor=tk.W, pady=(2, 0))
 
-        self.path_text = tk.StringVar(
-            value=(
-                f"Base: {self.paths.base_dir}\n"
-                f"FFmpeg: {self.paths.ffmpeg_path}\n"
-                f"OBSData: {self.paths.obs_dir}"
-            )
+        selector = ttk.Frame(header, style="App.TFrame")
+        selector.pack(side=tk.RIGHT)
+        ttk.Label(selector, text="実行プロファイル").pack(anchor=tk.W)
+        self.profile_combo = ttk.Combobox(
+            selector,
+            textvariable=self.active_profile_var,
+            width=32,
+            state="readonly",
         )
-        ttk.Label(path_frame, textvariable=self.path_text, justify=tk.LEFT).pack(anchor=tk.W)
+        self.profile_combo.pack(anchor=tk.E, pady=(3, 0))
+        self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_selected)
 
-        settings_frame = ttk.LabelFrame(main, text="Encode Settings", padding=8)
-        settings_frame.pack(fill=tk.X, pady=(8, 0))
+        self.notebook = ttk.Notebook(main)
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(16, 0))
 
+        self.run_tab = ttk.Frame(self.notebook, padding=14, style="App.TFrame")
+        self.profile_tab = ttk.Frame(self.notebook, padding=14, style="App.TFrame")
+        self.notebook.add(self.run_tab, text="実行")
+        self.notebook.add(self.profile_tab, text="プロファイル")
+
+        self._build_run_tab()
+        self._build_profile_tab()
+
+    def _surface(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.Frame(parent, padding=14, style="Surface.TFrame")
+        return frame
+
+    def _build_run_tab(self) -> None:
+        summary = self._surface(self.run_tab)
+        summary.pack(fill=tk.X)
+
+        left = ttk.Frame(summary, style="Surface.TFrame")
+        left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(left, textvariable=self.status_var, style="Section.TLabel").pack(anchor=tk.W)
+        ttk.Label(left, textvariable=self.input_summary_var, style="Muted.TLabel").pack(anchor=tk.W, pady=(6, 0))
+        ttk.Label(left, textvariable=self.output_summary_var, style="Muted.TLabel").pack(anchor=tk.W)
+
+        controls = ttk.Frame(summary, style="Surface.TFrame")
+        controls.pack(side=tk.RIGHT)
+        ttk.Button(controls, text="開始", style="Accent.TButton", command=self.start_current_profile).pack(side=tk.LEFT, padx=(0, 8))
+        self.pause_button = ttk.Button(controls, text="一時停止", command=self.toggle_pause)
+        self.pause_button.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(controls, text="中断", style="Danger.TButton", command=self.stop_all).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(controls, text="保存状態から再開", command=self.resume_saved).pack(side=tk.LEFT)
+
+        progress_box = self._surface(self.run_tab)
+        progress_box.pack(fill=tk.X, pady=(12, 0))
+        progress_head = ttk.Frame(progress_box, style="Surface.TFrame")
+        progress_head.pack(fill=tk.X)
+        ttk.Label(progress_head, text="全体進捗", style="Section.TLabel").pack(side=tk.LEFT)
+        ttk.Label(progress_head, textvariable=self.progress_text_var, style="Muted.TLabel").pack(side=tk.RIGHT)
+        self.overall_progress = ttk.Progressbar(progress_box, mode="determinate", maximum=100)
+        self.overall_progress.pack(fill=tk.X, pady=(10, 0))
+
+        body = ttk.Frame(self.run_tab, style="App.TFrame")
+        body.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+
+        list_box = self._surface(body)
+        list_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        list_head = ttk.Frame(list_box, style="Surface.TFrame")
+        list_head.pack(fill=tk.X)
+        ttk.Label(list_head, text="ファイル別進捗", style="Section.TLabel").pack(side=tk.LEFT)
+        ttk.Button(list_head, text="更新", command=self.scan_files).pack(side=tk.RIGHT)
+
+        columns = ("file", "output", "status", "progress")
+        self.progress_tree = ttk.Treeview(list_box, columns=columns, show="headings", height=15)
+        for key, text, width in [
+            ("file", "ファイル", 260),
+            ("output", "出力", 170),
+            ("status", "状態", 120),
+            ("progress", "進捗", 90),
+        ]:
+            self.progress_tree.heading(key, text=text)
+            self.progress_tree.column(key, width=width, anchor=tk.W)
+        self.progress_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(10, 0))
+        tree_scroll = ttk.Scrollbar(list_box, orient=tk.VERTICAL, command=self.progress_tree.yview)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=(10, 0))
+        self.progress_tree.config(yscrollcommand=tree_scroll.set)
+
+        log_box = self._surface(body)
+        log_box.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(12, 0))
+        log_head = ttk.Frame(log_box, style="Surface.TFrame")
+        log_head.pack(fill=tk.X)
+        ttk.Label(log_head, text="ログ", style="Section.TLabel").pack(side=tk.LEFT)
+        ttk.Button(log_head, text="ログフォルダ", command=self.open_log_dir).pack(side=tk.RIGHT)
+        self.log_text = ScrolledText(
+            log_box,
+            wrap=tk.WORD,
+            height=18,
+            bg="#0f172a",
+            fg="#dbeafe",
+            insertbackground="#dbeafe",
+            relief=tk.FLAT,
+            padx=10,
+            pady=10,
+            font=("Consolas", 9),
+        )
+        self.log_text.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+    def _build_profile_tab(self) -> None:
+        form = self._surface(self.profile_tab)
+        form.pack(fill=tk.X)
+
+        toolbar = ttk.Frame(form, style="Surface.TFrame")
+        toolbar.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 12))
+        ttk.Label(toolbar, text="プロファイル設定", style="Section.TLabel").pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="新規", command=self.new_profile).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(toolbar, text="削除", command=self.delete_current_profile).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(toolbar, text="保存", style="Accent.TButton", command=self.save_current_profile).pack(side=tk.RIGHT)
+
+        self.profile_name_var = tk.StringVar()
+        self.input_dir_var = tk.StringVar()
+        self.output_dir_var = tk.StringVar()
+        self.archive_dir_var = tk.StringVar()
         self.max_jobs_var = tk.IntVar(value=2)
-        self.make_4k_var = tk.BooleanVar(value=True)
-        self.make_mp4_var = tk.BooleanVar(value=True)
-        self.auto_download_ffmpeg_var = tk.BooleanVar(value=True)
-        self.height_4k_var = tk.StringVar(value="2160")
+        self.segment_minutes_var = tk.IntVar(value=10)
+        self.gpu_choice_var = tk.StringVar(value="CPU only")
         self.codec_var = tk.StringVar(value="hevc_nvenc")
+        self.cpu_codec_var = tk.StringVar(value="libx264")
         self.preset_var = tk.StringVar(value="p7")
         self.tune_var = tk.StringVar(value="hq")
         self.rate_mode_var = tk.StringVar(value="CQ")
-        self.cq_var = tk.StringVar(value="15")
-        self.bitrate_var = tk.StringVar(value="35000k")
-        self.maxrate_var = tk.StringVar(value="50000k")
-        self.bufsize_var = tk.StringVar(value="100000k")
+        self.cq_var = tk.StringVar(value="18")
+        self.bitrate_var = tk.StringVar(value="25000k")
+        self.maxrate_var = tk.StringVar(value="40000k")
+        self.bufsize_var = tk.StringVar(value="80000k")
 
-        row1 = ttk.Frame(settings_frame)
-        row1.pack(fill=tk.X)
+        self._label_entry(form, "名前", self.profile_name_var, 1, 0, width=28)
+        self._path_entry(form, "入力先", self.input_dir_var, 2, 0)
+        self._path_entry(form, "出力先", self.output_dir_var, 3, 0)
+        self._path_entry(form, "処理済み退避先", self.archive_dir_var, 4, 0)
 
-        ttk.Label(row1, text="Max jobs").pack(side=tk.LEFT)
-        ttk.Spinbox(row1, from_=1, to=8, textvariable=self.max_jobs_var, width=5).pack(side=tk.LEFT, padx=(4, 14))
-        ttk.Checkbutton(row1, text="Make 4K", variable=self.make_4k_var).pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Checkbutton(row1, text="Make MP4", variable=self.make_mp4_var).pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Checkbutton(row1, text="Auto download FFmpeg", variable=self.auto_download_ffmpeg_var).pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Label(row1, text="4K height").pack(side=tk.LEFT)
-        ttk.Entry(row1, textvariable=self.height_4k_var, width=8).pack(side=tk.LEFT, padx=(4, 14))
-        ttk.Label(row1, text="Codec").pack(side=tk.LEFT)
-        ttk.Combobox(row1, textvariable=self.codec_var, values=["hevc_nvenc", "h264_nvenc", "av1_nvenc"], width=14, state="readonly").pack(side=tk.LEFT, padx=(4, 14))
+        ttk.Label(form, text="同時実行数", style="Surface.TLabel").grid(row=1, column=3, sticky=tk.W, padx=(24, 4))
+        ttk.Spinbox(form, from_=1, to=8, textvariable=self.max_jobs_var, width=6).grid(row=1, column=4, sticky=tk.W)
+        ttk.Label(form, text="分割間隔(分)", style="Surface.TLabel").grid(row=2, column=3, sticky=tk.W, padx=(24, 4))
+        ttk.Spinbox(form, from_=1, to=120, textvariable=self.segment_minutes_var, width=6).grid(row=2, column=4, sticky=tk.W)
 
-        row2 = ttk.Frame(settings_frame)
-        row2.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(form, text="GPU", style="Surface.TLabel").grid(row=3, column=3, sticky=tk.W, padx=(24, 4))
+        self.gpu_combo = ttk.Combobox(form, textvariable=self.gpu_choice_var, state="readonly", width=34)
+        self.gpu_combo.grid(row=3, column=4, columnspan=2, sticky="ew")
 
-        ttk.Label(row2, text="Preset").pack(side=tk.LEFT)
-        ttk.Combobox(row2, textvariable=self.preset_var, values=["p1", "p2", "p3", "p4", "p5", "p6", "p7"], width=6, state="readonly").pack(side=tk.LEFT, padx=(4, 14))
-        ttk.Label(row2, text="Tune").pack(side=tk.LEFT)
-        ttk.Combobox(row2, textvariable=self.tune_var, values=["none", "hq", "ll", "ull", "lossless"], width=10, state="readonly").pack(side=tk.LEFT, padx=(4, 14))
-        ttk.Label(row2, text="Rate mode").pack(side=tk.LEFT)
-        ttk.Combobox(row2, textvariable=self.rate_mode_var, values=["CQ", "VBR", "ABR", "CBR"], width=8, state="readonly").pack(side=tk.LEFT, padx=(4, 14))
-        ttk.Label(row2, text="CQ").pack(side=tk.LEFT)
-        ttk.Entry(row2, textvariable=self.cq_var, width=8).pack(side=tk.LEFT, padx=(4, 14))
-        ttk.Label(row2, text="Bitrate").pack(side=tk.LEFT)
-        ttk.Entry(row2, textvariable=self.bitrate_var, width=10).pack(side=tk.LEFT, padx=(4, 14))
-        ttk.Label(row2, text="Maxrate").pack(side=tk.LEFT)
-        ttk.Entry(row2, textvariable=self.maxrate_var, width=10).pack(side=tk.LEFT, padx=(4, 14))
-        ttk.Label(row2, text="Bufsize").pack(side=tk.LEFT)
-        ttk.Entry(row2, textvariable=self.bufsize_var, width=10).pack(side=tk.LEFT, padx=(4, 14))
+        ttk.Label(form, text="NVENC Codec", style="Surface.TLabel").grid(row=5, column=0, sticky=tk.W, pady=(12, 0))
+        ttk.Combobox(
+            form,
+            textvariable=self.codec_var,
+            values=["hevc_nvenc", "h264_nvenc", "av1_nvenc"],
+            width=18,
+            state="readonly",
+        ).grid(row=5, column=1, sticky=tk.W, pady=(12, 0))
+        ttk.Label(form, text="CPU Codec", style="Surface.TLabel").grid(row=5, column=2, sticky=tk.W, pady=(12, 0), padx=(16, 4))
+        ttk.Combobox(
+            form,
+            textvariable=self.cpu_codec_var,
+            values=["libx264", "libx265"],
+            width=14,
+            state="readonly",
+        ).grid(row=5, column=3, sticky=tk.W, pady=(12, 0))
 
-        button_frame = ttk.Frame(main)
-        button_frame.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(form, text="Preset", style="Surface.TLabel").grid(row=6, column=0, sticky=tk.W)
+        ttk.Combobox(
+            form,
+            textvariable=self.preset_var,
+            values=["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+            width=8,
+            state="readonly",
+        ).grid(row=6, column=1, sticky=tk.W)
+        ttk.Label(form, text="Tune", style="Surface.TLabel").grid(row=6, column=2, sticky=tk.W, padx=(16, 4))
+        ttk.Combobox(
+            form,
+            textvariable=self.tune_var,
+            values=["none", "hq", "ll", "ull", "lossless"],
+            width=12,
+            state="readonly",
+        ).grid(row=6, column=3, sticky=tk.W)
+        ttk.Label(form, text="Rate", style="Surface.TLabel").grid(row=6, column=4, sticky=tk.W, padx=(16, 4))
+        rate_combo = ttk.Combobox(
+            form,
+            textvariable=self.rate_mode_var,
+            values=["CQ", "VBR", "ABR", "CBR"],
+            width=8,
+            state="readonly",
+        )
+        rate_combo.grid(row=6, column=5, sticky=tk.W)
+        rate_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_rate_controls())
 
-        ttk.Button(button_frame, text="Scan", command=self.scan_files).pack(side=tk.LEFT)
-        ttk.Button(button_frame, text="Select All", command=self.select_all_files).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(button_frame, text="Clear Select", command=self.clear_selection).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(button_frame, text="Download FFmpeg", command=self.download_ffmpeg_button).pack(side=tk.LEFT, padx=(24, 0))
-        ttk.Button(button_frame, text="Start", command=self.start_selected).pack(side=tk.LEFT, padx=(24, 0))
-        ttk.Button(button_frame, text="Pause", command=self.pause_jobs).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(button_frame, text="Resume", command=self.resume_jobs).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(button_frame, text="Stop", command=self.stop_all).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(button_frame, text="Resume Saved", command=self.resume_saved).pack(side=tk.LEFT, padx=(24, 0))
-        ttk.Button(button_frame, text="Open Log Dir", command=self.open_log_dir).pack(side=tk.LEFT, padx=(8, 0))
+        self.cq_entry = self._compact_entry(form, "CQ/CRF", self.cq_var, 7, 0)
+        self.bitrate_entry = self._compact_entry(form, "Bitrate", self.bitrate_var, 7, 2)
+        self.maxrate_entry = self._compact_entry(form, "Maxrate", self.maxrate_var, 7, 4)
+        self.bufsize_entry = self._compact_entry(form, "Bufsize", self.bufsize_var, 8, 0)
 
-        body = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
-        body.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        for column in range(6):
+            form.columnconfigure(column, weight=1)
 
-        list_frame = ttk.LabelFrame(body, text="OBSData Files", padding=8)
-        body.add(list_frame, weight=1)
+        outputs = self._surface(self.profile_tab)
+        outputs.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
 
-        self.file_list = tk.Listbox(list_frame, selectmode=tk.EXTENDED)
-        self.file_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        list_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_list.yview)
-        list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.file_list.config(yscrollcommand=list_scroll.set)
+        output_head = ttk.Frame(outputs, style="Surface.TFrame")
+        output_head.pack(fill=tk.X)
+        ttk.Label(output_head, text="出力バリアント", style="Section.TLabel").pack(side=tk.LEFT)
+        ttk.Button(output_head, text="選択を解除", command=self.clear_output_selection).pack(side=tk.RIGHT)
 
-        right_frame = ttk.Frame(body)
-        body.add(right_frame, weight=2)
+        output_body = ttk.Frame(outputs, style="Surface.TFrame")
+        output_body.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
-        status_frame = ttk.LabelFrame(right_frame, text="Job Status", padding=8)
-        status_frame.pack(fill=tk.X)
-        self.status_var = tk.StringVar(value="Idle")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(anchor=tk.W)
+        columns = ("name", "resolution", "folder", "container")
+        self.outputs_tree = ttk.Treeview(output_body, columns=columns, show="headings", height=8)
+        for key, text, width in [
+            ("name", "名前", 190),
+            ("resolution", "解像度", 100),
+            ("folder", "フォルダ名", 180),
+            ("container", "形式", 70),
+        ]:
+            self.outputs_tree.heading(key, text=text)
+            self.outputs_tree.column(key, width=width, anchor=tk.W)
+        self.outputs_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.outputs_tree.bind("<<TreeviewSelect>>", self.on_output_select)
 
-        log_frame = ttk.LabelFrame(right_frame, text="Run Log", padding=8)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        self.log_text = ScrolledText(log_frame, wrap=tk.WORD, height=25)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        edit = ttk.Frame(output_body, padding=(16, 0, 0, 0), style="Surface.TFrame")
+        edit.pack(side=tk.RIGHT, fill=tk.Y)
+        self.output_name_var = tk.StringVar()
+        self.output_folder_var = tk.StringVar()
+        self.output_resolution_var = tk.StringVar(value="1080p")
+        self.output_custom_height_var = tk.StringVar(value="")
+        self.output_container_var = tk.StringVar(value="mp4")
+
+        self._stacked_label_entry(edit, "名前", self.output_name_var)
+        self._stacked_label_entry(edit, "フォルダ名", self.output_folder_var)
+        ttk.Label(edit, text="解像度", style="Surface.TLabel").pack(anchor=tk.W, pady=(8, 2))
+        resolution_combo = ttk.Combobox(
+            edit,
+            textvariable=self.output_resolution_var,
+            values=list(RESOLUTION_PRESETS.keys()),
+            width=22,
+            state="readonly",
+        )
+        resolution_combo.pack(anchor=tk.W)
+        resolution_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_resolution_controls())
+        ttk.Label(edit, text="カスタム高さ", style="Surface.TLabel").pack(anchor=tk.W, pady=(8, 2))
+        self.custom_height_entry = ttk.Entry(edit, textvariable=self.output_custom_height_var, width=24)
+        self.custom_height_entry.pack(anchor=tk.W)
+        self._stacked_label_entry(edit, "形式", self.output_container_var)
+        ttk.Button(edit, text="追加/更新", style="Accent.TButton", command=self.add_or_update_output).pack(fill=tk.X, pady=(12, 4))
+        ttk.Button(edit, text="削除", command=self.remove_output).pack(fill=tk.X)
+
+        footer = ttk.Frame(self.profile_tab, style="App.TFrame")
+        footer.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(footer, text="FFmpegを確認/導入", command=self.download_ffmpeg_button).pack(side=tk.RIGHT)
+
+        self.update_rate_controls()
+        self.update_resolution_controls()
+
+    def _label_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, row: int, column: int, width: int = 38) -> ttk.Entry:
+        ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=column, sticky=tk.W, pady=3)
+        entry = ttk.Entry(parent, textvariable=variable, width=width)
+        entry.grid(row=row, column=column + 1, sticky="ew", pady=3)
+        return entry
+
+    def _path_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, row: int, column: int) -> None:
+        ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=column, sticky=tk.W, pady=3)
+        entry = ttk.Entry(parent, textvariable=variable, width=48)
+        entry.grid(row=row, column=column + 1, columnspan=2, sticky="ew", pady=3)
+        ttk.Button(parent, text="選択", command=lambda: self.browse_dir(variable)).grid(row=row, column=column + 3, sticky=tk.W, padx=(8, 0), pady=3)
+
+    def _compact_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, row: int, column: int) -> ttk.Entry:
+        ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=column, sticky=tk.W, pady=(8, 0))
+        entry = ttk.Entry(parent, textvariable=variable, width=12)
+        entry.grid(row=row, column=column + 1, sticky=tk.W, pady=(8, 0))
+        return entry
+
+    def _stacked_label_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar) -> ttk.Entry:
+        ttk.Label(parent, text=label, style="Surface.TLabel").pack(anchor=tk.W, pady=(0, 2))
+        entry = ttk.Entry(parent, textvariable=variable, width=26)
+        entry.pack(anchor=tk.W, pady=(0, 8))
+        return entry
+
+    def browse_dir(self, variable: tk.StringVar) -> None:
+        value = filedialog.askdirectory(initialdir=variable.get() or str(self.paths.base_dir))
+        if value:
+            variable.set(value)
+
+    def _profile_names(self) -> List[str]:
+        return [profile.name for profile in self.profiles]
+
+    def refresh_profile_choices(self) -> None:
+        values = self._profile_names()
+        self.profile_combo.configure(values=values)
+        self.gpu_combo.configure(values=self._gpu_choices())
+        if not self.active_profile_var.get() and values:
+            self.active_profile_var.set(values[0])
+        elif self.active_profile_var.get() not in values and values:
+            self.active_profile_var.set(values[0])
+
+    def _gpu_choices(self) -> List[str]:
+        choices = ["CPU only"]
+        choices.extend([f"GPU {gpu.index}: {gpu.name}" for gpu in self.gpus])
+        return choices
+
+    def current_profile(self) -> EncodeProfile:
+        selected = self.active_profile_var.get()
+        for profile in self.profiles:
+            if profile.name == selected:
+                return profile
+        return self.profiles[0]
+
+    def on_profile_selected(self, _event: object = None) -> None:
+        if self.running:
+            self.log("実行中のため、表示プロファイルだけ切り替えます。")
+        self.load_profile_into_form(self.current_profile())
+        self.scan_files()
+
+    def load_profile_into_form(self, profile: EncodeProfile) -> None:
+        self.profile_name_var.set(profile.name)
+        self.input_dir_var.set(profile.input_dir)
+        self.output_dir_var.set(profile.output_dir)
+        self.archive_dir_var.set(profile.archive_dir)
+        self.max_jobs_var.set(profile.max_parallel_jobs)
+        self.segment_minutes_var.set(profile.segment_minutes)
+        self.gpu_choice_var.set(self._choice_for_profile_gpu(profile))
+        self.codec_var.set(profile.codec)
+        self.cpu_codec_var.set(profile.cpu_codec)
+        self.preset_var.set(profile.preset)
+        self.tune_var.set(profile.tune)
+        self.rate_mode_var.set(profile.rate_mode)
+        self.cq_var.set(str(profile.cq_value))
+        self.bitrate_var.set(profile.bitrate)
+        self.maxrate_var.set(profile.maxrate)
+        self.bufsize_var.set(profile.bufsize)
+        self.editing_outputs = [OutputVariant.from_dict(asdict(item)) for item in profile.outputs]
+        self.selected_output_id = None
+        self.refresh_outputs_tree()
+        self.update_rate_controls()
+
+    def _choice_for_profile_gpu(self, profile: EncodeProfile) -> str:
+        if not profile.use_gpu:
+            return "CPU only"
+        for gpu in self.gpus:
+            if gpu.index == profile.gpu_index:
+                return f"GPU {gpu.index}: {gpu.name}"
+        return "CPU only"
+
+    def _parse_gpu_choice(self) -> tuple[bool, int, str]:
+        choice = self.gpu_choice_var.get()
+        if not choice.startswith("GPU "):
+            return False, 0, ""
+        prefix, _, name = choice.partition(":")
+        index_text = prefix.replace("GPU", "").strip()
+        if not index_text.isdigit():
+            return False, 0, ""
+        return True, int(index_text), name.strip()
+
+    def update_rate_controls(self) -> None:
+        mode = self.rate_mode_var.get().upper()
+        controls = {
+            self.cq_entry: mode in {"CQ", "VBR"},
+            self.bitrate_entry: mode in {"VBR", "ABR", "CBR"},
+            self.maxrate_entry: mode == "VBR",
+            self.bufsize_entry: mode in {"VBR", "CBR"},
+        }
+        for widget, enabled in controls.items():
+            widget.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def update_resolution_controls(self) -> None:
+        state = tk.NORMAL if self.output_resolution_var.get() == "Custom" else tk.DISABLED
+        self.custom_height_entry.configure(state=state)
+
+    def collect_profile_from_form(self) -> Optional[EncodeProfile]:
+        current = self.current_profile()
+        mode = self.rate_mode_var.get().upper()
+        try:
+            max_jobs = int(self.max_jobs_var.get())
+            segment_minutes = int(self.segment_minutes_var.get())
+        except ValueError:
+            messagebox.showerror("入力エラー", "同時実行数と分割間隔は数値で入力してください。")
+            return None
+
+        if mode in {"CQ", "VBR"}:
+            try:
+                cq_value = int(self.cq_var.get())
+            except ValueError:
+                messagebox.showerror("入力エラー", "CQ/CRF は数値で入力してください。")
+                return None
+        else:
+            cq_value = current.cq_value
+
+        if max_jobs < 1:
+            messagebox.showerror("入力エラー", "同時実行数は1以上にしてください。")
+            return None
+        if segment_minutes < 1:
+            messagebox.showerror("入力エラー", "分割間隔は1分以上にしてください。")
+            return None
+        if not self.editing_outputs:
+            messagebox.showerror("入力エラー", "出力バリアントを1つ以上登録してください。")
+            return None
+
+        use_gpu, gpu_index, gpu_name = self._parse_gpu_choice()
+        return EncodeProfile(
+            id=current.id,
+            name=self.profile_name_var.get().strip() or current.name,
+            input_dir=self.input_dir_var.get().strip(),
+            output_dir=self.output_dir_var.get().strip(),
+            archive_dir=self.archive_dir_var.get().strip(),
+            max_parallel_jobs=max_jobs,
+            segment_minutes=segment_minutes,
+            use_gpu=use_gpu,
+            gpu_index=gpu_index,
+            gpu_name=gpu_name,
+            codec=self.codec_var.get(),
+            cpu_codec=self.cpu_codec_var.get(),
+            preset=self.preset_var.get(),
+            tune=self.tune_var.get(),
+            rate_mode=self.rate_mode_var.get(),
+            cq_value=cq_value,
+            bitrate=self.bitrate_var.get().strip(),
+            maxrate=self.maxrate_var.get().strip(),
+            bufsize=self.bufsize_var.get().strip(),
+            outputs=[OutputVariant.from_dict(asdict(item)) for item in self.editing_outputs],
+        )
+
+    def save_current_profile(self) -> None:
+        profile = self.collect_profile_from_form()
+        if profile is None:
+            return
+
+        for index, existing in enumerate(self.profiles):
+            if existing.id == profile.id:
+                self.profiles[index] = profile
+                break
+        else:
+            self.profiles.append(profile)
+
+        save_profiles(self.paths, self.profiles)
+        self.active_profile_var.set(profile.name)
+        self.refresh_profile_choices()
+        self.log(f"プロファイルを保存: {profile.name}")
+        self.scan_files()
+
+    def new_profile(self) -> None:
+        profile = default_profile(self.paths, self.gpus)
+        profile.id = new_id("profile")
+        profile.name = f"Profile {len(self.profiles) + 1}"
+        self.profiles.append(profile)
+        save_profiles(self.paths, self.profiles)
+        self.active_profile_var.set(profile.name)
+        self.refresh_profile_choices()
+        self.load_profile_into_form(profile)
+        self.scan_files()
+
+    def delete_current_profile(self) -> None:
+        if len(self.profiles) <= 1:
+            messagebox.showwarning("削除できません", "プロファイルは最低1つ必要です。")
+            return
+        profile = self.current_profile()
+        ok = messagebox.askyesno("削除", f"プロファイル '{profile.name}' を削除しますか？")
+        if not ok:
+            return
+        self.profiles = [item for item in self.profiles if item.id != profile.id]
+        save_profiles(self.paths, self.profiles)
+        self.active_profile_var.set(self.profiles[0].name)
+        self.refresh_profile_choices()
+        self.load_profile_into_form(self.current_profile())
+        self.scan_files()
+
+    def refresh_outputs_tree(self) -> None:
+        self.outputs_tree.delete(*self.outputs_tree.get_children())
+        for variant in self.editing_outputs:
+            resolution = "Original" if variant.height is None else f"{variant.height}p"
+            self.outputs_tree.insert(
+                "",
+                tk.END,
+                iid=variant.id,
+                values=(variant.name, resolution, variant.folder_name, variant.container),
+            )
+
+    def on_output_select(self, _event: object = None) -> None:
+        selection = self.outputs_tree.selection()
+        if not selection:
+            return
+        self.selected_output_id = selection[0]
+        for variant in self.editing_outputs:
+            if variant.id == self.selected_output_id:
+                self.output_name_var.set(variant.name)
+                self.output_folder_var.set(variant.folder_name)
+                if variant.height is None:
+                    self.output_resolution_var.set("Original")
+                    self.output_custom_height_var.set("")
+                elif variant.height in [2160, 1440, 1080, 720]:
+                    self.output_resolution_var.set(f"{variant.height}p")
+                    self.output_custom_height_var.set("")
+                else:
+                    self.output_resolution_var.set("Custom")
+                    self.output_custom_height_var.set(str(variant.height))
+                self.output_container_var.set(variant.container)
+                self.update_resolution_controls()
+                return
+
+    def clear_output_selection(self) -> None:
+        self.outputs_tree.selection_remove(self.outputs_tree.selection())
+        self.selected_output_id = None
+        self.output_name_var.set("")
+        self.output_folder_var.set("")
+        self.output_resolution_var.set("1080p")
+        self.output_custom_height_var.set("")
+        self.output_container_var.set("mp4")
+        self.update_resolution_controls()
+
+    def add_or_update_output(self) -> None:
+        name = self.output_name_var.get().strip()
+        folder_name = safe_folder_name(self.output_folder_var.get().strip() or name)
+        container = self.output_container_var.get().strip().lstrip(".") or "mp4"
+        if not name:
+            messagebox.showerror("入力エラー", "出力名を入力してください。")
+            return
+
+        preset = self.output_resolution_var.get()
+        if preset == "Custom":
+            try:
+                height = int(self.output_custom_height_var.get())
+            except ValueError:
+                messagebox.showerror("入力エラー", "カスタム解像度の高さを数値で入力してください。")
+                return
+            if height < 1:
+                messagebox.showerror("入力エラー", "カスタム解像度は1以上にしてください。")
+                return
+        else:
+            height = RESOLUTION_PRESETS.get(preset)
+
+        variant = OutputVariant(
+            id=self.selected_output_id or new_id("variant"),
+            name=name,
+            folder_name=folder_name,
+            height=height,
+            container=container,
+            enabled=True,
+        )
+
+        for index, existing in enumerate(self.editing_outputs):
+            if existing.id == variant.id:
+                self.editing_outputs[index] = variant
+                break
+        else:
+            self.editing_outputs.append(variant)
+
+        self.selected_output_id = variant.id
+        self.refresh_outputs_tree()
+        self.outputs_tree.selection_set(variant.id)
+
+    def remove_output(self) -> None:
+        if not self.selected_output_id:
+            return
+        self.editing_outputs = [item for item in self.editing_outputs if item.id != self.selected_output_id]
+        self.clear_output_selection()
+        self.refresh_outputs_tree()
 
     def log(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -219,22 +785,72 @@ class EncoderApp:
         with self.lock:
             active = len(self.active_jobs)
             pending = self.pending_jobs.qsize()
-            state = "Paused" if self.paused else ("Running" if self.running else "Idle")
-        self.status_var.set(f"State: {state} / Active: {active} / Pending: {pending}")
-        self.root.after(200, self._poll_log_queue)
+            state = "一時停止" if self.paused else ("実行中" if self.running else "待機中")
+            jobs = list(self.all_jobs.values())
+
+        self.status_var.set(f"{state} / 実行中 {active} / 待機 {pending}")
+        self.pause_button.configure(text="再開" if self.paused else "一時停止")
+        self._update_runtime_rows(jobs)
+        self._update_overall_progress(jobs)
+        self.root.after(250, self._poll_log_queue)
+
+    def _update_overall_progress(self, jobs: List[RuntimeJob]) -> None:
+        if not jobs:
+            self.overall_progress["value"] = 0
+            self.progress_text_var.set("0%")
+            return
+        value = sum(max(0.0, min(100.0, job.progress)) for job in jobs) / len(jobs)
+        self.overall_progress["value"] = value
+        self.progress_text_var.set(f"{value:.0f}%")
+
+    def _update_runtime_rows(self, jobs: List[RuntimeJob]) -> None:
+        for job in jobs:
+            row_id = self.job_rows.get(job.job_id)
+            if not row_id or not self.progress_tree.exists(row_id):
+                continue
+            file_name = Path(job.spec.src).name
+            detail = job.message or f"{job.completed_segments}/{job.total_segments} segments"
+            self.progress_tree.item(
+                row_id,
+                values=(file_name, job.variant.name, job.status, f"{job.progress:.0f}%  {detail}"),
+            )
+
+    def _announce_resume_state(self) -> None:
+        data = load_state(self.paths)
+        if data:
+            self.log("未完了の保存状態があります。必要なら「保存状態から再開」を押してください。")
 
     def scan_files(self) -> None:
-        self.files = scan_obs_files(self.paths)
-        self.file_list.delete(0, tk.END)
+        if self.running:
+            return
+        profile = self.current_profile()
+        self.files = scan_profile_files(profile)
+        self.render_scan_rows(profile)
+        self.input_summary_var.set(f"入力: {profile.input_dir}")
+        variants = ", ".join(variant.name for variant in profile.outputs if variant.enabled)
+        self.output_summary_var.set(f"出力: {profile.output_dir} / {variants or '未設定'}")
+        if not profile_input_dir(profile).exists():
+            self.log(f"入力フォルダはまだありません: {profile.input_dir}")
+        else:
+            self.log(f"{profile.name}: {len(self.files)} file(s) scanned.")
+
+    def render_scan_rows(self, profile: EncodeProfile) -> None:
+        self.progress_tree.delete(*self.progress_tree.get_children())
         for item in self.files:
-            self.file_list.insert(tk.END, f"{item.label} {item.path.name}")
-        self.log(f"Scanned {len(self.files)} file(s).")
-
-    def select_all_files(self) -> None:
-        self.file_list.select_set(0, tk.END)
-
-    def clear_selection(self) -> None:
-        self.file_list.selection_clear(0, tk.END)
+            for variant in profile.outputs:
+                if not variant.enabled:
+                    continue
+                done = item.outputs.get(variant.id, False)
+                self.progress_tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        item.path.name,
+                        variant.name,
+                        "完了" if done else "待機",
+                        "100%" if done else "0%",
+                    ),
+                )
 
     def open_log_dir(self) -> None:
         self.paths.log_dir.mkdir(parents=True, exist_ok=True)
@@ -250,160 +866,129 @@ class EncoderApp:
     def _download_ffmpeg_worker(self) -> None:
         try:
             ensure_ffmpeg_available(self.paths, auto_download=True, progress=self.log)
-            self.log("FFmpeg is ready.")
+            self.log("FFmpeg / FFprobe is ready.")
         except Exception as exc:
-            self.log(f"FFmpeg download failed: {exc}")
-            self.root.after(0, lambda: messagebox.showerror("FFmpeg download failed", str(exc)))
+            self.log(f"FFmpeg install failed: {exc}")
+            self.root.after(0, lambda: messagebox.showerror("FFmpeg install failed", str(exc)))
 
     def ensure_ffmpeg_before_run(self) -> bool:
-        if self.paths.ffmpeg_path.exists():
-            return True
+        if self.paths.ffmpeg_path.exists() and self.paths.ffprobe_path.exists():
+            try:
+                ensure_ffmpeg_available(self.paths, auto_download=False, progress=self.log)
+                return True
+            except Exception as exc:
+                messagebox.showerror("FFmpeg error", str(exc))
+                return False
 
-        if not self.auto_download_ffmpeg_var.get():
-            messagebox.showerror("Error", f"ffmpeg.exe was not found:\n{self.paths.ffmpeg_path}")
-            return False
-
-        ok = messagebox.askyesno(
-            "FFmpeg not found",
-            "ffmpeg.exe was not found.\n\nDownload FFmpeg now?",
+        messagebox.showinfo(
+            "FFmpeg を準備します",
+            "FFmpeg / FFprobe が見つからないため、自動でダウンロードして配置します。",
         )
-        if not ok:
-            return False
-
         try:
             ensure_ffmpeg_available(self.paths, auto_download=True, progress=self.log)
-            self.log("FFmpeg is ready.")
+            self.log("FFmpeg / FFprobe is ready.")
             return True
         except FfmpegDownloadError as exc:
-            messagebox.showerror("FFmpeg download failed", str(exc))
+            messagebox.showerror("FFmpeg install failed", str(exc))
             return False
         except Exception as exc:
-            messagebox.showerror("FFmpeg download failed", str(exc))
+            messagebox.showerror("FFmpeg install failed", str(exc))
             return False
 
-    def read_settings(self) -> Optional[EncodeSettings]:
-        try:
-            max_jobs = int(self.max_jobs_var.get())
-            height_4k = int(self.height_4k_var.get())
-            cq_value = int(self.cq_var.get())
-        except ValueError:
-            messagebox.showerror("Error", "Max jobs, 4K height, and CQ must be numbers.")
-            return None
+    def start_current_profile(self) -> None:
+        profile = self.current_profile()
 
-        if max_jobs < 1:
-            messagebox.showerror("Error", "Max jobs must be 1 or more.")
-            return None
-        if height_4k < 1:
-            messagebox.showerror("Error", "4K height must be 1 or more.")
-            return None
-        if not self.make_4k_var.get() and not self.make_mp4_var.get():
-            messagebox.showerror("Error", "Select Make 4K or Make MP4.")
-            return None
-
-        return EncodeSettings(
-            max_jobs=max_jobs,
-            make_4k=self.make_4k_var.get(),
-            make_mp4=self.make_mp4_var.get(),
-            height_4k=height_4k,
-            codec=self.codec_var.get(),
-            preset=self.preset_var.get(),
-            tune=self.tune_var.get(),
-            rate_mode=self.rate_mode_var.get(),
-            cq_value=cq_value,
-            bitrate=self.bitrate_var.get().strip(),
-            maxrate=self.maxrate_var.get().strip(),
-            bufsize=self.bufsize_var.get().strip(),
-        )
-
-    def start_selected(self) -> None:
-        if not self.ensure_ffmpeg_before_run():
-            return
-
-        settings = self.read_settings()
-        if settings is None:
-            return
-
-        selected = list(self.file_list.curselection())
-        if not selected:
-            messagebox.showwarning("Warning", "Select one or more files.")
-            return
-
-        selected_files = [self.files[i].path for i in selected]
-        specs = build_job_specs(self.paths, selected_files, settings)
-        self.start_specs(settings, specs, save=True)
-
-    def resume_saved(self) -> None:
-        if not self.ensure_ffmpeg_before_run():
-            return
-
-        data = load_state(self.paths)
-        if not data:
-            messagebox.showinfo("Info", "No saved state was found.")
-            return
-
-        settings = EncodeSettings.from_dict(data.get("settings", {}))
-        specs = resumable_specs(self.paths, data)
-        if not specs:
-            clear_state(self.paths)
-            self.log("Saved jobs are already completed. State was cleared.")
+        ensure_profile_dirs(profile)
+        self.files = scan_profile_files(profile)
+        if not self.files:
+            messagebox.showwarning("対象なし", "入力フォルダに動画ファイルがありません。")
             self.scan_files()
             return
 
-        self.start_specs(settings, specs, save=True)
+        specs = build_job_specs(profile, [item.path for item in self.files])
+        if not specs:
+            messagebox.showinfo("対象なし", "このプロファイルの出力はすべて完了しています。")
+            self.scan_files()
+            return
 
-    def start_specs(self, settings: EncodeSettings, specs: List[JobSpec], save: bool) -> None:
+        if not self.ensure_ffmpeg_before_run():
+            return
+
+        self.start_specs(profile, specs, save=True)
+
+    def resume_saved(self) -> None:
+        data = load_state(self.paths)
+        if not data:
+            messagebox.showinfo("保存状態なし", "再開できる保存状態はありません。")
+            return
+
+        profile = profile_from_state(data)
+        specs = resumable_specs(profile, data)
+        if not specs:
+            clear_state(self.paths)
+            self.log("保存状態はすでに完了済みでした。状態ファイルを削除しました。")
+            self.scan_files()
+            return
+
+        if not self.ensure_ffmpeg_before_run():
+            return
+
+        ensure_profile_dirs(profile)
+        self.start_specs(profile, specs, save=True)
+
+    def start_specs(self, profile: EncodeProfile, specs: List[JobSpec], save: bool) -> None:
         with self.lock:
             if self.running:
-                messagebox.showwarning("Warning", "Jobs are already running.")
+                messagebox.showwarning("実行中", "すでにジョブが実行中です。")
                 return
             self.running = True
             self.paused = False
             self.stop_requested = False
             self.active_jobs.clear()
             self.all_jobs.clear()
+            self.job_rows.clear()
             while not self.pending_jobs.empty():
                 try:
                     self.pending_jobs.get_nowait()
                 except queue.Empty:
                     break
 
-        if not specs:
-            with self.lock:
-                self.running = False
-            self.log("No jobs were added.")
-            self.move_finished_sources(settings)
-            self.scan_files()
-            return
-
         if save:
-            save_state(self.paths, settings, specs)
+            save_state(self.paths, profile, specs)
 
+        self.progress_tree.delete(*self.progress_tree.get_children())
         for spec in specs:
-            job = self.create_runtime_job(spec, settings)
+            job = self.create_runtime_job(spec, profile)
             self.pending_jobs.put(job)
             self.all_jobs[job.job_id] = job
+            self.job_rows[job.job_id] = self.progress_tree.insert(
+                "",
+                tk.END,
+                values=(Path(spec.src).name, job.variant.name, "待機", "0%"),
+            )
 
-        self.log(f"Added {len(specs)} job(s).")
-        self.scheduler_thread = threading.Thread(target=self.scheduler_loop, args=(settings,), daemon=True)
+        self.log(f"{profile.name}: {len(specs)} job(s) added.")
+        self.scheduler_thread = threading.Thread(target=self.scheduler_loop, args=(profile,), daemon=True)
         self.scheduler_thread.start()
 
-    def create_runtime_job(self, spec: JobSpec, settings: EncodeSettings) -> RuntimeJob:
+    def create_runtime_job(self, spec: JobSpec, profile: EncodeProfile) -> RuntimeJob:
         self.job_counter += 1
         src = Path(spec.src)
-        tmp_out = temp_path_for(self.paths, src, spec.mode)
-        out_file = output_path_for(self.paths, src, spec.mode)
-        log_file = self.paths.log_dir / f"job_{self.job_counter}_{spec.mode}.log"
-        command = build_ffmpeg_command(self.paths.ffmpeg_path, src, tmp_out, spec.mode, settings)
+        variant = variant_by_id(profile, spec.variant_id)
+        tmp_out = temp_output_path_for(self.paths, src, variant)
+        out_file = output_path_for(profile, src, variant)
+        log_file = self.paths.log_dir / f"job_{self.job_counter}_{variant.folder_name}.log"
         return RuntimeJob(
             job_id=self.job_counter,
             spec=spec,
+            profile=profile,
+            variant=variant,
             tmp_out=tmp_out,
             out_file=out_file,
             log_file=log_file,
-            command=command,
         )
 
-    def scheduler_loop(self, settings: EncodeSettings) -> None:
+    def scheduler_loop(self, profile: EncodeProfile) -> None:
         self.log("Scheduler started.")
 
         while True:
@@ -418,7 +1003,7 @@ class EncoderApp:
                 break
 
             if not is_paused:
-                while active_count < settings.max_jobs:
+                while active_count < profile.max_parallel_jobs:
                     try:
                         job = self.pending_jobs.get_nowait()
                     except queue.Empty:
@@ -449,110 +1034,224 @@ class EncoderApp:
             self.paused = False
 
         if stopped:
-            self.log("Scheduler stopped.")
+            self.log("Scheduler stopped. 完了済みセグメントは再開用に残します。")
         else:
             self.log("Scheduler finished.")
-            self.move_finished_sources(settings)
+            self.move_finished_sources(profile)
             clear_state(self.paths)
             self.root.after(0, self.scan_files)
 
     def start_job_thread(self, job: RuntimeJob) -> None:
         with self.lock:
             self.active_jobs[job.job_id] = job
-            job.status = "running"
+            job.status = "準備中"
         thread = threading.Thread(target=self.run_job, args=(job,), daemon=True)
         thread.start()
 
     def run_job(self, job: RuntimeJob) -> None:
         src = Path(job.spec.src)
-        self.log(f"Start {job.spec.mode}: {src.name}")
+        segment_seconds = max(60, int(job.profile.segment_minutes) * 60)
+        self.log(f"Start {job.variant.name}: {src.name}")
         self.log(f"Log file: {job.log_file}")
 
-        if job.tmp_out.exists():
-            try:
-                job.tmp_out.unlink()
-            except Exception as exc:
-                self.log(f"Failed to delete temp file: {exc}")
-
-        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        segment_dir_for(self.paths, src, job.variant).mkdir(parents=True, exist_ok=True)
 
         try:
             with open(job.log_file, "w", encoding="utf-8", errors="replace") as log_fp:
-                log_fp.write("Command:\n")
-                log_fp.write(command_to_text(job.command))
-                log_fp.write("\n\n")
+                duration = probe_duration(self.paths.ffprobe_path, src)
+                ranges = segment_ranges(duration, segment_seconds)
+
+                with self.lock:
+                    job.total_segments = len(ranges)
+                    job.message = f"0/{len(ranges)} segments"
+                    job.status = "実行中"
+
+                segment_files: List[Path] = []
+                for index, (start, duration_seconds) in enumerate(ranges):
+                    final_segment = segment_path_for(self.paths, src, job.variant, index)
+                    partial_segment = partial_segment_path_for(self.paths, src, job.variant, index)
+                    segment_files.append(final_segment)
+
+                    if final_segment.exists():
+                        self._mark_segment_done(job, index + 1)
+                        continue
+
+                    if not self.wait_until_unpaused(job):
+                        self._mark_job_cancelled(job)
+                        return
+
+                    if partial_segment.exists():
+                        partial_segment.unlink(missing_ok=True)
+
+                    command = build_ffmpeg_command(
+                        self.paths.ffmpeg_path,
+                        src,
+                        partial_segment,
+                        job.profile,
+                        job.variant,
+                        start_seconds=start,
+                        duration_seconds=duration_seconds,
+                    )
+                    log_fp.write(f"\nSegment {index + 1}/{len(ranges)} command:\n")
+                    log_fp.write(command_to_text(command) + "\n\n")
+                    log_fp.flush()
+
+                    with self.lock:
+                        job.current_segment = index + 1
+                        job.status = "実行中"
+                        job.message = f"segment {index + 1}/{len(ranges)}"
+
+                    ret = self.run_process(job, command, log_fp, duration_seconds)
+                    if self.was_stopped() or ret != 0 or not partial_segment.exists():
+                        partial_segment.unlink(missing_ok=True)
+                        if self.was_stopped():
+                            self._mark_job_cancelled(job)
+                        else:
+                            self._mark_job_failed(job, f"segment {index + 1} failed: exit {ret}")
+                        return
+
+                    partial_segment.replace(final_segment)
+                    self._mark_segment_done(job, index + 1)
+
+                if not self.wait_until_unpaused(job):
+                    self._mark_job_cancelled(job)
+                    return
+
+                concat_file = concat_list_path_for(self.paths, src, job.variant)
+                write_concat_file(concat_file, segment_files)
+                if job.tmp_out.exists():
+                    job.tmp_out.unlink(missing_ok=True)
+                concat_command = build_concat_command(self.paths.ffmpeg_path, concat_file, job.tmp_out)
+                log_fp.write("\nConcat command:\n")
+                log_fp.write(command_to_text(concat_command) + "\n\n")
                 log_fp.flush()
 
-                process = subprocess.Popen(
-                    job.command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    creationflags=creationflags,
-                )
-                job.process = process
+                with self.lock:
+                    job.status = "結合中"
+                    job.message = "finalizing"
 
-                if process.stdout is not None:
-                    for line in process.stdout:
-                        line = line.rstrip("\r\n")
-                        if line:
-                            log_fp.write(line + "\n")
-                            log_fp.flush()
-                            self.log(f"job {job.job_id}: {line}")
+                ret = self.run_process(job, concat_command, log_fp, None)
+                if self.was_stopped() or ret != 0 or not job.tmp_out.exists():
+                    job.tmp_out.unlink(missing_ok=True)
+                    if self.was_stopped():
+                        self._mark_job_cancelled(job)
+                    else:
+                        self._mark_job_failed(job, f"concat failed: exit {ret}")
+                    return
 
-                ret = process.wait()
-
-            if ret == 0 and job.tmp_out.exists():
                 job.out_file.parent.mkdir(parents=True, exist_ok=True)
                 if job.out_file.exists():
                     job.out_file.unlink()
                 shutil.move(str(job.tmp_out), str(job.out_file))
-                job.status = "ok"
-                self.log(f"Finish {job.spec.mode}: {src.name}")
-            else:
-                job.status = "fail"
-                if job.tmp_out.exists():
-                    job.tmp_out.unlink(missing_ok=True)
-                self.log(f"Failed {job.spec.mode}: {src.name} / exit code {ret}")
+                shutil.rmtree(segment_dir_for(self.paths, src, job.variant), ignore_errors=True)
+                with self.lock:
+                    job.status = "完了"
+                    job.progress = 100.0
+                    job.message = "done"
+                self.log(f"Finish {job.variant.name}: {src.name}")
         except Exception as exc:
-            job.status = "fail"
-            if job.tmp_out.exists():
-                job.tmp_out.unlink(missing_ok=True)
+            self._mark_job_failed(job, str(exc))
             self.log(f"Exception in job {job.job_id}: {exc}")
         finally:
             with self.lock:
                 self.active_jobs.pop(job.job_id, None)
 
-    def pause_jobs(self) -> None:
-        with self.lock:
-            if not self.running:
-                return
-            self.paused = True
-            jobs = list(self.active_jobs.values())
+    def run_process(
+        self,
+        job: RuntimeJob,
+        command: List[str],
+        log_fp,
+        segment_duration: Optional[float],
+    ) -> int:
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creationflags,
+        )
+        job.process = process
 
-        if psutil is None:
-            self.log("Soft pause only. Install psutil for real process pause.")
-            self.log("Soft pause: new jobs will not start.")
+        if process.stdout is not None:
+            for raw_line in process.stdout:
+                line = raw_line.rstrip("\r\n")
+                if line:
+                    log_fp.write(line + "\n")
+                    log_fp.flush()
+                    self.log(f"job {job.job_id}: {line}")
+                    self._update_job_progress_from_line(job, line, segment_duration)
+
+        ret = process.wait()
+        job.process = None
+        return ret
+
+    def _update_job_progress_from_line(
+        self,
+        job: RuntimeJob,
+        line: str,
+        segment_duration: Optional[float],
+    ) -> None:
+        if not segment_duration:
             return
+        current = parse_ffmpeg_time(line)
+        if current is None:
+            return
+        current_ratio = min(max(current / segment_duration, 0.0), 1.0)
+        with self.lock:
+            job.progress = ((job.completed_segments + current_ratio) / max(job.total_segments, 1)) * 100.0
 
-        for job in jobs:
-            self.suspend_process(job)
-        self.log("Paused.")
+    def _mark_segment_done(self, job: RuntimeJob, completed: int) -> None:
+        with self.lock:
+            job.completed_segments = max(job.completed_segments, completed)
+            job.progress = (job.completed_segments / max(job.total_segments, 1)) * 100.0
+            job.message = f"{job.completed_segments}/{job.total_segments} segments"
 
-    def resume_jobs(self) -> None:
+    def _mark_job_failed(self, job: RuntimeJob, message: str) -> None:
+        with self.lock:
+            job.status = "失敗"
+            job.message = message
+        self.log(f"Failed {job.variant.name}: {Path(job.spec.src).name} / {message}")
+
+    def _mark_job_cancelled(self, job: RuntimeJob) -> None:
+        with self.lock:
+            job.status = "中断"
+            job.message = "resume available"
+        self.log(f"Cancelled {job.variant.name}: {Path(job.spec.src).name}")
+
+    def was_stopped(self) -> bool:
+        with self.lock:
+            return self.stop_requested
+
+    def wait_until_unpaused(self, job: RuntimeJob) -> bool:
+        while True:
+            with self.lock:
+                if self.stop_requested:
+                    return False
+                paused = self.paused
+                if paused:
+                    job.status = "一時停止"
+                    job.message = "waiting between segments"
+            if not paused:
+                with self.lock:
+                    if job.status == "一時停止":
+                        job.status = "実行中"
+                return True
+            time.sleep(0.3)
+
+    def toggle_pause(self) -> None:
         with self.lock:
             if not self.running:
                 return
-            jobs = list(self.active_jobs.values())
-            self.paused = False
-
-        if psutil is not None:
-            for job in jobs:
-                self.resume_process(job)
-        self.log("Resumed.")
+            self.paused = not self.paused
+            paused = self.paused
+        if paused:
+            self.log("安全な一時停止を予約しました。現在のセグメント完了後に停止します。")
+        else:
+            self.log("再開しました。")
 
     def stop_all(self) -> None:
         with self.lock:
@@ -564,89 +1263,47 @@ class EncoderApp:
             while not self.pending_jobs.empty():
                 try:
                     dropped = self.pending_jobs.get_nowait()
-                    dropped.status = "cancelled"
+                    dropped.status = "中断"
+                    dropped.message = "not started"
                 except queue.Empty:
                     break
 
         for job in jobs:
-            if psutil is not None:
-                self.resume_process(job)
-                self.kill_process(job)
-            elif job.process is not None:
+            if job.process is not None and job.process.poll() is None:
                 try:
                     job.process.kill()
                 except Exception:
                     pass
-        self.log("Stop sent to all active jobs.")
+        self.log("中断を送信しました。完了済みセグメントは保持します。")
 
-    def suspend_process(self, job: RuntimeJob) -> None:
-        if job.process is None or job.process.poll() is not None:
-            return
-        try:
-            parent = psutil.Process(job.process.pid)  # type: ignore[union-attr]
-            for child in parent.children(recursive=True):
-                try:
-                    child.suspend()
-                except Exception:
-                    pass
-            parent.suspend()
-        except Exception as exc:
-            self.log(f"Pause failed for job {job.job_id}: {exc}")
-
-    def resume_process(self, job: RuntimeJob) -> None:
-        if job.process is None:
-            return
-        try:
-            parent = psutil.Process(job.process.pid)  # type: ignore[union-attr]
-            for child in parent.children(recursive=True):
-                try:
-                    child.resume()
-                except Exception:
-                    pass
-            parent.resume()
-        except Exception:
-            pass
-
-    def kill_process(self, job: RuntimeJob) -> None:
-        if job.process is None or job.process.poll() is not None:
-            return
-        try:
-            parent = psutil.Process(job.process.pid)  # type: ignore[union-attr]
-            for child in parent.children(recursive=True):
-                try:
-                    child.kill()
-                except Exception:
-                    pass
-            parent.kill()
-        except Exception as exc:
-            self.log(f"Kill failed for job {job.job_id}: {exc}")
-
-    def move_finished_sources(self, settings: EncodeSettings) -> None:
+    def move_finished_sources(self, profile: EncodeProfile) -> None:
         moved = 0
         kept = 0
-        for status in scan_obs_files(self.paths):
-            src = status.path
-            stem = src.stem
-            k4_ok = (self.paths.k4_dir / f"{stem}.mp4").exists()
-            mp4_ok = (self.paths.mp4_dir / f"{stem}.mp4").exists()
+        archive_dir = profile_archive_dir(profile)
+        archive_dir.mkdir(parents=True, exist_ok=True)
 
-            if settings.make_4k and not k4_ok:
+        for status in scan_profile_files(profile):
+            src = status.path
+            missing = []
+            for variant in profile.outputs:
+                if not variant.enabled:
+                    continue
+                if not output_path_for(profile, src, variant).exists():
+                    missing.append(variant.name)
+
+            if missing:
                 kept += 1
-                self.log(f"Keep source: {src.name} / Missing 4K output.")
-                continue
-            if settings.make_mp4 and not mp4_ok:
-                kept += 1
-                self.log(f"Keep source: {src.name} / Missing MP4 output.")
+                self.log(f"Keep source: {src.name} / missing {', '.join(missing)}")
                 continue
 
             try:
-                dest = self.paths.source_dir / src.name
+                dest = archive_dir / src.name
                 if dest.exists():
                     base = dest.stem
                     suffix = dest.suffix
                     n = 1
                     while dest.exists():
-                        dest = self.paths.source_dir / f"{base}_{n}{suffix}"
+                        dest = archive_dir / f"{base}_{n}{suffix}"
                         n += 1
                 shutil.move(str(src), str(dest))
                 moved += 1
@@ -664,7 +1321,7 @@ def main() -> None:
 
     def on_close() -> None:
         if app.running:
-            ok = messagebox.askyesno("Exit", "Jobs are running. Stop all jobs and exit?")
+            ok = messagebox.askyesno("Exit", "ジョブが実行中です。中断して終了しますか？")
             if not ok:
                 return
             app.stop_all()

@@ -30,6 +30,7 @@ from ffmpeg_nvenc_gui.core import (
     save_state,
     scan_profile_files,
     segment_dir_for,
+    segment_file_name,
     segment_ranges,
     write_concat_file,
 )
@@ -423,6 +424,18 @@ def test_segment_dir_includes_profile_and_encode_settings(tmp_path: Path):
     assert base_dir != other_profile_dir
     assert base_dir != edited_settings_dir
     assert base_dir != replaced_source_dir
+
+
+def test_segment_file_name_normalizes_container_and_partial_marker():
+    variant = OutputVariant(
+        id="review",
+        name="Review",
+        folder_name="review",
+        container=".MKV",
+    )
+
+    assert segment_file_name(variant, 3) == "segment-00003.mkv"
+    assert segment_file_name(variant, 3, partial=True) == "segment-00003.partial.mkv"
 
 
 def test_encoder_app_profile_helpers_use_ids_for_duplicates(tmp_path: Path):

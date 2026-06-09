@@ -29,7 +29,6 @@ try:
         build_paths,
         clear_state,
         command_to_text,
-        concat_list_path_for,
         default_profile,
         detect_nvidia_gpus,
         duplicate_output_targets,
@@ -45,7 +44,6 @@ try:
         normalize_container_extension,
         output_path_for,
         parse_ffmpeg_time,
-        partial_segment_path_for,
         probe_duration,
         profile_archive_dir,
         profile_from_state,
@@ -56,7 +54,7 @@ try:
         save_state,
         scan_profile_files,
         segment_dir_for,
-        segment_path_for,
+        segment_file_name,
         segment_ranges,
         temp_output_path_for,
         variant_by_id,
@@ -78,7 +76,6 @@ except ModuleNotFoundError:
         build_paths,
         clear_state,
         command_to_text,
-        concat_list_path_for,
         default_profile,
         detect_nvidia_gpus,
         duplicate_output_targets,
@@ -94,7 +91,6 @@ except ModuleNotFoundError:
         normalize_container_extension,
         output_path_for,
         parse_ffmpeg_time,
-        partial_segment_path_for,
         probe_duration,
         profile_archive_dir,
         profile_from_state,
@@ -105,7 +101,7 @@ except ModuleNotFoundError:
         save_state,
         scan_profile_files,
         segment_dir_for,
-        segment_path_for,
+        segment_file_name,
         segment_ranges,
         temp_output_path_for,
         variant_by_id,
@@ -1189,10 +1185,12 @@ class EncoderApp:
     def run_job(self, job: RuntimeJob) -> None:
         src = Path(job.spec.src)
         segment_seconds = max(60, int(job.profile.segment_minutes) * 60)
+        # job_key includes source size/mtime, so keep one segment root for this run.
+        segment_root = segment_dir_for(self.paths, src, job.profile, job.variant)
         self.log(f"Start {job.variant.name}: {src.name}")
         self.log(f"Log file: {job.log_file}")
 
-        segment_dir_for(self.paths, src, job.profile, job.variant).mkdir(parents=True, exist_ok=True)
+        segment_root.mkdir(parents=True, exist_ok=True)
 
         try:
             with open(job.log_file, "w", encoding="utf-8", errors="replace") as log_fp:
@@ -1206,8 +1204,8 @@ class EncoderApp:
 
                 segment_files: List[Path] = []
                 for index, (start, duration_seconds) in enumerate(ranges):
-                    final_segment = segment_path_for(self.paths, src, job.profile, job.variant, index)
-                    partial_segment = partial_segment_path_for(self.paths, src, job.profile, job.variant, index)
+                    final_segment = segment_root / segment_file_name(job.variant, index)
+                    partial_segment = segment_root / segment_file_name(job.variant, index, partial=True)
                     segment_files.append(final_segment)
 
                     if final_segment.exists():
@@ -1255,7 +1253,7 @@ class EncoderApp:
                     self._mark_job_cancelled(job)
                     return
 
-                concat_file = concat_list_path_for(self.paths, src, job.profile, job.variant)
+                concat_file = segment_root / "concat.txt"
                 write_concat_file(concat_file, segment_files)
                 if job.tmp_out.exists():
                     job.tmp_out.unlink(missing_ok=True)
@@ -1281,7 +1279,7 @@ class EncoderApp:
                 if job.out_file.exists():
                     job.out_file.unlink()
                 shutil.move(str(job.tmp_out), str(job.out_file))
-                shutil.rmtree(segment_dir_for(self.paths, src, job.profile, job.variant), ignore_errors=True)
+                shutil.rmtree(segment_root, ignore_errors=True)
                 with self.lock:
                     job.status = "完了"
                     job.progress = 100.0

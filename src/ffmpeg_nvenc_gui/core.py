@@ -804,23 +804,15 @@ def segment_dir_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant:
     return paths.tmp_dir / "segments" / job_key(src, profile, variant)
 
 
-def segment_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant, index: int) -> Path:
+def segment_file_name(variant: OutputVariant, index: int, partial: bool = False) -> str:
     container = normalize_container_extension(variant.container)
-    return segment_dir_for(paths, src, profile, variant) / f"segment-{index:05d}.{container}"
-
-
-def partial_segment_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant, index: int) -> Path:
-    container = normalize_container_extension(variant.container)
-    return segment_dir_for(paths, src, profile, variant) / f"segment-{index:05d}.partial.{container}"
+    marker = ".partial" if partial else ""
+    return f"segment-{index:05d}{marker}.{container}"
 
 
 def temp_output_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant) -> Path:
     container = normalize_container_extension(variant.container)
     return paths.tmp_dir / f"{job_key(src, profile, variant)}.final.{container}"
-
-
-def concat_list_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant) -> Path:
-    return segment_dir_for(paths, src, profile, variant) / "concat.txt"
 
 
 def write_concat_file(list_path: Path, segments: List[Path]) -> None:

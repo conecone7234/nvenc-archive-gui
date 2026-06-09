@@ -612,13 +612,20 @@ class EncoderApp:
             messagebox.showerror("入力エラー", "出力バリアントを1つ以上登録してください。")
             return None
 
+        input_dir = self.input_dir_var.get().strip()
+        output_dir = self.output_dir_var.get().strip()
+        archive_dir = self.archive_dir_var.get().strip()
+        if not input_dir or not output_dir or not archive_dir:
+            messagebox.showerror("入力エラー", "入力先、出力先、処理済み退避先を入力してください。")
+            return None
+
         use_gpu, gpu_index, gpu_name = self._parse_gpu_choice()
         return EncodeProfile(
             id=current.id,
             name=self.profile_name_var.get().strip() or current.name,
-            input_dir=self.input_dir_var.get().strip(),
-            output_dir=self.output_dir_var.get().strip(),
-            archive_dir=self.archive_dir_var.get().strip(),
+            input_dir=input_dir,
+            output_dir=output_dir,
+            archive_dir=archive_dir,
             max_parallel_jobs=max_jobs,
             segment_minutes=segment_minutes,
             use_gpu=use_gpu,
@@ -928,7 +935,7 @@ class EncoderApp:
             messagebox.showinfo("保存状態なし", "再開できる保存状態はありません。")
             return
 
-        profile = profile_from_state(data)
+        profile = profile_from_state(data, self.paths, self.gpus)
         specs = resumable_specs(profile, data)
         if not specs:
             clear_state(self.paths)

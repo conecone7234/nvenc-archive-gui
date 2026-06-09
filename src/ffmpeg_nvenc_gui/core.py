@@ -98,8 +98,14 @@ class EncodeProfile:
     outputs: List[OutputVariant] = field(default_factory=list)
 
     @staticmethod
-    def from_dict(data: Dict[str, Any]) -> "EncodeProfile":
-        base = asdict(default_profile(build_paths()))
+    def from_dict(
+        data: Dict[str, Any],
+        paths: Optional[AppPaths] = None,
+        gpus: Optional[List[GpuInfo]] = None,
+    ) -> "EncodeProfile":
+        base_paths = paths or build_paths()
+        default_gpus = [] if gpus is None else gpus
+        base = asdict(default_profile(base_paths, default_gpus))
         base.update(data or {})
         base["outputs"] = [OutputVariant.from_dict(x) for x in base.get("outputs", [])]
         if not base["outputs"]:
@@ -165,12 +171,16 @@ def ensure_dirs(paths: AppPaths) -> None:
 
 
 def ensure_profile_dirs(profile: EncodeProfile) -> None:
-    Path(profile.input_dir).mkdir(parents=True, exist_ok=True)
-    Path(profile.output_dir).mkdir(parents=True, exist_ok=True)
-    Path(profile.archive_dir).mkdir(parents=True, exist_ok=True)
+    input_dir = profile_input_dir(profile)
+    output_dir = profile_output_dir(profile)
+    archive_dir = profile_archive_dir(profile)
+
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    archive_dir.mkdir(parents=True, exist_ok=True)
     for variant in profile.outputs:
         if variant.enabled:
-            (Path(profile.output_dir) / variant.folder_name).mkdir(parents=True, exist_ok=True)
+            (output_dir / variant.folder_name).mkdir(parents=True, exist_ok=True)
 
 
 def safe_folder_name(text: str) -> str:
@@ -264,7 +274,7 @@ def load_profiles(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> List
         return [default_profile(paths, gpus)]
 
     data = json.loads(paths.config_file.read_text(encoding="utf-8"))
-    profiles = [EncodeProfile.from_dict(item) for item in data.get("profiles", [])]
+    profiles = [EncodeProfile.from_dict(item, paths, gpus) for item in data.get("profiles", [])]
     return profiles or [default_profile(paths, gpus)]
 
 
@@ -623,14 +633,27 @@ def clear_state(paths: AppPaths) -> None:
         paths.state_file.unlink()
 
 
-def profile_from_state(data: Dict[str, Any]) -> EncodeProfile:
-    return EncodeProfile.from_dict(data.get("profile", {}))
+def profile_from_state(
+    data: Dict[str, Any],
+    paths: Optional[AppPaths] = None,
+    gpus: Optional[List[GpuInfo]] = None,
+) -> EncodeProfile:
+    return EncodeProfile.from_dict(data.get("profile", {}), paths, gpus)
 
 
 def resumable_specs(profile: EncodeProfile, data: Dict[str, Any]) -> List[JobSpec]:
     specs: List[JobSpec] = []
     for item in data.get("jobs", []):
-        spec = JobSpec(**item)
+        if not isinstance(item, dict):
+            continue
+        try:
+            spec = JobSpec(
+                src=str(item["src"]),
+                profile_id=str(item["profile_id"]),
+                variant_id=str(item["variant_id"]),
+            )
+        except KeyError:
+            continue
         src = Path(spec.src)
         if not src.exists():
             continue

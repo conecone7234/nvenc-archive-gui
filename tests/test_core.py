@@ -1,18 +1,25 @@
+import json
 from pathlib import Path
 
 from ffmpeg_nvenc_gui.core import (
     EncodeProfile,
+    GpuInfo,
     JobSpec,
     OutputVariant,
     build_ffmpeg_command,
     build_job_specs,
     build_paths,
     clear_state,
+    ensure_profile_dirs,
     format_seconds,
+    load_profiles,
     load_state,
     normalize_container_extension,
     output_path_for,
+    profile_archive_dir,
     profile_from_state,
+    profile_input_dir,
+    profile_output_dir,
     resumable_specs,
     save_state,
     scan_profile_files,
@@ -144,6 +151,49 @@ def test_output_variant_normalizes_safe_container_extensions(tmp_path: Path):
     assert output_path_for(profile, Path(profile.input_dir) / "video.mkv", unsafe).name == "video.mp4"
 
 
+def test_encode_profile_from_dict_uses_supplied_paths_and_gpus(tmp_path: Path):
+    paths = build_paths(tmp_path)
+
+    gpu_profile = EncodeProfile.from_dict({}, paths, [GpuInfo(index=2, name="RTX Test")])
+    cpu_profile = EncodeProfile.from_dict({}, paths, [])
+
+    assert Path(gpu_profile.input_dir) == paths.base_dir / "Incoming"
+    assert gpu_profile.use_gpu is True
+    assert gpu_profile.gpu_index == 2
+    assert gpu_profile.gpu_name == "RTX Test"
+    assert cpu_profile.use_gpu is False
+    assert cpu_profile.max_parallel_jobs == 1
+
+
+def test_load_profiles_defaults_missing_fields_from_supplied_paths(tmp_path: Path):
+    paths = build_paths(tmp_path)
+    paths.config_file.write_text(
+        json.dumps({"profiles": [{"id": "partial", "name": "Partial"}]}),
+        encoding="utf-8",
+    )
+
+    profiles = load_profiles(paths, [])
+
+    assert len(profiles) == 1
+    assert Path(profiles[0].input_dir) == paths.base_dir / "Incoming"
+    assert Path(profiles[0].output_dir) == paths.base_dir / "Encoded"
+    assert profiles[0].use_gpu is False
+
+
+def test_ensure_profile_dirs_uses_resolved_profile_paths(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.input_dir = str(tmp_path / "base" / ".." / "incoming")
+    profile.output_dir = str(tmp_path / "base" / ".." / "encoded")
+    profile.archive_dir = str(tmp_path / "base" / ".." / "archive")
+
+    ensure_profile_dirs(profile)
+
+    assert profile_input_dir(profile).exists()
+    assert profile_output_dir(profile).exists()
+    assert profile_archive_dir(profile).exists()
+    assert (profile_output_dir(profile) / profile.outputs[0].folder_name).exists()
+
+
 def test_format_seconds_carries_rounded_milliseconds():
     assert format_seconds(1.9999) == "00:00:02.000"
     assert format_seconds(3599.9999) == "01:00:00.000"
@@ -179,12 +229,23 @@ def test_state_resume_filters_completed_jobs(tmp_path: Path):
 
     data = load_state(paths)
     assert data is not None
-    restored = profile_from_state(data)
+    restored = profile_from_state(data, paths, [])
     resume = resumable_specs(restored, data)
     assert resume == [JobSpec(src=str(src), profile_id="profile", variant_id="review")]
 
     clear_state(paths)
     assert load_state(paths) is None
+
+
+def test_resumable_specs_skips_legacy_state_jobs(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    src = Path(profile.input_dir) / "video.mkv"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"dummy")
+
+    data = {"version": 1, "jobs": [{"src": str(src), "mode": "4K"}]}
+
+    assert resumable_specs(profile, data) == []
 
 
 def test_segment_ranges_split_by_duration():

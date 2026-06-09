@@ -601,7 +601,7 @@ def build_ffmpeg_command(
         "1",
     ]
 
-    # Segment resume needs input seeking; FFmpeg keeps accurate seek enabled by default while transcoding.
+    # Segment resume prioritizes fast input seeking; exact boundaries are handled at segment granularity.
     if start_seconds is not None and start_seconds > 0:
         cmd += ["-ss", format_seconds(start_seconds)]
     if duration_seconds is not None and duration_seconds > 0:

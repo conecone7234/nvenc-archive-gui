@@ -8,13 +8,16 @@ from ffmpeg_nvenc_gui.core import (
     build_job_specs,
     build_paths,
     clear_state,
+    format_seconds,
     load_state,
+    normalize_container_extension,
     output_path_for,
     profile_from_state,
     resumable_specs,
     save_state,
     scan_profile_files,
     segment_ranges,
+    write_concat_file,
 )
 from ffmpeg_nvenc_gui.ffmpeg_downloader import find_binary_member, find_ffmpeg_member
 
@@ -113,6 +116,48 @@ def test_scan_and_job_specs_skip_existing_outputs(tmp_path: Path):
 
     specs = build_job_specs(profile, [src])
     assert specs == [JobSpec(src=str(src), profile_id="profile", variant_id="master")]
+
+
+def test_output_variant_normalizes_safe_container_extensions(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    variant = OutputVariant.from_dict(
+        {
+            "id": "archive",
+            "name": "Archive MOV",
+            "folder_name": "archive-mov",
+            "container": ".MOV",
+        }
+    )
+    unsafe = OutputVariant.from_dict(
+        {
+            "id": "unsafe",
+            "name": "Unsafe",
+            "folder_name": "unsafe",
+            "container": "../outside",
+        }
+    )
+
+    assert normalize_container_extension(" .MKV ") == "mkv"
+    assert normalize_container_extension("../outside", default="") == ""
+    assert variant.container == "mov"
+    assert unsafe.container == "mp4"
+    assert output_path_for(profile, Path(profile.input_dir) / "video.mkv", unsafe).name == "video.mp4"
+
+
+def test_format_seconds_carries_rounded_milliseconds():
+    assert format_seconds(1.9999) == "00:00:02.000"
+    assert format_seconds(3599.9999) == "01:00:00.000"
+
+
+def test_write_concat_file_escapes_single_quotes(tmp_path: Path):
+    list_file = tmp_path / "concat.txt"
+    segment = tmp_path / "clip'segment.mp4"
+
+    write_concat_file(list_file, [segment])
+
+    text = list_file.read_text(encoding="utf-8")
+    assert "clip\\'segment.mp4" in text
+    assert "clip'\\''segment" not in text
 
 
 def test_state_resume_filters_completed_jobs(tmp_path: Path):

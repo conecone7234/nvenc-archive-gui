@@ -21,6 +21,7 @@ RESOLUTION_PRESETS: Dict[str, Optional[int]] = {
     "720p": 720,
     "Custom": -1,
 }
+SAFE_CONTAINER_RE = re.compile(r"^[a-z0-9]{1,8}$")
 
 
 @dataclass
@@ -50,14 +51,23 @@ class OutputVariant:
     container: str = "mp4"
     enabled: bool = True
 
+    def __post_init__(self) -> None:
+        if not self.id:
+            self.id = new_id("variant")
+        self.folder_name = safe_folder_name(self.folder_name or self.name or self.id)
+        self.container = normalize_container_extension(self.container)
+
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "OutputVariant":
-        base = asdict(OutputVariant(id="", name="", folder_name=""))
+        base = {
+            "id": "",
+            "name": "",
+            "folder_name": "",
+            "height": None,
+            "container": "mp4",
+            "enabled": True,
+        }
         base.update(data or {})
-        if not base["id"]:
-            base["id"] = new_id("variant")
-        if not base["folder_name"]:
-            base["folder_name"] = safe_folder_name(base["name"] or base["id"])
         return OutputVariant(**base)
 
 
@@ -168,6 +178,13 @@ def safe_folder_name(text: str) -> str:
     value = re.sub(r"\s+", "-", value)
     value = value.strip(".- ")
     return value or "output"
+
+
+def normalize_container_extension(value: object, default: str = "mp4") -> str:
+    candidate = str(value or "").strip().lower().lstrip(".")
+    if SAFE_CONTAINER_RE.fullmatch(candidate):
+        return candidate
+    return default
 
 
 def default_outputs() -> List[OutputVariant]:
@@ -283,7 +300,7 @@ def profile_archive_dir(profile: EncodeProfile) -> Path:
 
 
 def output_path_for(profile: EncodeProfile, src: Path, variant: OutputVariant) -> Path:
-    container = variant.container.lstrip(".") or "mp4"
+    container = normalize_container_extension(variant.container)
     return profile_output_dir(profile) / variant.folder_name / f"{src.stem}.{container}"
 
 
@@ -471,6 +488,9 @@ def format_seconds(seconds: float) -> str:
     seconds = max(float(seconds), 0.0)
     whole = int(seconds)
     ms = int(round((seconds - whole) * 1000))
+    if ms >= 1000:
+        whole += ms // 1000
+        ms %= 1000
     hours = whole // 3600
     minutes = (whole % 3600) // 60
     secs = whole % 60
@@ -548,15 +568,18 @@ def segment_dir_for(paths: AppPaths, src: Path, variant: OutputVariant) -> Path:
 
 
 def segment_path_for(paths: AppPaths, src: Path, variant: OutputVariant, index: int) -> Path:
-    return segment_dir_for(paths, src, variant) / f"segment-{index:05d}.{variant.container}"
+    container = normalize_container_extension(variant.container)
+    return segment_dir_for(paths, src, variant) / f"segment-{index:05d}.{container}"
 
 
 def partial_segment_path_for(paths: AppPaths, src: Path, variant: OutputVariant, index: int) -> Path:
-    return segment_dir_for(paths, src, variant) / f"segment-{index:05d}.partial.{variant.container}"
+    container = normalize_container_extension(variant.container)
+    return segment_dir_for(paths, src, variant) / f"segment-{index:05d}.partial.{container}"
 
 
 def temp_output_path_for(paths: AppPaths, src: Path, variant: OutputVariant) -> Path:
-    return paths.tmp_dir / f"{job_key(src, variant)}.final.{variant.container}"
+    container = normalize_container_extension(variant.container)
+    return paths.tmp_dir / f"{job_key(src, variant)}.final.{container}"
 
 
 def concat_list_path_for(paths: AppPaths, src: Path, variant: OutputVariant) -> Path:
@@ -567,9 +590,13 @@ def write_concat_file(list_path: Path, segments: List[Path]) -> None:
     list_path.parent.mkdir(parents=True, exist_ok=True)
     lines = []
     for segment in segments:
-        value = segment.resolve().as_posix().replace("'", "'\\''")
+        value = escape_concat_path(segment)
         lines.append(f"file '{value}'")
     list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def escape_concat_path(path: Path) -> str:
+    return path.resolve().as_posix().replace("\\", "\\\\").replace("'", "\\'")
 
 
 def save_state(paths: AppPaths, profile: EncodeProfile, specs: List[JobSpec]) -> None:

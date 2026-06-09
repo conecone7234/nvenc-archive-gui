@@ -37,6 +37,7 @@ try:
         load_profiles,
         load_state,
         new_id,
+        normalize_container_extension,
         output_path_for,
         parse_ffmpeg_time,
         partial_segment_path_for,
@@ -80,6 +81,7 @@ except ModuleNotFoundError:
         load_profiles,
         load_state,
         new_id,
+        normalize_container_extension,
         output_path_for,
         parse_ffmpeg_time,
         partial_segment_path_for,
@@ -724,9 +726,13 @@ class EncoderApp:
     def add_or_update_output(self) -> None:
         name = self.output_name_var.get().strip()
         folder_name = safe_folder_name(self.output_folder_var.get().strip() or name)
-        container = self.output_container_var.get().strip().lstrip(".") or "mp4"
+        raw_container = self.output_container_var.get()
+        container = normalize_container_extension(raw_container, default="")
         if not name:
             messagebox.showerror("入力エラー", "出力名を入力してください。")
+            return
+        if not container:
+            messagebox.showerror("入力エラー", "形式は英数字1〜8文字で入力してください。例: mp4, mkv")
             return
 
         preset = self.output_resolution_var.get()

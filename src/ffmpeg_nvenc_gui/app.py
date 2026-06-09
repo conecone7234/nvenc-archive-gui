@@ -134,6 +134,7 @@ class EncoderApp:
 
         self.gpus: List[GpuInfo] = detect_nvidia_gpus()
         self.profiles: List[EncodeProfile] = load_profiles(self.paths, self.gpus)
+        self.active_profile_id: Optional[str] = self.profiles[0].id if self.profiles else None
         self.files: List[FileStatus] = []
         self.editing_outputs: List[OutputVariant] = []
         self.selected_output_id: Optional[str] = None
@@ -498,31 +499,84 @@ class EncoderApp:
         if value:
             variable.set(value)
 
-    def _profile_names(self) -> List[str]:
-        return [profile.name for profile in self.profiles]
+    def _profile_labels(self) -> List[str]:
+        counts: Dict[str, int] = {}
+        for profile in self.profiles:
+            counts[profile.name] = counts.get(profile.name, 0) + 1
+
+        labels = []
+        for profile in self.profiles:
+            if counts.get(profile.name, 0) > 1:
+                labels.append(f"{profile.name} ({self.profile_short_id(profile)})")
+            else:
+                labels.append(profile.name)
+        return labels
+
+    def profile_short_id(self, profile: EncodeProfile) -> str:
+        return profile.id.rsplit("_", 1)[-1][:8]
 
     def refresh_profile_choices(self) -> None:
-        values = self._profile_names()
+        values = self._profile_labels()
         self.profile_combo.configure(values=values)
         self.gpu_combo.configure(values=self._gpu_choices())
-        if not self.active_profile_var.get() and values:
-            self.active_profile_var.set(values[0])
-        elif self.active_profile_var.get() not in values and values:
-            self.active_profile_var.set(values[0])
+
+        profile_ids = [profile.id for profile in self.profiles]
+        if self.active_profile_id not in profile_ids:
+            self.active_profile_id = profile_ids[0] if profile_ids else None
+
+        active_index = self.profile_index_by_id(self.active_profile_id)
+        if active_index is None:
+            self.active_profile_var.set("")
+            return
+
+        self.active_profile_var.set(values[active_index])
+        self.profile_combo.current(active_index)
 
     def _gpu_choices(self) -> List[str]:
         choices = ["CPU only"]
         choices.extend([f"GPU {gpu.index}: {gpu.name}" for gpu in self.gpus])
         return choices
 
+    def profile_index_by_id(self, profile_id: Optional[str]) -> Optional[int]:
+        if profile_id is None:
+            return None
+        for index, profile in enumerate(self.profiles):
+            if profile.id == profile_id:
+                return index
+        return None
+
     def current_profile(self) -> EncodeProfile:
-        selected = self.active_profile_var.get()
-        for profile in self.profiles:
-            if profile.name == selected:
-                return profile
+        selected_index = self.profile_index_by_id(self.active_profile_id)
+        if selected_index is not None:
+            return self.profiles[selected_index]
+
+        combo_index = self.profile_combo.current()
+        if 0 <= combo_index < len(self.profiles):
+            self.active_profile_id = self.profiles[combo_index].id
+            return self.profiles[combo_index]
+
+        self.active_profile_id = self.profiles[0].id
         return self.profiles[0]
 
+    def unique_profile_name(self, prefix: str = "Profile") -> str:
+        existing = {profile.name for profile in self.profiles}
+        index = len(self.profiles) + 1
+        while True:
+            candidate = f"{prefix} {index}"
+            if candidate not in existing:
+                return candidate
+            index += 1
+
+    def has_duplicate_profile_name(self, profile_id: str, name: str) -> bool:
+        for profile in self.profiles:
+            if profile.id != profile_id and profile.name == name:
+                return True
+        return False
+
     def on_profile_selected(self, _event: object = None) -> None:
+        combo_index = self.profile_combo.current()
+        if 0 <= combo_index < len(self.profiles):
+            self.active_profile_id = self.profiles[combo_index].id
         if self.running:
             self.log("実行中のため、表示プロファイルだけ切り替えます。")
         self.load_profile_into_form(self.current_profile())
@@ -647,6 +701,9 @@ class EncoderApp:
         profile = self.collect_profile_from_form()
         if profile is None:
             return
+        if self.has_duplicate_profile_name(profile.id, profile.name):
+            messagebox.showerror("入力エラー", "同じ名前のプロファイルがすでにあります。別の名前にしてください。")
+            return
 
         for index, existing in enumerate(self.profiles):
             if existing.id == profile.id:
@@ -656,7 +713,7 @@ class EncoderApp:
             self.profiles.append(profile)
 
         save_profiles(self.paths, self.profiles)
-        self.active_profile_var.set(profile.name)
+        self.active_profile_id = profile.id
         self.refresh_profile_choices()
         self.log(f"プロファイルを保存: {profile.name}")
         self.scan_files()
@@ -664,10 +721,10 @@ class EncoderApp:
     def new_profile(self) -> None:
         profile = default_profile(self.paths, self.gpus)
         profile.id = new_id("profile")
-        profile.name = f"Profile {len(self.profiles) + 1}"
+        profile.name = self.unique_profile_name("Profile")
         self.profiles.append(profile)
         save_profiles(self.paths, self.profiles)
-        self.active_profile_var.set(profile.name)
+        self.active_profile_id = profile.id
         self.refresh_profile_choices()
         self.load_profile_into_form(profile)
         self.scan_files()
@@ -682,7 +739,7 @@ class EncoderApp:
             return
         self.profiles = [item for item in self.profiles if item.id != profile.id]
         save_profiles(self.paths, self.profiles)
-        self.active_profile_var.set(self.profiles[0].name)
+        self.active_profile_id = self.profiles[0].id
         self.refresh_profile_choices()
         self.load_profile_into_form(self.current_profile())
         self.scan_files()

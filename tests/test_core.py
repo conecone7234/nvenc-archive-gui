@@ -6,6 +6,7 @@ from ffmpeg_nvenc_gui.core import (
     GpuInfo,
     JobSpec,
     OutputVariant,
+    build_concat_command,
     build_ffmpeg_command,
     build_job_specs,
     build_paths,
@@ -26,6 +27,7 @@ from ffmpeg_nvenc_gui.core import (
     segment_ranges,
     write_concat_file,
 )
+from ffmpeg_nvenc_gui.app import EncoderApp
 from ffmpeg_nvenc_gui.ffmpeg_downloader import find_binary_member, find_ffmpeg_member
 
 
@@ -105,6 +107,40 @@ def test_build_cpu_cq_uses_crf_and_hides_bitrate(tmp_path: Path):
     assert "-crf" in cmd
     assert "-cq:v" not in cmd
     assert "-b:v" not in cmd
+
+
+def test_faststart_is_only_used_for_mov_mp4_family(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    mp4_variant = profile.outputs[0]
+    mkv_variant = OutputVariant(
+        id="matroska",
+        name="Matroska",
+        folder_name="matroska",
+        height=None,
+        container="mkv",
+    )
+
+    mp4_cmd = build_ffmpeg_command(
+        tmp_path / "ffmpeg.exe",
+        tmp_path / "a.mkv",
+        tmp_path / "a.mp4",
+        profile,
+        mp4_variant,
+    )
+    mkv_cmd = build_ffmpeg_command(
+        tmp_path / "ffmpeg.exe",
+        tmp_path / "a.mkv",
+        tmp_path / "a.mkv",
+        profile,
+        mkv_variant,
+    )
+    mp4_concat = build_concat_command(tmp_path / "ffmpeg.exe", tmp_path / "concat.txt", tmp_path / "final.mp4")
+    mkv_concat = build_concat_command(tmp_path / "ffmpeg.exe", tmp_path / "concat.txt", tmp_path / "final.mkv")
+
+    assert "-movflags" in mp4_cmd
+    assert "-movflags" not in mkv_cmd
+    assert "-movflags" in mp4_concat
+    assert "-movflags" not in mkv_concat
 
 
 def test_scan_and_job_specs_skip_existing_outputs(tmp_path: Path):
@@ -208,6 +244,41 @@ def test_write_concat_file_escapes_single_quotes(tmp_path: Path):
     text = list_file.read_text(encoding="utf-8")
     assert "clip\\'segment.mp4" in text
     assert "clip'\\''segment" not in text
+
+
+def test_encoder_app_profile_helpers_use_ids_for_duplicates(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    app.profiles = [
+        EncodeProfile(
+            id="profile_alpha",
+            name="Archive",
+            input_dir=str(tmp_path / "in-a"),
+            output_dir=str(tmp_path / "out-a"),
+            archive_dir=str(tmp_path / "archive-a"),
+        ),
+        EncodeProfile(
+            id="profile_beta",
+            name="Archive",
+            input_dir=str(tmp_path / "in-b"),
+            output_dir=str(tmp_path / "out-b"),
+            archive_dir=str(tmp_path / "archive-b"),
+        ),
+        EncodeProfile(
+            id="profile_gamma",
+            name="Profile 4",
+            input_dir=str(tmp_path / "in-c"),
+            output_dir=str(tmp_path / "out-c"),
+            archive_dir=str(tmp_path / "archive-c"),
+        ),
+    ]
+
+    labels = EncoderApp._profile_labels(app)
+
+    assert labels == ["Archive (alpha)", "Archive (beta)", "Profile 4"]
+    assert EncoderApp.profile_index_by_id(app, "profile_beta") == 1
+    assert EncoderApp.has_duplicate_profile_name(app, "profile_alpha", "Archive") is True
+    assert EncoderApp.has_duplicate_profile_name(app, "profile_alpha", "Unique") is False
+    assert EncoderApp.unique_profile_name(app, "Profile") == "Profile 5"
 
 
 def test_state_resume_filters_completed_jobs(tmp_path: Path):

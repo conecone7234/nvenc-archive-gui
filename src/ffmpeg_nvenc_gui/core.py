@@ -22,6 +22,7 @@ RESOLUTION_PRESETS: Dict[str, Optional[int]] = {
     "Custom": -1,
 }
 SAFE_CONTAINER_RE = re.compile(r"^[a-z0-9]{1,8}$")
+FASTSTART_CONTAINERS = {"mp4", "m4v", "mov", "ismv"}
 
 
 @dataclass
@@ -195,6 +196,13 @@ def normalize_container_extension(value: object, default: str = "mp4") -> str:
     if SAFE_CONTAINER_RE.fullmatch(candidate):
         return candidate
     return default
+
+
+def faststart_args_for_container(value: object) -> List[str]:
+    container = normalize_container_extension(value)
+    if container in FASTSTART_CONTAINERS:
+        return ["-movflags", "+faststart"]
+    return []
 
 
 def default_outputs() -> List[OutputVariant]:
@@ -462,12 +470,14 @@ def build_ffmpeg_command(
         scale = f"scale=-2:{variant.height}:flags={profile.scale_flags}"
         cmd += ["-vf", scale]
 
-    cmd += ["-c:a", "copy", "-c:s", "copy", "-movflags", "+faststart", str(tmp_out)]
+    cmd += ["-c:a", "copy", "-c:s", "copy"]
+    cmd += faststart_args_for_container(variant.container)
+    cmd += [str(tmp_out)]
     return cmd
 
 
 def build_concat_command(ffmpeg_path: Path, list_file: Path, tmp_out: Path) -> List[str]:
-    return [
+    cmd = [
         str(ffmpeg_path),
         "-hide_banner",
         "-f",
@@ -479,10 +489,10 @@ def build_concat_command(ffmpeg_path: Path, list_file: Path, tmp_out: Path) -> L
         "-y",
         "-c",
         "copy",
-        "-movflags",
-        "+faststart",
-        str(tmp_out),
     ]
+    cmd += faststart_args_for_container(tmp_out.suffix)
+    cmd += [str(tmp_out)]
+    return cmd
 
 
 def command_to_text(cmd: List[str]) -> str:

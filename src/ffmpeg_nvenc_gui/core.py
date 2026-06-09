@@ -601,16 +601,15 @@ def build_ffmpeg_command(
         "1",
     ]
 
-    cmd += [
-        "-i",
-        str(src),
-        "-y",
-    ]
+    # Segment resume needs input seeking; FFmpeg keeps accurate seek enabled by default while transcoding.
     if start_seconds is not None and start_seconds > 0:
         cmd += ["-ss", format_seconds(start_seconds)]
     if duration_seconds is not None and duration_seconds > 0:
         cmd += ["-t", format_seconds(duration_seconds)]
     cmd += [
+        "-i",
+        str(src),
+        "-y",
         "-map",
         "0",
         "-pix_fmt",

@@ -88,8 +88,10 @@ def test_build_cq_gpu_command(tmp_path: Path):
     assert "scale=-2:2160:flags=lanczos+accurate_rnd" in cmd
     assert "-ss" in cmd
     assert "-t" in cmd
-    assert cmd.index("-ss") > cmd.index(str(tmp_path / "Incoming" / "input file.mkv"))
-    assert cmd.index("-t") > cmd.index(str(tmp_path / "Incoming" / "input file.mkv"))
+    input_index = cmd.index("-i")
+    assert cmd.index("-ss") < input_index
+    assert cmd.index("-t") < input_index
+    assert cmd[input_index + 1] == str(tmp_path / "Incoming" / "input file.mkv")
     assert "-map" in cmd
     assert "0" in cmd
 

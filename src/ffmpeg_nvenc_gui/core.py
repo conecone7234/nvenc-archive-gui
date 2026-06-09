@@ -192,7 +192,7 @@ class EncodeProfile:
         base["outputs"] = [OutputVariant.from_dict(x) for x in raw_outputs]
         if not base["outputs"]:
             base["outputs"] = default_outputs()
-        return EncodeProfile(**base)
+        return normalize_profile_gpu(EncodeProfile(**base), default_gpus)
 
 
 @dataclass
@@ -352,6 +352,21 @@ def detect_nvidia_gpus(timeout: int = 5) -> List[GpuInfo]:
             continue
         gpus.append(GpuInfo(index=int(index_text), name=name))
     return gpus
+
+
+def normalize_profile_gpu(profile: EncodeProfile, gpus: Optional[List[GpuInfo]]) -> EncodeProfile:
+    if not profile.use_gpu:
+        return profile
+
+    for gpu in gpus or []:
+        if gpu.index == profile.gpu_index:
+            profile.gpu_name = gpu.name
+            return profile
+
+    profile.use_gpu = False
+    profile.gpu_index = 0
+    profile.gpu_name = ""
+    return profile
 
 
 def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> EncodeProfile:

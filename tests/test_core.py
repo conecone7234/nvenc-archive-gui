@@ -312,6 +312,16 @@ def test_encode_profile_from_dict_uses_supplied_paths_and_gpus(tmp_path: Path):
 
     gpu_profile = EncodeProfile.from_dict({}, paths, [GpuInfo(index=2, name="RTX Test")])
     cpu_profile = EncodeProfile.from_dict({}, paths, [])
+    stale_gpu_profile = EncodeProfile.from_dict(
+        {"use_gpu": True, "gpu_index": 9, "gpu_name": "Old GPU"},
+        paths,
+        [GpuInfo(index=2, name="RTX Test")],
+    )
+    synced_gpu_profile = EncodeProfile.from_dict(
+        {"use_gpu": True, "gpu_index": 2, "gpu_name": "Old GPU"},
+        paths,
+        [GpuInfo(index=2, name="RTX Test")],
+    )
 
     assert Path(gpu_profile.input_dir) == paths.base_dir / "Incoming"
     assert gpu_profile.use_gpu is True
@@ -319,6 +329,11 @@ def test_encode_profile_from_dict_uses_supplied_paths_and_gpus(tmp_path: Path):
     assert gpu_profile.gpu_name == "RTX Test"
     assert cpu_profile.use_gpu is False
     assert cpu_profile.max_parallel_jobs == 1
+    assert stale_gpu_profile.use_gpu is False
+    assert stale_gpu_profile.gpu_index == 0
+    assert stale_gpu_profile.gpu_name == ""
+    assert synced_gpu_profile.use_gpu is True
+    assert synced_gpu_profile.gpu_name == "RTX Test"
 
 
 def test_load_profiles_defaults_missing_fields_from_supplied_paths(tmp_path: Path):

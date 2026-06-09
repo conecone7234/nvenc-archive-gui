@@ -41,6 +41,7 @@ try:
         missing_profile_dirs,
         missing_rate_fields,
         new_id,
+        normalize_profile_gpu,
         normalize_container_extension,
         output_path_for,
         parse_ffmpeg_time,
@@ -89,6 +90,7 @@ except ModuleNotFoundError:
         missing_profile_dirs,
         missing_rate_fields,
         new_id,
+        normalize_profile_gpu,
         normalize_container_extension,
         output_path_for,
         parse_ffmpeg_time,
@@ -1028,7 +1030,7 @@ class EncoderApp:
         return True
 
     def start_current_profile(self) -> None:
-        profile = self.current_profile()
+        profile = normalize_profile_gpu(self.current_profile(), self.gpus)
         if not self.validate_profile_before_run(profile):
             return
 
@@ -1056,7 +1058,7 @@ class EncoderApp:
             messagebox.showinfo("保存状態なし", "再開できる保存状態はありません。")
             return
 
-        profile = profile_from_state(data, self.paths, self.gpus)
+        profile = normalize_profile_gpu(profile_from_state(data, self.paths, self.gpus), self.gpus)
         if not self.validate_profile_before_run(profile):
             return
         specs = resumable_specs(profile, data)

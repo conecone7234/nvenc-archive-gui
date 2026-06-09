@@ -124,8 +124,8 @@ GPU_PRESETS = ["p1", "p2", "p3", "p4", "p5", "p6", "p7"]
 CPU_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"]
 GPU_TUNES = ["none", "hq", "ll", "ull", "lossless"]
 CPU_TUNES_BY_CODEC = {
-    "libx264": ["none", "film", "animation", "grain", "stillimage", "fastdecode", "zerolatency"],
-    "libx265": ["none", "grain", "fastdecode", "zerolatency", "animation"],
+    "libx264": ["none", "film", "animation", "grain", "stillimage", "fastdecode", "zerolatency", "psnr", "ssim"],
+    "libx265": ["none", "psnr", "ssim", "grain", "fastdecode", "zerolatency"],
 }
 RATE_MODES = ["CQ", "VBR", "ABR", "CBR"]
 CONTAINER_CHOICES = ["mp4", "mkv", "mov", "m4v", "webm", "ts", "m2ts"]
@@ -221,11 +221,9 @@ class EncoderApp:
             "surface_alt": "#f8fafc",
             "text": "#111827",
             "muted": "#64748b",
-            "line": "#cbd5e1",
             "accent": "#0f766e",
             "accent_hover": "#115e59",
             "danger": "#b91c1c",
-            "ok": "#047857",
             "log_bg": "#111827",
             "log_fg": "#d1fae5",
         }
@@ -233,11 +231,9 @@ class EncoderApp:
         self.root.configure(bg=self.colors["bg"])
         style.configure("App.TFrame", background=self.colors["bg"])
         style.configure("Surface.TFrame", background=self.colors["surface"], relief="flat")
-        style.configure("Soft.TFrame", background=self.colors["surface_alt"], relief="flat")
         style.configure("TFrame", background=self.colors["bg"])
         style.configure("TLabel", background=self.colors["bg"], foreground=self.colors["text"])
         style.configure("Surface.TLabel", background=self.colors["surface"], foreground=self.colors["text"])
-        style.configure("Soft.TLabel", background=self.colors["surface_alt"], foreground=self.colors["text"])
         style.configure("Muted.TLabel", background=self.colors["surface"], foreground=self.colors["muted"])
         style.configure("Title.TLabel", background=self.colors["bg"], foreground=self.colors["text"], font=("Segoe UI", 20, "bold"))
         style.configure("Subtitle.TLabel", background=self.colors["bg"], foreground=self.colors["muted"], font=("Segoe UI", 10))
@@ -636,30 +632,6 @@ class EncoderApp:
         entry.grid(row=0, column=1, sticky=tk.W)
         return label_widget, entry
 
-    def _label_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, row: int, column: int, width: int = 38) -> ttk.Entry:
-        ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=column, sticky=tk.W, pady=3)
-        entry = ttk.Entry(parent, textvariable=variable, width=width)
-        entry.grid(row=row, column=column + 1, sticky="ew", pady=3)
-        return entry
-
-    def _path_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, row: int, column: int) -> None:
-        ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=column, sticky=tk.W, pady=3)
-        entry = ttk.Entry(parent, textvariable=variable, width=48)
-        entry.grid(row=row, column=column + 1, columnspan=2, sticky="ew", pady=3)
-        ttk.Button(parent, text="選択", command=lambda: self.browse_dir(variable)).grid(row=row, column=column + 3, sticky=tk.W, padx=(8, 0), pady=3)
-
-    def _compact_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, row: int, column: int) -> ttk.Entry:
-        ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=column, sticky=tk.W, pady=(8, 0))
-        entry = ttk.Entry(parent, textvariable=variable, width=12)
-        entry.grid(row=row, column=column + 1, sticky=tk.W, pady=(8, 0))
-        return entry
-
-    def _stacked_label_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar) -> ttk.Entry:
-        ttk.Label(parent, text=label, style="Surface.TLabel").pack(anchor=tk.W, pady=(0, 2))
-        entry = ttk.Entry(parent, textvariable=variable, width=26)
-        entry.pack(anchor=tk.W, pady=(0, 8))
-        return entry
-
     def browse_dir(self, variable: tk.StringVar) -> None:
         value = filedialog.askdirectory(initialdir=variable.get() or str(self.paths.base_dir))
         if value:
@@ -893,14 +865,14 @@ class EncoderApp:
             messagebox.showerror("入力エラー", "分割間隔は1分以上にしてください。")
             return None
         if not any(item.enabled for item in self.editing_outputs):
-            messagebox.showerror("入力エラー", "出力バリアントを1つ以上登録してください。")
+            messagebox.showerror("入力エラー", "出力バリアントを1つ以上有効にしてください。")
             return None
 
         input_dir = self.input_dir_var.get().strip()
         output_dir = self.output_dir_var.get().strip()
         archive_dir = self.archive_dir_var.get().strip()
         if not input_dir or not output_dir or not archive_dir:
-            messagebox.showerror("入力エラー", "入力先、出力先、処理済み退避先を入力してください。")
+            messagebox.showerror("入力エラー", "入力先、出力先、処理済みソース退避先を入力してください。")
             return None
 
         use_gpu, gpu_index, gpu_name = self._parse_gpu_choice()
@@ -1237,6 +1209,9 @@ class EncoderApp:
         missing_dirs = missing_profile_dirs(profile)
         if missing_dirs:
             messagebox.showerror("入力エラー", f"{profile_dir_label_text(missing_dirs)} を入力してください。")
+            return False
+        if not any(variant.enabled for variant in profile.outputs):
+            messagebox.showerror("入力エラー", "出力バリアントを1つ以上有効にしてください。")
             return False
         missing = missing_rate_fields(profile)
         if missing:

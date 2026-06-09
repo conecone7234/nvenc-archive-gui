@@ -187,14 +187,21 @@ class EncodeProfile:
         base_paths = paths or build_paths()
         default_gpus = [] if gpus is None else gpus
         base = asdict(default_profile(base_paths, default_gpus))
-        base.update(dataclass_values(EncodeProfile, data))
+        explicit_values = dataclass_values(EncodeProfile, data)
+        base.update(explicit_values)
         raw_outputs = base.get("outputs")
         if not isinstance(raw_outputs, list):
             raw_outputs = []
         base["outputs"] = [OutputVariant.from_dict(x) for x in raw_outputs]
         if not base["outputs"]:
             base["outputs"] = default_outputs()
-        return normalize_profile_gpu(EncodeProfile(**base), default_gpus)
+        profile = normalize_profile_gpu(EncodeProfile(**base), default_gpus)
+        if not profile.use_gpu:
+            cpu_defaults = default_profile(base_paths, [])
+            for key in ("max_parallel_jobs", "cq_value", "bitrate", "maxrate", "bufsize", "cpu_preset", "cpu_tune"):
+                if key not in explicit_values:
+                    setattr(profile, key, getattr(cpu_defaults, key))
+        return profile
 
 
 @dataclass

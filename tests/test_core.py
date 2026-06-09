@@ -328,6 +328,16 @@ def test_encode_profile_from_dict_uses_supplied_paths_and_gpus(tmp_path: Path):
 
     gpu_profile = EncodeProfile.from_dict({}, paths, [GpuInfo(index=2, name="RTX Test")])
     cpu_profile = EncodeProfile.from_dict({}, paths, [])
+    explicit_cpu_profile = EncodeProfile.from_dict(
+        {"use_gpu": False},
+        paths,
+        [GpuInfo(index=2, name="RTX Test")],
+    )
+    custom_cpu_profile = EncodeProfile.from_dict(
+        {"use_gpu": False, "max_parallel_jobs": 3, "cq_value": 20, "bitrate": "6000k"},
+        paths,
+        [GpuInfo(index=2, name="RTX Test")],
+    )
     stale_gpu_profile = EncodeProfile.from_dict(
         {"use_gpu": True, "gpu_index": 9, "gpu_name": "Old GPU"},
         paths,
@@ -349,9 +359,18 @@ def test_encode_profile_from_dict_uses_supplied_paths_and_gpus(tmp_path: Path):
     assert cpu_profile.bitrate == "8000k"
     assert cpu_profile.cpu_preset == "medium"
     assert cpu_profile.cpu_tune == "none"
+    assert explicit_cpu_profile.use_gpu is False
+    assert explicit_cpu_profile.max_parallel_jobs == 1
+    assert explicit_cpu_profile.cq_value == 23
+    assert explicit_cpu_profile.bitrate == "8000k"
+    assert custom_cpu_profile.max_parallel_jobs == 3
+    assert custom_cpu_profile.cq_value == 20
+    assert custom_cpu_profile.bitrate == "6000k"
     assert stale_gpu_profile.use_gpu is False
     assert stale_gpu_profile.gpu_index == 0
     assert stale_gpu_profile.gpu_name == ""
+    assert stale_gpu_profile.max_parallel_jobs == 1
+    assert stale_gpu_profile.cq_value == 23
     assert synced_gpu_profile.use_gpu is True
     assert synced_gpu_profile.gpu_name == "RTX Test"
 
@@ -490,6 +509,27 @@ def test_encoder_app_profile_helpers_use_ids_for_duplicates(tmp_path: Path):
     assert EncoderApp.has_duplicate_profile_name(app, "profile_alpha", "Archive") is True
     assert EncoderApp.has_duplicate_profile_name(app, "profile_alpha", "Unique") is False
     assert EncoderApp.unique_profile_name(app, "Profile") == "Profile 5"
+
+
+def test_encoder_app_validate_profile_requires_enabled_output(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    for variant in profile.outputs:
+        variant.enabled = False
+    messages = []
+
+    original_showerror = app_module.messagebox.showerror
+
+    def showerror(title, message):
+        messages.append((title, message))
+
+    app_module.messagebox.showerror = showerror
+    try:
+        assert app.validate_profile_before_run(profile) is False
+    finally:
+        app_module.messagebox.showerror = original_showerror
+
+    assert any("有効" in message for _, message in messages)
 
 
 def test_run_process_publishes_process_under_lock_and_honors_stop(tmp_path: Path):

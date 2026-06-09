@@ -324,15 +324,27 @@ class EncoderApp:
         def on_canvas_configure(event: tk.Event) -> None:
             canvas.itemconfigure(window_id, width=event.width)
 
-        def on_mousewheel(event: tk.Event) -> None:
+        def event_is_inside_content(widget: tk.Misc) -> bool:
+            current: Optional[tk.Misc] = widget
+            while current is not None:
+                if current == content:
+                    return True
+                current = getattr(current, "master", None)
+            return False
+
+        def on_mousewheel(event: tk.Event) -> Optional[str]:
+            widget = getattr(event, "widget", None)
+            if widget is None or not event_is_inside_content(widget):
+                return None
             delta = int(-1 * (event.delta / 120)) if event.delta else 0
             if delta:
                 canvas.yview_scroll(delta, "units")
+                return "break"
+            return None
 
         content.bind("<Configure>", on_content_configure)
         canvas.bind("<Configure>", on_canvas_configure)
-        content.bind("<Enter>", lambda _event: content.bind_all("<MouseWheel>", on_mousewheel))
-        content.bind("<Leave>", lambda _event: content.unbind_all("<MouseWheel>"))
+        content.bind_all("<MouseWheel>", on_mousewheel, add="+")
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)

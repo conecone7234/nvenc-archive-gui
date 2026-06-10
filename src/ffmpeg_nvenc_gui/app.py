@@ -746,7 +746,7 @@ class EncoderApp:
         self.output_tune_combo = grid_combo("NVENC Tune", self.output_tune_var, GPU_TUNES, 5, 0)
         self.output_split_combo = grid_combo("SFE", self.output_split_encode_mode_var, ["auto"], 5, 1, width=18)
         self.output_rate_combo = grid_combo("Rate", self.output_rate_mode_var, RATE_MODES, 6, 0)
-        self.output_rate_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_rate_controls())
+        self.output_rate_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_encoder_controls())
         self.output_cpu_codec_combo = grid_combo("CPU Codec", self.output_cpu_codec_var, CPU_CODECS, 6, 1)
         self.output_cpu_codec_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_cpu_tune_choices())
         self.output_cpu_preset_combo = grid_combo("CPU Preset", self.output_cpu_preset_var, CPU_PRESETS, 7, 0)
@@ -980,7 +980,7 @@ class EncoderApp:
             self.output_rate_combo.configure(values=rate_modes)
         if self.output_rate_mode_var.get().upper() not in rate_modes:
             self.output_rate_mode_var.set(rate_modes[0])
-            self.update_output_rate_controls()
+        self.update_output_rate_controls()
 
         nvenc_state = tk.NORMAL if backend == BACKEND_NVENC else tk.DISABLED
         cpu_state = tk.NORMAL if backend == BACKEND_CPU else tk.DISABLED
@@ -1254,8 +1254,9 @@ class EncoderApp:
         if not hasattr(self, "output_cq_entry"):
             return
         mode = self.output_rate_mode_var.get().upper()
+        backend = self.output_backend_var.get() if hasattr(self, "output_backend_var") else BACKEND_CPU
         controls = {
-            self.output_cq_entry: mode in {"CQ", "VBR"},
+            self.output_cq_entry: backend_allows_cq(backend) and mode in {"CQ", "VBR"},
             self.output_bitrate_entry: mode in {"VBR", "ABR", "CBR"},
             self.output_maxrate_entry: mode == "VBR",
             self.output_bufsize_entry: mode in {"VBR", "CBR"},
@@ -1737,19 +1738,6 @@ class EncoderApp:
             os.startfile(self.paths.log_dir)
         except Exception as exc:
             messagebox.showerror("Error", str(exc))
-
-    def download_ffmpeg_button(self) -> None:
-        thread = threading.Thread(target=self._download_ffmpeg_worker, daemon=True)
-        thread.start()
-
-    def _download_ffmpeg_worker(self) -> None:
-        try:
-            ensure_ffmpeg_available(self.paths, auto_download=True, progress=self.log)
-            self.refresh_encoder_capabilities(show_errors=False)
-            self.log("FFmpeg / FFprobe is ready.")
-        except Exception as exc:
-            self.log(f"FFmpeg install failed: {exc}")
-            self.root.after(0, lambda: messagebox.showerror("FFmpeg install failed", str(exc)))
 
     def refresh_encoder_capabilities(self, show_errors: bool = True) -> bool:
         try:

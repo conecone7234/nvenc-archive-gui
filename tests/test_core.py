@@ -974,8 +974,11 @@ def test_update_output_encoder_controls_removes_cq_for_qsv():
     app.output_cpu_codec_var = Value("libx264")
     app.output_rate_mode_var = Value("CQ")
     app.output_split_encode_mode_var = Value("auto")
+    app.output_cq_entry = Widget()
+    app.output_bitrate_entry = Widget()
+    app.output_maxrate_entry = Widget()
+    app.output_bufsize_entry = Widget()
     app.encoder_capabilities = {}
-    app.update_output_rate_controls = lambda: None
     app._encoders_for_backend = lambda backend: ["hevc_qsv"]
     app.selected_output_resource_ids = lambda: ["intel:0"]
     app.current_profile = lambda: make_profile(Path("unused"))
@@ -985,6 +988,15 @@ def test_update_output_encoder_controls_removes_cq_for_qsv():
 
     assert app.output_rate_combo.config["values"] == ["VBR", "ABR", "CBR"]
     assert app.output_rate_mode_var.get() == "VBR"
+    assert app.output_cq_entry.config["state"] == app_module.tk.DISABLED
+    assert app.output_bitrate_entry.config["state"] == app_module.tk.NORMAL
+    assert app.output_maxrate_entry.config["state"] == app_module.tk.NORMAL
+    assert app.output_bufsize_entry.config["state"] == app_module.tk.NORMAL
+
+
+def test_encoder_app_has_no_unused_ffmpeg_download_button_handler():
+    assert not hasattr(EncoderApp, "download_ffmpeg_button")
+    assert not hasattr(EncoderApp, "_download_ffmpeg_worker")
 
 
 def test_set_output_edit_defaults_uses_qsv_backend_and_encoder(tmp_path: Path):

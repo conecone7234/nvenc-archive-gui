@@ -156,8 +156,8 @@ class EncoderApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("NVEnc Archive Studio")
-        self.root.geometry("1220x820")
-        self.root.minsize(1060, 700)
+        self.root.geometry("1180x720")
+        self.root.minsize(980, 620)
 
         self.paths: AppPaths = build_paths()
         ensure_dirs(self.paths)
@@ -381,14 +381,14 @@ class EncoderApp:
         self._path_entry(form, "出力先", self.output_dir_var, 3, 0)
         self._path_entry(form, "処理済み退避先", self.archive_dir_var, 4, 0)
 
-        ttk.Label(form, text="同時実行数", style="Surface.TLabel").grid(row=1, column=3, sticky=tk.W, padx=(24, 4))
-        ttk.Spinbox(form, from_=1, to=8, textvariable=self.max_jobs_var, width=6).grid(row=1, column=4, sticky=tk.W)
-        ttk.Label(form, text="分割間隔(分)", style="Surface.TLabel").grid(row=2, column=3, sticky=tk.W, padx=(24, 4))
-        ttk.Spinbox(form, from_=1, to=120, textvariable=self.segment_minutes_var, width=6).grid(row=2, column=4, sticky=tk.W)
+        ttk.Label(form, text="同時実行数", style="Surface.TLabel").grid(row=1, column=4, sticky=tk.W, padx=(24, 4))
+        ttk.Spinbox(form, from_=1, to=8, textvariable=self.max_jobs_var, width=6).grid(row=1, column=5, sticky=tk.W)
+        ttk.Label(form, text="分割間隔(分)", style="Surface.TLabel").grid(row=2, column=4, sticky=tk.W, padx=(24, 4))
+        ttk.Spinbox(form, from_=1, to=120, textvariable=self.segment_minutes_var, width=6).grid(row=2, column=5, sticky=tk.W)
 
-        ttk.Label(form, text="GPU", style="Surface.TLabel").grid(row=3, column=3, sticky=tk.W, padx=(24, 4))
+        ttk.Label(form, text="GPU", style="Surface.TLabel").grid(row=3, column=4, sticky=tk.W, padx=(24, 4))
         self.gpu_combo = ttk.Combobox(form, textvariable=self.gpu_choice_var, state="readonly", width=34)
-        self.gpu_combo.grid(row=3, column=4, columnspan=2, sticky="ew")
+        self.gpu_combo.grid(row=3, column=5, sticky="ew")
 
         ttk.Label(form, text="NVENC Codec", style="Surface.TLabel").grid(row=5, column=0, sticky=tk.W, pady=(12, 0))
         ttk.Combobox(
@@ -481,6 +481,8 @@ class EncoderApp:
         edit.bind("<Configure>", lambda _event: edit_canvas.configure(scrollregion=edit_canvas.bbox("all")))
         edit_canvas.bind("<Configure>", lambda event: edit_canvas.itemconfigure(edit_window, width=event.width))
         edit_canvas.configure(yscrollcommand=edit_scroll.set)
+        edit_canvas.bind("<MouseWheel>", lambda event: edit_canvas.yview_scroll(-int(event.delta / 120), "units"))
+        edit.bind("<MouseWheel>", lambda event: edit_canvas.yview_scroll(-int(event.delta / 120), "units"))
         edit_canvas.pack(side=tk.LEFT, fill=tk.Y)
         edit_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.output_name_var = tk.StringVar()

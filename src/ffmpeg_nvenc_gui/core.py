@@ -381,7 +381,11 @@ def parse_ffmpeg_args(value: object) -> List[str]:
     if not text:
         return []
     try:
-        return shlex.split(text.replace("\r", " ").replace("\n", " "), posix=True)
+        lexer = shlex.shlex(text.replace("\r", " ").replace("\n", " "), posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        lexer.escape = ""
+        return list(lexer)
     except ValueError as exc:
         raise ValueError(f"Invalid FFmpeg options: {exc}") from exc
 

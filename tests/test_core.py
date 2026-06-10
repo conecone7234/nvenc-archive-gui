@@ -26,6 +26,7 @@ from ffmpeg_nvenc_gui.core import (
     missing_rate_fields,
     normalize_container_extension,
     output_path_for,
+    parse_ffmpeg_args,
     profile_archive_dir,
     profile_from_state,
     profile_input_dir,
@@ -164,6 +165,12 @@ def test_output_profile_overrides_video_segment_command_and_extra_args(tmp_path:
     assert cmd.count("-movflags") == 1
     assert "+frag_keyframe+empty_moov" in cmd
     assert "+faststart" not in cmd
+
+
+def test_parse_ffmpeg_args_preserves_windows_paths_and_removes_quotes():
+    args = parse_ffmpeg_args(r'-metadata title="My Clip" -passlogfile "C:\temp\ffmpeg pass.log"')
+
+    assert args == ["-metadata", "title=My Clip", "-passlogfile", r"C:\temp\ffmpeg pass.log"]
 
 
 def test_audio_and_mux_commands_are_separate_from_video_segments(tmp_path: Path):

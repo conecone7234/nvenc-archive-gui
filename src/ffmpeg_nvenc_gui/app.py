@@ -123,8 +123,39 @@ except ModuleNotFoundError:
 PROFILE_DIR_LABELS = {
     "input_dir": "入力先",
     "output_dir": "出力先",
-    "archive_dir": "処理済み退避先",
+    "archive_dir": "処理済みソース退避先",
 }
+
+CPU_DEVICE_LABEL = "CPU"
+GPU_DEVICE_PREFIX = "GPU "
+GPU_CODECS = ["hevc_nvenc", "h264_nvenc", "av1_nvenc"]
+CPU_CODECS = ["libx264", "libx265"]
+GPU_PRESETS = ["p1", "p2", "p3", "p4", "p5", "p6", "p7"]
+CPU_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"]
+GPU_TUNES = ["none", "hq", "ll", "ull", "lossless"]
+CPU_TUNES_BY_CODEC = {
+    "libx264": ["none", "film", "animation", "grain", "stillimage", "fastdecode", "zerolatency", "psnr", "ssim"],
+    "libx265": ["none", "psnr", "ssim", "grain", "fastdecode", "zerolatency"],
+}
+RATE_MODES = ["CQ", "VBR", "ABR", "CBR"]
+CONTAINER_CHOICES = ["mp4", "mkv", "mov", "m4v", "webm", "ts", "m2ts"]
+
+
+class SearchableCombobox(ttk.Combobox):
+    def __init__(self, master: tk.Widget, values: List[str], **kwargs: object) -> None:
+        self._search_values = list(values)
+        super().__init__(master, values=self._search_values, **kwargs)
+        self.bind("<KeyRelease>", self._filter_values, add="+")
+
+    def _filter_values(self, event: tk.Event) -> None:
+        if event.keysym in {"Up", "Down", "Left", "Right", "Return", "Escape", "Tab"}:
+            return
+        needle = self.get().strip().lower().lstrip(".")
+        if not needle:
+            self.configure(values=self._search_values)
+            return
+        matches = [value for value in self._search_values if needle in value.lower()]
+        self.configure(values=matches or self._search_values)
 
 
 def profile_dir_label_text(fields: List[str]) -> str:
@@ -198,14 +229,16 @@ class EncoderApp:
             pass
 
         self.colors = {
-            "bg": "#f4f6f8",
+            "bg": "#eef2f7",
             "surface": "#ffffff",
-            "text": "#1f2937",
-            "muted": "#667085",
-            "line": "#d7dde5",
-            "accent": "#2563eb",
-            "danger": "#b42318",
-            "ok": "#067647",
+            "surface_alt": "#f8fafc",
+            "text": "#111827",
+            "muted": "#64748b",
+            "accent": "#0f766e",
+            "accent_hover": "#115e59",
+            "danger": "#b91c1c",
+            "log_bg": "#111827",
+            "log_fg": "#d1fae5",
         }
 
         self.root.configure(bg=self.colors["bg"])
@@ -215,16 +248,30 @@ class EncoderApp:
         style.configure("TLabel", background=self.colors["bg"], foreground=self.colors["text"])
         style.configure("Surface.TLabel", background=self.colors["surface"], foreground=self.colors["text"])
         style.configure("Muted.TLabel", background=self.colors["surface"], foreground=self.colors["muted"])
-        style.configure("Title.TLabel", background=self.colors["bg"], foreground=self.colors["text"], font=("Segoe UI", 18, "bold"))
+        style.configure("Title.TLabel", background=self.colors["bg"], foreground=self.colors["text"], font=("Segoe UI", 20, "bold"))
         style.configure("Subtitle.TLabel", background=self.colors["bg"], foreground=self.colors["muted"], font=("Segoe UI", 10))
         style.configure("Section.TLabel", background=self.colors["surface"], foreground=self.colors["text"], font=("Segoe UI", 11, "bold"))
-        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
-        style.configure("Danger.TButton", foreground=self.colors["danger"], font=("Segoe UI", 10, "bold"))
+        style.configure("Accent.TButton", background=self.colors["accent"], foreground="#ffffff", font=("Segoe UI", 10, "bold"), padding=(12, 7))
+        style.map("Accent.TButton", background=[("active", self.colors["accent_hover"])], foreground=[("disabled", "#e5e7eb")])
+        style.configure("Danger.TButton", foreground=self.colors["danger"], font=("Segoe UI", 10, "bold"), padding=(12, 7))
+        style.configure("TButton", font=("Segoe UI", 10), padding=(10, 6))
+        style.configure("TEntry", padding=(7, 5))
+        style.configure("TCombobox", padding=(7, 5))
+        style.configure("TSpinbox", padding=(7, 5))
         style.configure("TNotebook", background=self.colors["bg"], borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(18, 8), font=("Segoe UI", 10))
-        style.configure("Treeview", rowheight=28, font=("Segoe UI", 9))
-        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
-        style.configure("Horizontal.TProgressbar", thickness=12)
+        style.configure("TNotebook.Tab", background="#dde7f0", foreground=self.colors["text"], padding=(18, 9), font=("Segoe UI", 10, "bold"))
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#ffffff"), ("active", "#edf3f8")],
+            foreground=[("selected", self.colors["text"])],
+        )
+        style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff", foreground=self.colors["text"], rowheight=30, font=("Segoe UI", 9), borderwidth=0)
+        style.configure("Treeview.Heading", background=self.colors["surface_alt"], foreground=self.colors["text"], font=("Segoe UI", 9, "bold"), padding=(8, 6))
+        style.configure("Horizontal.TProgressbar", thickness=13)
+
+    def _surface(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.Frame(parent, padding=14, style="Surface.TFrame")
+        return frame
 
     def _build_ui(self) -> None:
         self._configure_style()
@@ -235,7 +282,7 @@ class EncoderApp:
         self.input_summary_var = tk.StringVar(value="")
         self.output_summary_var = tk.StringVar(value="")
 
-        main = ttk.Frame(self.root, padding=(20, 18), style="App.TFrame")
+        main = ttk.Frame(self.root, padding=(18, 16), style="App.TFrame")
         main.pack(fill=tk.BOTH, expand=True)
 
         header = ttk.Frame(main, style="App.TFrame")
@@ -250,34 +297,125 @@ class EncoderApp:
         ).pack(anchor=tk.W, pady=(2, 0))
 
         selector = ttk.Frame(header, style="App.TFrame")
-        selector.pack(side=tk.RIGHT)
+        selector.pack(side=tk.RIGHT, padx=(12, 0))
         ttk.Label(selector, text="実行設定").pack(anchor=tk.W)
         self.profile_combo = ttk.Combobox(
             selector,
             textvariable=self.active_profile_var,
-            width=32,
+            width=30,
             state="readonly",
         )
         self.profile_combo.pack(anchor=tk.E, pady=(3, 0))
         self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_selected)
 
         self.notebook = ttk.Notebook(main)
-        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(16, 0))
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
 
-        self.run_tab = ttk.Frame(self.notebook, padding=14, style="App.TFrame")
-        self.profile_tab = ttk.Frame(self.notebook, padding=14, style="App.TFrame")
+        self.run_tab = ttk.Frame(self.notebook, style="App.TFrame")
+        self.profile_tab = ttk.Frame(self.notebook, style="App.TFrame")
         self.notebook.add(self.run_tab, text="実行")
         self.notebook.add(self.profile_tab, text="設定")
+        self.run_tab_body = self._scrollable_tab(self.run_tab)
+        self.profile_tab_body = self._scrollable_tab(self.profile_tab)
 
         self._build_run_tab()
         self._build_profile_tab()
 
-    def _surface(self, parent: ttk.Frame) -> ttk.Frame:
-        frame = ttk.Frame(parent, padding=14, style="Surface.TFrame")
+    def _scrollable_tab(self, parent: ttk.Frame) -> ttk.Frame:
+        canvas = tk.Canvas(parent, highlightthickness=0, background=self.colors["bg"])
+        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
+        content = ttk.Frame(canvas, padding=14, style="App.TFrame")
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def on_content_configure(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def on_canvas_configure(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        def event_is_inside_content(widget: tk.Misc) -> bool:
+            current: Optional[tk.Misc] = widget
+            while current is not None:
+                if current == content:
+                    return True
+                current = getattr(current, "master", None)
+            return False
+
+        def on_mousewheel(event: tk.Event) -> Optional[str]:
+            widget = getattr(event, "widget", None)
+            if widget is None or not event_is_inside_content(widget):
+                return None
+            delta = int(-1 * (event.delta / 120)) if event.delta else 0
+            if delta:
+                canvas.yview_scroll(delta, "units")
+                return "break"
+            return None
+
+        content.bind("<Configure>", on_content_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
+        content.bind_all("<MouseWheel>", on_mousewheel, add="+")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        return content
+
+    def _section(self, parent: ttk.Frame, title: str) -> ttk.Frame:
+        frame = self._surface(parent)
+        frame.pack(fill=tk.X, pady=(0, 12))
+        ttk.Label(frame, text=title, style="Section.TLabel").pack(anchor=tk.W, pady=(0, 10))
         return frame
 
+    def _row(self, parent: ttk.Frame) -> ttk.Frame:
+        row = ttk.Frame(parent, style="Surface.TFrame")
+        row.pack(fill=tk.X, pady=4)
+        row.columnconfigure(1, weight=1)
+        return row
+
+    def _entry_row(self, parent: ttk.Frame, label: str, variable: tk.Variable, width: int = 28) -> ttk.Entry:
+        row = self._row(parent)
+        ttk.Label(row, text=label, width=18, style="Surface.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        entry = ttk.Entry(row, textvariable=variable, width=width)
+        entry.grid(row=0, column=1, sticky="ew")
+        return entry
+
+    def _spin_row(
+        self,
+        parent: ttk.Frame,
+        label: str,
+        variable: tk.Variable,
+        from_: int,
+        to: int,
+    ) -> ttk.Spinbox:
+        row = self._row(parent)
+        ttk.Label(row, text=label, width=18, style="Surface.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        spin = ttk.Spinbox(row, from_=from_, to=to, textvariable=variable, width=8)
+        spin.grid(row=0, column=1, sticky=tk.W)
+        return spin
+
+    def _combo_row(
+        self,
+        parent: ttk.Frame,
+        label: str,
+        variable: tk.Variable,
+        values: List[str],
+        width: int = 28,
+    ) -> ttk.Combobox:
+        row = self._row(parent)
+        ttk.Label(row, text=label, width=18, style="Surface.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        combo = ttk.Combobox(row, textvariable=variable, values=values, width=width, state="readonly")
+        combo.grid(row=0, column=1, sticky="ew")
+        return combo
+
+    def _path_row(self, parent: ttk.Frame, label: str, variable: tk.StringVar) -> None:
+        row = self._row(parent)
+        ttk.Label(row, text=label, width=18, style="Surface.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        entry = ttk.Entry(row, textvariable=variable)
+        entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(row, text="参照", command=lambda: self.browse_dir(variable)).grid(row=0, column=2, sticky=tk.E, padx=(8, 0))
+
     def _build_run_tab(self) -> None:
-        summary = self._surface(self.run_tab)
+        tab = self.run_tab_body
+        summary = self._surface(tab)
         summary.pack(fill=tk.X)
 
         left = ttk.Frame(summary, style="Surface.TFrame")
@@ -287,14 +425,14 @@ class EncoderApp:
         ttk.Label(left, textvariable=self.output_summary_var, style="Muted.TLabel").pack(anchor=tk.W)
 
         controls = ttk.Frame(summary, style="Surface.TFrame")
-        controls.pack(side=tk.RIGHT)
+        controls.pack(side=tk.RIGHT, padx=(12, 0))
         ttk.Button(controls, text="開始", style="Accent.TButton", command=self.start_current_profile).pack(side=tk.LEFT, padx=(0, 8))
         self.pause_button = ttk.Button(controls, text="一時停止", command=self.toggle_pause)
         self.pause_button.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(controls, text="中断", style="Danger.TButton", command=self.stop_all).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(controls, text="停止", style="Danger.TButton", command=self.stop_all).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(controls, text="保存状態から再開", command=self.resume_saved).pack(side=tk.LEFT)
 
-        progress_box = self._surface(self.run_tab)
+        progress_box = self._surface(tab)
         progress_box.pack(fill=tk.X, pady=(12, 0))
         progress_head = ttk.Frame(progress_box, style="Surface.TFrame")
         progress_head.pack(fill=tk.X)
@@ -303,33 +441,32 @@ class EncoderApp:
         self.overall_progress = ttk.Progressbar(progress_box, mode="determinate", maximum=100)
         self.overall_progress.pack(fill=tk.X, pady=(10, 0))
 
-        body = ttk.Frame(self.run_tab, style="App.TFrame")
-        body.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
-
-        list_box = self._surface(body)
-        list_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        list_box = self._surface(tab)
+        list_box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
         list_head = ttk.Frame(list_box, style="Surface.TFrame")
         list_head.pack(fill=tk.X)
         ttk.Label(list_head, text="ファイル別進捗", style="Section.TLabel").pack(side=tk.LEFT)
-        ttk.Button(list_head, text="更新", command=self.scan_files).pack(side=tk.RIGHT)
+        ttk.Button(list_head, text="再スキャン", command=self.scan_files).pack(side=tk.RIGHT)
 
+        tree_frame = ttk.Frame(list_box, style="Surface.TFrame")
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
         columns = ("file", "output", "status", "progress")
-        self.progress_tree = ttk.Treeview(list_box, columns=columns, show="headings", height=15)
+        self.progress_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=10)
         for key, text, width in [
-            ("file", "ファイル", 260),
-            ("output", "出力", 170),
+            ("file", "ファイル", 280),
+            ("output", "出力", 190),
             ("status", "状態", 120),
-            ("progress", "進捗", 90),
+            ("progress", "進捗", 220),
         ]:
             self.progress_tree.heading(key, text=text)
             self.progress_tree.column(key, width=width, anchor=tk.W)
-        self.progress_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(10, 0))
-        tree_scroll = ttk.Scrollbar(list_box, orient=tk.VERTICAL, command=self.progress_tree.yview)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=(10, 0))
+        self.progress_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.progress_tree.yview)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.progress_tree.config(yscrollcommand=tree_scroll.set)
 
-        log_box = self._surface(body)
-        log_box.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(12, 0))
+        log_box = self._surface(tab)
+        log_box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
         log_head = ttk.Frame(log_box, style="Surface.TFrame")
         log_head.pack(fill=tk.X)
         ttk.Label(log_head, text="ログ", style="Section.TLabel").pack(side=tk.LEFT)
@@ -337,10 +474,10 @@ class EncoderApp:
         self.log_text = ScrolledText(
             log_box,
             wrap=tk.WORD,
-            height=18,
-            bg="#0f172a",
-            fg="#dbeafe",
-            insertbackground="#dbeafe",
+            height=12,
+            bg=self.colors["log_bg"],
+            fg=self.colors["log_fg"],
+            insertbackground=self.colors["log_fg"],
             relief=tk.FLAT,
             padx=10,
             pady=10,
@@ -349,11 +486,12 @@ class EncoderApp:
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
     def _build_profile_tab(self) -> None:
-        form = self._surface(self.profile_tab)
+        tab = self.profile_tab_body
+        form = self._surface(tab)
         form.pack(fill=tk.X)
 
         toolbar = ttk.Frame(form, style="Surface.TFrame")
-        toolbar.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 12))
+        toolbar.pack(fill=tk.X, pady=(0, 12))
         ttk.Label(toolbar, text="設定", style="Section.TLabel").pack(side=tk.LEFT)
         ttk.Button(toolbar, text="新規", command=self.new_profile).pack(side=tk.RIGHT, padx=(8, 0))
         ttk.Button(toolbar, text="削除", command=self.delete_current_profile).pack(side=tk.RIGHT, padx=(8, 0))
@@ -365,86 +503,53 @@ class EncoderApp:
         self.archive_dir_var = tk.StringVar()
         self.max_jobs_var = tk.IntVar(value=2)
         self.segment_minutes_var = tk.IntVar(value=10)
-        self.gpu_choice_var = tk.StringVar(value="CPU only")
+        self.gpu_choice_var = tk.StringVar(value=CPU_DEVICE_LABEL)
         self.codec_var = tk.StringVar(value="hevc_nvenc")
         self.cpu_codec_var = tk.StringVar(value="libx264")
         self.preset_var = tk.StringVar(value="p7")
+        self.cpu_preset_var = tk.StringVar(value="medium")
         self.tune_var = tk.StringVar(value="hq")
+        self.cpu_tune_var = tk.StringVar(value="none")
         self.rate_mode_var = tk.StringVar(value="CQ")
         self.cq_var = tk.StringVar(value="18")
         self.bitrate_var = tk.StringVar(value="25000k")
         self.maxrate_var = tk.StringVar(value="40000k")
         self.bufsize_var = tk.StringVar(value="80000k")
 
-        self._label_entry(form, "名前", self.profile_name_var, 1, 0, width=28)
-        self._path_entry(form, "入力先", self.input_dir_var, 2, 0)
-        self._path_entry(form, "出力先", self.output_dir_var, 3, 0)
-        self._path_entry(form, "処理済み退避先", self.archive_dir_var, 4, 0)
+        general = self._section(form, "基本設定")
+        self._entry_row(general, "設定名", self.profile_name_var)
+        self._path_row(general, "入力先", self.input_dir_var)
+        self._path_row(general, "出力先", self.output_dir_var)
+        self._path_row(general, "処理済みソース退避先", self.archive_dir_var)
 
-        ttk.Label(form, text="同時実行数", style="Surface.TLabel").grid(row=1, column=4, sticky=tk.W, padx=(24, 4))
-        ttk.Spinbox(form, from_=1, to=8, textvariable=self.max_jobs_var, width=6).grid(row=1, column=5, sticky=tk.W)
-        ttk.Label(form, text="分割間隔(分)", style="Surface.TLabel").grid(row=2, column=4, sticky=tk.W, padx=(24, 4))
-        ttk.Spinbox(form, from_=1, to=120, textvariable=self.segment_minutes_var, width=6).grid(row=2, column=5, sticky=tk.W)
+        runtime = self._section(form, "実行設定")
+        self.gpu_combo = self._combo_row(runtime, "処理デバイス", self.gpu_choice_var, self._gpu_choices())
+        self.gpu_combo.bind("<<ComboboxSelected>>", self.on_device_changed)
+        self._spin_row(runtime, "並列セグメント数", self.max_jobs_var, 1, 8)
+        self._spin_row(runtime, "分割間隔(分)", self.segment_minutes_var, 1, 120)
 
-        ttk.Label(form, text="GPU", style="Surface.TLabel").grid(row=3, column=4, sticky=tk.W, padx=(24, 4))
-        self.gpu_combo = ttk.Combobox(form, textvariable=self.gpu_choice_var, state="readonly", width=34)
-        self.gpu_combo.grid(row=3, column=5, sticky="ew")
+        encoder = self._section(form, "エンコード既定値")
+        self.gpu_settings_frame = ttk.Frame(encoder, style="Surface.TFrame")
+        self.cpu_settings_frame = ttk.Frame(encoder, style="Surface.TFrame")
+        self.gpu_codec_combo = self._combo_row(self.gpu_settings_frame, "GPU Codec", self.codec_var, GPU_CODECS, width=18)
+        self.gpu_preset_combo = self._combo_row(self.gpu_settings_frame, "NVENC Preset", self.preset_var, GPU_PRESETS, width=12)
+        self.gpu_tune_combo = self._combo_row(self.gpu_settings_frame, "NVENC Tune", self.tune_var, GPU_TUNES, width=16)
+        self.cpu_codec_combo = self._combo_row(self.cpu_settings_frame, "CPU Codec", self.cpu_codec_var, CPU_CODECS, width=18)
+        self.cpu_codec_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_cpu_tune_choices())
+        self.cpu_preset_combo = self._combo_row(self.cpu_settings_frame, "CPU Preset", self.cpu_preset_var, CPU_PRESETS, width=18)
+        self.cpu_tune_combo = self._combo_row(self.cpu_settings_frame, "CPU Tune", self.cpu_tune_var, CPU_TUNES_BY_CODEC["libx264"], width=18)
 
-        ttk.Label(form, text="NVENC Codec", style="Surface.TLabel").grid(row=5, column=0, sticky=tk.W, pady=(12, 0))
-        ttk.Combobox(
-            form,
-            textvariable=self.codec_var,
-            values=["hevc_nvenc", "h264_nvenc", "av1_nvenc"],
-            width=18,
-            state="readonly",
-        ).grid(row=5, column=1, sticky=tk.W, pady=(12, 0))
-        ttk.Label(form, text="CPU Codec", style="Surface.TLabel").grid(row=5, column=2, sticky=tk.W, pady=(12, 0), padx=(16, 4))
-        ttk.Combobox(
-            form,
-            textvariable=self.cpu_codec_var,
-            values=["libx264", "libx265"],
-            width=14,
-            state="readonly",
-        ).grid(row=5, column=3, sticky=tk.W, pady=(12, 0))
+        self.rate_frame = ttk.Frame(encoder, style="Surface.TFrame")
+        self.rate_frame.pack(fill=tk.X, pady=(8, 0))
+        self.rate_combo = self._combo_row(self.rate_frame, "品質/レート制御", self.rate_mode_var, RATE_MODES, width=12)
+        self.rate_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_rate_controls())
+        self.cq_label, self.cq_entry = self._labeled_rate_entry(self.rate_frame, "CQ", self.cq_var)
+        self.bitrate_label, self.bitrate_entry = self._labeled_rate_entry(self.rate_frame, "Bitrate", self.bitrate_var)
+        self.maxrate_label, self.maxrate_entry = self._labeled_rate_entry(self.rate_frame, "Maxrate", self.maxrate_var)
+        self.bufsize_label, self.bufsize_entry = self._labeled_rate_entry(self.rate_frame, "Bufsize", self.bufsize_var)
 
-        ttk.Label(form, text="Preset", style="Surface.TLabel").grid(row=6, column=0, sticky=tk.W)
-        ttk.Combobox(
-            form,
-            textvariable=self.preset_var,
-            values=["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
-            width=8,
-            state="readonly",
-        ).grid(row=6, column=1, sticky=tk.W)
-        ttk.Label(form, text="Tune", style="Surface.TLabel").grid(row=6, column=2, sticky=tk.W, padx=(16, 4))
-        ttk.Combobox(
-            form,
-            textvariable=self.tune_var,
-            values=["none", "hq", "ll", "ull", "lossless"],
-            width=12,
-            state="readonly",
-        ).grid(row=6, column=3, sticky=tk.W)
-        ttk.Label(form, text="Rate", style="Surface.TLabel").grid(row=6, column=4, sticky=tk.W, padx=(16, 4))
-        rate_combo = ttk.Combobox(
-            form,
-            textvariable=self.rate_mode_var,
-            values=["CQ", "VBR", "ABR", "CBR"],
-            width=8,
-            state="readonly",
-        )
-        rate_combo.grid(row=6, column=5, sticky=tk.W)
-        rate_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_rate_controls())
-
-        self.cq_entry = self._compact_entry(form, "CQ/CRF", self.cq_var, 7, 0)
-        self.bitrate_entry = self._compact_entry(form, "Bitrate", self.bitrate_var, 7, 2)
-        self.maxrate_entry = self._compact_entry(form, "Maxrate", self.maxrate_var, 7, 4)
-        self.bufsize_entry = self._compact_entry(form, "Bufsize", self.bufsize_var, 8, 0)
-
-        for column in range(6):
-            form.columnconfigure(column, weight=1)
-
-        outputs = self._surface(self.profile_tab)
+        outputs = self._surface(tab)
         outputs.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
-
         output_head = ttk.Frame(outputs, style="Surface.TFrame")
         output_head.pack(fill=tk.X)
         ttk.Label(output_head, text="出力プロファイル", style="Section.TLabel").pack(side=tk.LEFT)
@@ -452,50 +557,42 @@ class EncoderApp:
 
         output_body = ttk.Frame(outputs, style="Surface.TFrame")
         output_body.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-
-        columns = ("name", "resolution", "folder", "container")
-        self.outputs_tree = ttk.Treeview(output_body, columns=columns, show="headings", height=8)
+        tree_frame = ttk.Frame(output_body, style="Surface.TFrame")
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        columns = ("enabled", "name", "resolution", "folder", "container")
+        self.outputs_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=7)
         for key, text, width in [
+            ("enabled", "有効", 60),
             ("name", "名前", 190),
             ("resolution", "解像度", 100),
-            ("folder", "フォルダ名", 180),
-            ("container", "形式", 70),
+            ("folder", "フォルダ名", 190),
+            ("container", "コンテナ", 90),
         ]:
             self.outputs_tree.heading(key, text=text)
             self.outputs_tree.column(key, width=width, anchor=tk.W)
         self.outputs_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        output_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.outputs_tree.yview)
+        output_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.outputs_tree.config(yscrollcommand=output_scroll.set)
         self.outputs_tree.bind("<<TreeviewSelect>>", self.on_output_select)
 
-        edit_container = ttk.Frame(output_body, padding=(16, 0, 0, 0), style="Surface.TFrame")
-        edit_container.pack(side=tk.RIGHT, fill=tk.Y)
-        edit_canvas = tk.Canvas(
-            edit_container,
-            width=310,
-            height=300,
-            bg=self.colors["surface"],
-            highlightthickness=0,
-        )
-        edit_scroll = ttk.Scrollbar(edit_container, orient=tk.VERTICAL, command=edit_canvas.yview)
-        edit = ttk.Frame(edit_canvas, style="Surface.TFrame")
-        edit_window = edit_canvas.create_window((0, 0), window=edit, anchor=tk.NW)
-        edit.bind("<Configure>", lambda _event: edit_canvas.configure(scrollregion=edit_canvas.bbox("all")))
-        edit_canvas.bind("<Configure>", lambda event: edit_canvas.itemconfigure(edit_window, width=event.width))
-        edit_canvas.configure(yscrollcommand=edit_scroll.set)
-        edit_canvas.bind("<MouseWheel>", lambda event: edit_canvas.yview_scroll(-int(event.delta / 120), "units"))
-        edit.bind("<MouseWheel>", lambda event: edit_canvas.yview_scroll(-int(event.delta / 120), "units"))
-        edit_canvas.pack(side=tk.LEFT, fill=tk.Y)
-        edit_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        edit = ttk.Frame(output_body, style="Surface.TFrame")
+        edit.pack(fill=tk.X, pady=(14, 0))
+        edit.columnconfigure(1, weight=1)
+        edit.columnconfigure(3, weight=1)
         self.output_name_var = tk.StringVar()
         self.output_folder_var = tk.StringVar()
         self.output_resolution_var = tk.StringVar(value="1080p")
         self.output_custom_height_var = tk.StringVar(value="")
         self.output_container_var = tk.StringVar(value="mp4")
+        self.output_enabled_var = tk.BooleanVar(value=True)
         self.output_filename_template_var = tk.StringVar(value="{source}")
-        self.output_gpu_choice_var = tk.StringVar(value="CPU only")
+        self.output_gpu_choice_var = tk.StringVar(value=CPU_DEVICE_LABEL)
         self.output_codec_var = tk.StringVar(value="hevc_nvenc")
         self.output_cpu_codec_var = tk.StringVar(value="libx264")
         self.output_preset_var = tk.StringVar(value="p7")
         self.output_cpu_preset_var = tk.StringVar(value="medium")
+        self.output_cpu_tune_var = tk.StringVar(value="none")
         self.output_tune_var = tk.StringVar(value="hq")
         self.output_rate_mode_var = tk.StringVar(value="CQ")
         self.output_cq_var = tk.StringVar(value="18")
@@ -514,80 +611,120 @@ class EncoderApp:
         self.output_extra_concat_args_var = tk.StringVar(value="")
         self.output_extra_mux_args_var = tk.StringVar(value="")
 
-        self._stacked_label_entry(edit, "名前", self.output_name_var)
-        self._stacked_label_entry(edit, "フォルダ名", self.output_folder_var)
-        self._stacked_label_entry(edit, "ファイル名テンプレート", self.output_filename_template_var)
-        ttk.Label(edit, text="解像度", style="Surface.TLabel").pack(anchor=tk.W, pady=(8, 2))
+        def grid_entry(label: str, variable: tk.Variable, row: int, pair: int = 0) -> ttk.Entry:
+            label_column = pair * 2
+            ttk.Label(edit, text=label, style="Surface.TLabel").grid(
+                row=row,
+                column=label_column,
+                sticky=tk.W,
+                pady=4,
+                padx=(0 if pair == 0 else 16, 8),
+            )
+            entry = ttk.Entry(edit, textvariable=variable)
+            entry.grid(row=row, column=label_column + 1, sticky="ew", pady=4)
+            return entry
+
+        def grid_combo(
+            label: str,
+            variable: tk.Variable,
+            values: List[str],
+            row: int,
+            pair: int = 0,
+            width: int = 18,
+        ) -> ttk.Combobox:
+            label_column = pair * 2
+            ttk.Label(edit, text=label, style="Surface.TLabel").grid(
+                row=row,
+                column=label_column,
+                sticky=tk.W,
+                pady=4,
+                padx=(0 if pair == 0 else 16, 8),
+            )
+            combo = ttk.Combobox(edit, textvariable=variable, values=values, width=width, state="readonly")
+            combo.grid(row=row, column=label_column + 1, sticky="ew", pady=4)
+            return combo
+
+        grid_entry("名前", self.output_name_var, 0, 0)
+        grid_entry("フォルダ名", self.output_folder_var, 0, 1)
+        grid_entry("ファイル名テンプレート", self.output_filename_template_var, 1, 0)
+        ttk.Checkbutton(edit, text="このプロファイルを有効にする", variable=self.output_enabled_var).grid(
+            row=1,
+            column=2,
+            columnspan=2,
+            sticky=tk.W,
+            pady=4,
+            padx=(16, 0),
+        )
+
+        ttk.Label(edit, text="解像度", style="Surface.TLabel").grid(row=2, column=0, sticky=tk.W, pady=4, padx=(0, 8))
         resolution_combo = ttk.Combobox(
             edit,
             textvariable=self.output_resolution_var,
             values=list(RESOLUTION_PRESETS.keys()),
-            width=22,
             state="readonly",
         )
-        resolution_combo.pack(anchor=tk.W)
+        resolution_combo.grid(row=2, column=1, sticky="ew", pady=4)
         resolution_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_resolution_controls())
-        ttk.Label(edit, text="カスタム高さ", style="Surface.TLabel").pack(anchor=tk.W, pady=(8, 2))
-        self.custom_height_entry = ttk.Entry(edit, textvariable=self.output_custom_height_var, width=24)
-        self.custom_height_entry.pack(anchor=tk.W)
-        self._stacked_label_entry(edit, "形式", self.output_container_var)
-        ttk.Label(edit, text="GPU", style="Surface.TLabel").pack(anchor=tk.W, pady=(8, 2))
-        self.output_gpu_combo = ttk.Combobox(edit, textvariable=self.output_gpu_choice_var, state="readonly", width=24)
-        self.output_gpu_combo.pack(anchor=tk.W)
-        self._stacked_combo(edit, "NVENC Codec", self.output_codec_var, ["hevc_nvenc", "h264_nvenc", "av1_nvenc"])
-        self._stacked_combo(edit, "CPU Codec", self.output_cpu_codec_var, ["libx264", "libx265"])
-        self._stacked_combo(edit, "Preset", self.output_preset_var, ["p1", "p2", "p3", "p4", "p5", "p6", "p7"])
-        self._stacked_combo(edit, "CPU Preset", self.output_cpu_preset_var, ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"])
-        self._stacked_combo(edit, "Tune", self.output_tune_var, ["none", "hq", "ll", "ull", "lossless"])
-        self._stacked_combo(edit, "Rate", self.output_rate_mode_var, ["CQ", "VBR", "ABR", "CBR"])
-        self._stacked_label_entry(edit, "CQ/CRF", self.output_cq_var)
-        self._stacked_label_entry(edit, "Bitrate", self.output_bitrate_var)
-        self._stacked_label_entry(edit, "Maxrate", self.output_maxrate_var)
-        self._stacked_label_entry(edit, "Bufsize", self.output_bufsize_var)
-        self._stacked_label_entry(edit, "Pix fmt", self.output_pix_fmt_var)
-        self._stacked_label_entry(edit, "Scale flags", self.output_scale_flags_var)
-        self._stacked_label_entry(edit, "Audio codec", self.output_audio_codec_var)
-        self._stacked_label_entry(edit, "Audio bitrate", self.output_audio_bitrate_var)
-        self._stacked_label_entry(edit, "Audio container", self.output_audio_container_var)
-        self._stacked_label_entry(edit, "FFmpeg input args", self.output_extra_input_args_var)
-        self._stacked_label_entry(edit, "FFmpeg video args", self.output_extra_video_args_var)
-        self._stacked_label_entry(edit, "FFmpeg audio args", self.output_extra_audio_args_var)
-        self._stacked_label_entry(edit, "FFmpeg output args", self.output_extra_output_args_var)
-        self._stacked_label_entry(edit, "FFmpeg concat args", self.output_extra_concat_args_var)
-        self._stacked_label_entry(edit, "FFmpeg mux args", self.output_extra_mux_args_var)
-        ttk.Button(edit, text="追加/更新", style="Accent.TButton", command=self.add_or_update_output).pack(fill=tk.X, pady=(12, 4))
-        ttk.Button(edit, text="削除", command=self.remove_output).pack(fill=tk.X)
+        self.custom_height_label = ttk.Label(edit, text="カスタム高さ", style="Surface.TLabel")
+        self.custom_height_entry = ttk.Entry(edit, textvariable=self.output_custom_height_var)
+        self.custom_height_label.grid(row=2, column=2, sticky=tk.W, pady=4, padx=(16, 8))
+        self.custom_height_entry.grid(row=2, column=3, sticky="ew", pady=4)
 
-        footer = ttk.Frame(self.profile_tab, style="App.TFrame")
+        ttk.Label(edit, text="コンテナ", style="Surface.TLabel").grid(row=3, column=0, sticky=tk.W, pady=4, padx=(0, 8))
+        self.output_container_combo = SearchableCombobox(
+            edit,
+            textvariable=self.output_container_var,
+            values=CONTAINER_CHOICES,
+            state="normal",
+        )
+        self.output_container_combo.grid(row=3, column=1, sticky="ew", pady=4)
+        self.output_gpu_combo = grid_combo("処理デバイス", self.output_gpu_choice_var, self._gpu_choices(), 3, 1, width=26)
+        grid_combo("NVENC Codec", self.output_codec_var, GPU_CODECS, 4, 0)
+        grid_combo("NVENC Preset", self.output_preset_var, GPU_PRESETS, 4, 1)
+        grid_combo("NVENC Tune", self.output_tune_var, GPU_TUNES, 5, 0)
+        grid_combo("Rate", self.output_rate_mode_var, RATE_MODES, 5, 1)
+        self.output_cpu_codec_combo = grid_combo("CPU Codec", self.output_cpu_codec_var, CPU_CODECS, 6, 0)
+        self.output_cpu_codec_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_cpu_tune_choices())
+        grid_combo("CPU Preset", self.output_cpu_preset_var, CPU_PRESETS, 6, 1)
+        self.output_cpu_tune_combo = grid_combo("CPU Tune", self.output_cpu_tune_var, CPU_TUNES_BY_CODEC["libx264"], 7, 0)
+        grid_entry("CQ/CRF", self.output_cq_var, 7, 1)
+        grid_entry("Bitrate", self.output_bitrate_var, 8, 0)
+        grid_entry("Maxrate", self.output_maxrate_var, 8, 1)
+        grid_entry("Bufsize", self.output_bufsize_var, 9, 0)
+        grid_entry("Pix fmt", self.output_pix_fmt_var, 9, 1)
+        grid_entry("Scale flags", self.output_scale_flags_var, 10, 0)
+        grid_entry("Audio codec", self.output_audio_codec_var, 10, 1)
+        grid_entry("Audio bitrate", self.output_audio_bitrate_var, 11, 0)
+        grid_entry("Audio container", self.output_audio_container_var, 11, 1)
+        grid_entry("FFmpeg input args", self.output_extra_input_args_var, 12, 0)
+        grid_entry("FFmpeg video args", self.output_extra_video_args_var, 12, 1)
+        grid_entry("FFmpeg audio args", self.output_extra_audio_args_var, 13, 0)
+        grid_entry("FFmpeg output args", self.output_extra_output_args_var, 13, 1)
+        grid_entry("FFmpeg concat args", self.output_extra_concat_args_var, 14, 0)
+        grid_entry("FFmpeg mux args", self.output_extra_mux_args_var, 14, 1)
+
+        buttons = ttk.Frame(edit, style="Surface.TFrame")
+        buttons.grid(row=15, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        ttk.Button(buttons, text="追加/更新", style="Accent.TButton", command=self.add_or_update_output).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(buttons, text="削除", command=self.remove_output).pack(side=tk.RIGHT)
+
+        footer = ttk.Frame(tab, style="App.TFrame")
         footer.pack(fill=tk.X, pady=(12, 0))
         ttk.Button(footer, text="FFmpegを確認/導入", command=self.download_ffmpeg_button).pack(side=tk.RIGHT)
 
+        self.update_cpu_tune_choices()
+        self.update_output_cpu_tune_choices()
+        self.update_encoder_controls(apply_defaults=False)
         self.update_rate_controls()
         self.update_resolution_controls()
 
-    def _label_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, row: int, column: int, width: int = 38) -> ttk.Entry:
-        ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=column, sticky=tk.W, pady=3)
-        entry = ttk.Entry(parent, textvariable=variable, width=width)
-        entry.grid(row=row, column=column + 1, sticky="ew", pady=3)
-        return entry
-
-    def _path_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, row: int, column: int) -> None:
-        ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=column, sticky=tk.W, pady=3)
-        entry = ttk.Entry(parent, textvariable=variable, width=48)
-        entry.grid(row=row, column=column + 1, columnspan=2, sticky="ew", pady=3)
-        ttk.Button(parent, text="選択", command=lambda: self.browse_dir(variable)).grid(row=row, column=column + 3, sticky=tk.W, padx=(8, 0), pady=3)
-
-    def _compact_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, row: int, column: int) -> ttk.Entry:
-        ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=column, sticky=tk.W, pady=(8, 0))
-        entry = ttk.Entry(parent, textvariable=variable, width=12)
-        entry.grid(row=row, column=column + 1, sticky=tk.W, pady=(8, 0))
-        return entry
-
-    def _stacked_label_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar) -> ttk.Entry:
-        ttk.Label(parent, text=label, style="Surface.TLabel").pack(anchor=tk.W, pady=(0, 2))
-        entry = ttk.Entry(parent, textvariable=variable, width=26)
-        entry.pack(anchor=tk.W, pady=(0, 8))
-        return entry
+    def _labeled_rate_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar) -> tuple[ttk.Label, ttk.Entry]:
+        row = self._row(parent)
+        label_widget = ttk.Label(row, text=label, width=18, style="Surface.TLabel")
+        label_widget.grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        entry = ttk.Entry(row, textvariable=variable, width=14)
+        entry.grid(row=0, column=1, sticky=tk.W)
+        return label_widget, entry
 
     def _stacked_combo(self, parent: ttk.Frame, label: str, variable: tk.StringVar, values: List[str]) -> ttk.Combobox:
         ttk.Label(parent, text=label, style="Surface.TLabel").pack(anchor=tk.W, pady=(8, 2))
@@ -637,8 +774,8 @@ class EncoderApp:
         self.profile_combo.current(active_index)
 
     def _gpu_choices(self) -> List[str]:
-        choices = ["CPU only"]
-        choices.extend([f"GPU {gpu.index}: {gpu.name}" for gpu in self.gpus])
+        choices = [CPU_DEVICE_LABEL]
+        choices.extend([f"{GPU_DEVICE_PREFIX}{gpu.index}: {gpu.name}" for gpu in self.gpus])
         return choices
 
     def profile_index_by_id(self, profile_id: Optional[str]) -> Optional[int]:
@@ -697,7 +834,9 @@ class EncoderApp:
         self.codec_var.set(profile.codec)
         self.cpu_codec_var.set(profile.cpu_codec)
         self.preset_var.set(profile.preset)
+        self.cpu_preset_var.set(profile.cpu_preset)
         self.tune_var.set(profile.tune)
+        self.cpu_tune_var.set(getattr(profile, "cpu_tune", "none"))
         self.rate_mode_var.set(profile.rate_mode)
         self.cq_var.set(str(profile.cq_value))
         self.bitrate_var.set(profile.bitrate)
@@ -707,15 +846,19 @@ class EncoderApp:
         self.selected_output_id = None
         self.set_output_edit_defaults(profile)
         self.refresh_outputs_tree()
+        self.update_cpu_tune_choices()
+        self.update_output_cpu_tune_choices()
+        self.update_encoder_controls(apply_defaults=False)
         self.update_rate_controls()
+        self.update_resolution_controls()
 
     def _choice_for_profile_gpu(self, profile: EncodeProfile) -> str:
         if not profile.use_gpu:
-            return "CPU only"
+            return CPU_DEVICE_LABEL
         for gpu in self.gpus:
             if gpu.index == profile.gpu_index:
-                return f"GPU {gpu.index}: {gpu.name}"
-        return "CPU only"
+                return f"{GPU_DEVICE_PREFIX}{gpu.index}: {gpu.name}"
+        return CPU_DEVICE_LABEL
 
     def _parse_gpu_choice(self) -> tuple[bool, int, str]:
         return self._parse_gpu_choice_value(self.gpu_choice_var.get())
@@ -724,10 +867,10 @@ class EncoderApp:
         return self._parse_gpu_choice_value(self.output_gpu_choice_var.get())
 
     def _parse_gpu_choice_value(self, choice: str) -> tuple[bool, int, str]:
-        if not choice.startswith("GPU "):
+        if not choice.startswith(GPU_DEVICE_PREFIX):
             return False, 0, ""
         prefix, _, name = choice.partition(":")
-        index_text = prefix.replace("GPU", "").strip()
+        index_text = prefix.replace(GPU_DEVICE_PREFIX.strip(), "").strip()
         if not index_text.isdigit():
             return False, 0, ""
         return True, int(index_text), name.strip()
@@ -735,12 +878,12 @@ class EncoderApp:
     def _choice_for_variant_gpu(self, profile: EncodeProfile, variant: OutputVariant) -> str:
         use_gpu = profile.use_gpu if variant.use_gpu is None else variant.use_gpu
         if not use_gpu:
-            return "CPU only"
+            return CPU_DEVICE_LABEL
         gpu_index = profile.gpu_index if variant.gpu_index is None else variant.gpu_index
         for gpu in self.gpus:
             if gpu.index == gpu_index:
-                return f"GPU {gpu.index}: {gpu.name}"
-        return "CPU only"
+                return f"{GPU_DEVICE_PREFIX}{gpu.index}: {gpu.name}"
+        return CPU_DEVICE_LABEL
 
     def set_output_edit_defaults(self, profile: EncodeProfile) -> None:
         self.output_name_var.set("")
@@ -748,12 +891,14 @@ class EncoderApp:
         self.output_resolution_var.set("1080p")
         self.output_custom_height_var.set("")
         self.output_container_var.set("mp4")
+        self.output_enabled_var.set(True)
         self.output_filename_template_var.set("{source}")
         self.output_gpu_choice_var.set(self._choice_for_profile_gpu(profile))
         self.output_codec_var.set(profile.codec)
         self.output_cpu_codec_var.set(profile.cpu_codec)
         self.output_preset_var.set(profile.preset)
         self.output_cpu_preset_var.set(profile.cpu_preset)
+        self.output_cpu_tune_var.set(getattr(profile, "cpu_tune", "none"))
         self.output_tune_var.set(profile.tune)
         self.output_rate_mode_var.set(profile.rate_mode)
         self.output_cq_var.set(str(profile.cq_value))
@@ -771,7 +916,66 @@ class EncoderApp:
         self.output_extra_output_args_var.set("")
         self.output_extra_concat_args_var.set("")
         self.output_extra_mux_args_var.set("")
+        self.update_output_cpu_tune_choices()
         self.update_resolution_controls()
+
+    def on_device_changed(self, _event: object = None) -> None:
+        use_gpu, _gpu_index, _gpu_name = self._parse_gpu_choice()
+        self.apply_device_defaults(use_gpu)
+        self.update_encoder_controls(apply_defaults=False)
+        self.update_rate_controls()
+
+    def apply_device_defaults(self, use_gpu: bool) -> None:
+        self.rate_mode_var.set("CQ")
+        if use_gpu:
+            if self.max_jobs_var.get() < 2:
+                self.max_jobs_var.set(2)
+            self.cq_var.set("18")
+            self.bitrate_var.set("25000k")
+            self.maxrate_var.set("40000k")
+            self.bufsize_var.set("80000k")
+        else:
+            self.max_jobs_var.set(1)
+            self.cpu_codec_var.set(self.cpu_codec_var.get() or "libx264")
+            self.cpu_preset_var.set(self.cpu_preset_var.get() or "medium")
+            self.cpu_tune_var.set("none")
+            self.cq_var.set("23")
+            self.bitrate_var.set("8000k")
+            self.maxrate_var.set("12000k")
+            self.bufsize_var.set("24000k")
+            self.update_cpu_tune_choices()
+
+    def update_cpu_tune_choices(self) -> None:
+        if not hasattr(self, "cpu_tune_combo"):
+            return
+        values = CPU_TUNES_BY_CODEC.get(self.cpu_codec_var.get(), CPU_TUNES_BY_CODEC["libx264"])
+        self.cpu_tune_combo.configure(values=values)
+        if self.cpu_tune_var.get() not in values:
+            self.cpu_tune_var.set("none")
+
+    def update_output_cpu_tune_choices(self) -> None:
+        if not hasattr(self, "output_cpu_tune_combo"):
+            return
+        values = CPU_TUNES_BY_CODEC.get(self.output_cpu_codec_var.get(), CPU_TUNES_BY_CODEC["libx264"])
+        self.output_cpu_tune_combo.configure(values=values)
+        if self.output_cpu_tune_var.get() not in values:
+            self.output_cpu_tune_var.set("none")
+
+    def update_encoder_controls(self, apply_defaults: bool = False) -> None:
+        if not hasattr(self, "gpu_settings_frame"):
+            return
+        use_gpu, _gpu_index, _gpu_name = self._parse_gpu_choice()
+        if apply_defaults:
+            self.apply_device_defaults(use_gpu)
+        if use_gpu:
+            self.cpu_settings_frame.pack_forget()
+            self.gpu_settings_frame.pack(fill=tk.X, before=self.rate_frame)
+        else:
+            self.gpu_settings_frame.pack_forget()
+            self.cpu_settings_frame.pack(fill=tk.X, before=self.rate_frame)
+
+        if hasattr(self, "cq_label"):
+            self.cq_label.configure(text="CQ" if use_gpu else "CRF")
 
     def update_rate_controls(self) -> None:
         mode = self.rate_mode_var.get().upper()
@@ -785,8 +989,17 @@ class EncoderApp:
             widget.configure(state=tk.NORMAL if enabled else tk.DISABLED)
 
     def update_resolution_controls(self) -> None:
-        state = tk.NORMAL if self.output_resolution_var.get() == "Custom" else tk.DISABLED
-        self.custom_height_entry.configure(state=state)
+        if not hasattr(self, "custom_height_entry"):
+            return
+        if self.output_resolution_var.get() == "Custom":
+            self.custom_height_label.grid()
+            self.custom_height_entry.grid()
+            self.custom_height_entry.configure(state=tk.NORMAL)
+        else:
+            self.output_custom_height_var.set("")
+            self.custom_height_entry.configure(state=tk.DISABLED)
+            self.custom_height_label.grid_remove()
+            self.custom_height_entry.grid_remove()
 
     def collect_profile_from_form(self) -> Optional[EncodeProfile]:
         current = self.current_profile()
@@ -795,7 +1008,7 @@ class EncoderApp:
             max_jobs = int(self.max_jobs_var.get())
             segment_minutes = int(self.segment_minutes_var.get())
         except ValueError:
-            messagebox.showerror("入力エラー", "同時実行数と分割間隔は数値で入力してください。")
+            messagebox.showerror("入力エラー", "並列セグメント数と分割間隔は数値で入力してください。")
             return None
 
         if mode in {"CQ", "VBR"}:
@@ -808,20 +1021,20 @@ class EncoderApp:
             cq_value = current.cq_value
 
         if max_jobs < 1:
-            messagebox.showerror("入力エラー", "同時実行数は1以上にしてください。")
+            messagebox.showerror("入力エラー", "並列セグメント数は1以上にしてください。")
             return None
         if segment_minutes < 1:
             messagebox.showerror("入力エラー", "分割間隔は1分以上にしてください。")
             return None
-        if not self.editing_outputs:
-            messagebox.showerror("入力エラー", "出力プロファイルを1つ以上登録してください。")
+        if not any(item.enabled for item in self.editing_outputs):
+            messagebox.showerror("入力エラー", "出力プロファイルを1つ以上有効にしてください。")
             return None
 
         input_dir = self.input_dir_var.get().strip()
         output_dir = self.output_dir_var.get().strip()
         archive_dir = self.archive_dir_var.get().strip()
         if not input_dir or not output_dir or not archive_dir:
-            messagebox.showerror("入力エラー", "入力先、出力先、処理済み退避先を入力してください。")
+            messagebox.showerror("入力エラー", "入力先、出力先、処理済みソース退避先を入力してください。")
             return None
 
         use_gpu, gpu_index, gpu_name = self._parse_gpu_choice()
@@ -839,7 +1052,9 @@ class EncoderApp:
             codec=self.codec_var.get(),
             cpu_codec=self.cpu_codec_var.get(),
             preset=self.preset_var.get(),
+            cpu_preset=self.cpu_preset_var.get(),
             tune=self.tune_var.get(),
+            cpu_tune=self.cpu_tune_var.get(),
             rate_mode=self.rate_mode_var.get(),
             cq_value=cq_value,
             bitrate=self.bitrate_var.get().strip(),
@@ -916,7 +1131,7 @@ class EncoderApp:
                 "",
                 tk.END,
                 iid=variant.id,
-                values=(variant.name, resolution, variant.folder_name, variant.container),
+                values=("有効" if variant.enabled else "無効", variant.name, resolution, variant.folder_name, variant.container),
             )
 
     def on_output_select(self, _event: object = None) -> None:
@@ -929,6 +1144,8 @@ class EncoderApp:
             if variant.id == self.selected_output_id:
                 self.output_name_var.set(variant.name)
                 self.output_folder_var.set(variant.folder_name)
+                if hasattr(self, "output_enabled_var"):
+                    self.output_enabled_var.set(variant.enabled)
                 if variant.height is None:
                     self.output_resolution_var.set("Original")
                     self.output_custom_height_var.set("")
@@ -945,6 +1162,7 @@ class EncoderApp:
                 self.output_cpu_codec_var.set(variant.cpu_codec or profile.cpu_codec)
                 self.output_preset_var.set(variant.preset or profile.preset)
                 self.output_cpu_preset_var.set(variant.cpu_preset or profile.cpu_preset)
+                self.output_cpu_tune_var.set(variant.cpu_tune or getattr(profile, "cpu_tune", "none"))
                 self.output_tune_var.set(variant.tune or profile.tune)
                 self.output_rate_mode_var.set(variant.rate_mode or profile.rate_mode)
                 self.output_cq_var.set(str(variant.cq_value if variant.cq_value is not None else profile.cq_value))
@@ -962,6 +1180,7 @@ class EncoderApp:
                 self.output_extra_output_args_var.set(variant.extra_output_args)
                 self.output_extra_concat_args_var.set(variant.extra_concat_args)
                 self.output_extra_mux_args_var.set(variant.extra_mux_args)
+                self.update_output_cpu_tune_choices()
                 self.update_resolution_controls()
                 return
 
@@ -1008,7 +1227,7 @@ class EncoderApp:
             folder_name=folder_name,
             height=height,
             container=container,
-            enabled=True,
+            enabled=self.output_enabled_var.get() if hasattr(self, "output_enabled_var") else True,
             filename_template=self.output_filename_template_var.get().strip() or "{source}",
             use_gpu=use_gpu,
             gpu_index=gpu_index,
@@ -1017,6 +1236,7 @@ class EncoderApp:
             cpu_codec=self.output_cpu_codec_var.get(),
             preset=self.output_preset_var.get(),
             cpu_preset=self.output_cpu_preset_var.get(),
+            cpu_tune=self.output_cpu_tune_var.get(),
             tune=self.output_tune_var.get(),
             rate_mode=rate_mode,
             cq_value=cq_value,
@@ -1210,6 +1430,9 @@ class EncoderApp:
         missing_dirs = missing_profile_dirs(profile)
         if missing_dirs:
             messagebox.showerror("入力エラー", f"{profile_dir_label_text(missing_dirs)} を入力してください。")
+            return False
+        if not any(variant.enabled for variant in profile.outputs):
+            messagebox.showerror("入力エラー", "出力プロファイルを1つ以上有効にしてください。")
             return False
         for variant in profile.outputs:
             if not variant.enabled:

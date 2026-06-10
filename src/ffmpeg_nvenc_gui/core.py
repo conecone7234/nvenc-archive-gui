@@ -24,6 +24,7 @@ RESOLUTION_PRESETS: Dict[str, Optional[int]] = {
 }
 SAFE_CONTAINER_RE = re.compile(r"^[a-z0-9]{1,8}$")
 FASTSTART_CONTAINERS = {"mp4", "m4v", "mov", "ismv"}
+SEGMENT_SOURCE_STEM_LIMIT = 40
 
 
 def dataclass_values(cls: Any, data: object) -> Dict[str, Any]:
@@ -67,6 +68,7 @@ class OutputVariant:
     cpu_codec: str = ""
     preset: str = ""
     cpu_preset: str = ""
+    cpu_tune: str = ""
     tune: str = ""
     rate_mode: str = ""
     cq_value: Optional[int] = None
@@ -114,6 +116,7 @@ class OutputVariant:
         self.cpu_codec = str(self.cpu_codec or "").strip()
         self.preset = str(self.preset or "").strip()
         self.cpu_preset = str(self.cpu_preset or "").strip()
+        self.cpu_tune = str(self.cpu_tune or "").strip()
         self.tune = str(self.tune or "").strip()
         self.rate_mode = str(self.rate_mode or "").strip().upper()
         self.cq_value = normalize_optional_int(self.cq_value)
@@ -163,6 +166,7 @@ class EncodeProfile:
     preset: str = "p7"
     cpu_preset: str = "medium"
     tune: str = "hq"
+    cpu_tune: str = "none"
     rate_mode: str = "CQ"
     cq_value: int = 18
     bitrate: str = "25000k"
@@ -184,6 +188,7 @@ class EncodeProfile:
         self.preset = str(self.preset or "p7").strip()
         self.cpu_preset = str(self.cpu_preset or "medium").strip()
         self.tune = str(self.tune or "hq").strip()
+        self.cpu_tune = str(self.cpu_tune or "none").strip()
         self.rate_mode = str(self.rate_mode or "CQ").strip().upper()
         self.bitrate = str(self.bitrate or "").strip()
         self.maxrate = str(self.maxrate or "").strip()
@@ -236,14 +241,21 @@ class EncodeProfile:
         base_paths = paths or build_paths()
         default_gpus = [] if gpus is None else gpus
         base = asdict(default_profile(base_paths, default_gpus))
-        base.update(dataclass_values(EncodeProfile, data))
+        explicit_values = dataclass_values(EncodeProfile, data)
+        base.update(explicit_values)
         raw_outputs = base.get("outputs")
         if not isinstance(raw_outputs, list):
             raw_outputs = []
         base["outputs"] = [OutputVariant.from_dict(x) for x in raw_outputs]
         if not base["outputs"]:
             base["outputs"] = default_outputs()
-        return normalize_profile_gpu(EncodeProfile(**base), default_gpus)
+        profile = normalize_profile_gpu(EncodeProfile(**base), default_gpus)
+        if not profile.use_gpu:
+            cpu_defaults = default_profile(base_paths, [])
+            for key in ("max_parallel_jobs", "cq_value", "bitrate", "maxrate", "bufsize", "cpu_preset", "cpu_tune"):
+                if key not in explicit_values:
+                    setattr(profile, key, getattr(cpu_defaults, key))
+        return profile
 
 
 @dataclass
@@ -500,6 +512,12 @@ def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> En
         gpu_name=gpu.name if gpu else "",
         codec="hevc_nvenc",
         cpu_codec="libx264",
+        cpu_preset="medium",
+        cpu_tune="none",
+        cq_value=18 if gpu else 23,
+        bitrate="25000k" if gpu else "8000k",
+        maxrate="40000k" if gpu else "12000k",
+        bufsize="80000k" if gpu else "24000k",
         outputs=default_outputs(),
     )
 
@@ -737,7 +755,12 @@ def build_video_encoder_args(profile: EncodeProfile, variant: Optional[OutputVar
         cpu_preset = str(
             variant_setting(profile, variant, "cpu_preset", profile.cpu_preset) if variant is not None else profile.cpu_preset
         )
+        cpu_tune = str(
+            variant_setting(profile, variant, "cpu_tune", profile.cpu_tune) if variant is not None else profile.cpu_tune
+        )
         cmd += ["-preset:v", cpu_preset]
+        if cpu_tune != "none":
+            cmd += ["-tune:v", cpu_tune]
 
     mode_name = str(variant_setting(profile, variant, "rate_mode", profile.rate_mode) if variant is not None else profile.rate_mode).upper()
     cq_value = int(variant_setting(profile, variant, "cq_value", profile.cq_value) if variant is not None else profile.cq_value)
@@ -1068,6 +1091,7 @@ def job_fingerprint(profile: EncodeProfile, variant: OutputVariant) -> str:
         "cpu_codec": variant_setting(profile, variant, "cpu_codec", profile.cpu_codec),
         "preset": variant_setting(profile, variant, "preset", profile.preset),
         "cpu_preset": variant_setting(profile, variant, "cpu_preset", profile.cpu_preset),
+        "cpu_tune": variant_setting(profile, variant, "cpu_tune", profile.cpu_tune),
         "tune": variant_setting(profile, variant, "tune", profile.tune),
         "rate_mode": variant_setting(profile, variant, "rate_mode", profile.rate_mode),
         "cq_value": variant_setting(profile, variant, "cq_value", profile.cq_value),
@@ -1132,6 +1156,8 @@ def segment_file_name(
     marker = ".partial" if partial else ""
     if src is not None:
         stem = safe_file_stem(src.stem)
+        if len(stem) > SEGMENT_SOURCE_STEM_LIMIT:
+            stem = stem[:SEGMENT_SOURCE_STEM_LIMIT].rstrip(".- ") or "video"
         return f"{stem}-{index + 1:03d}{marker}.{container}"
     return f"segment-{index:05d}{marker}.{container}"
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import urllib.request
@@ -8,11 +9,24 @@ import zipfile
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from .core import AppPaths, ensure_dirs
+from .core import AppPaths, ensure_dirs, is_nvenc_codec, resource_index
 
 ProgressCallback = Optional[Callable[[str], None]]
 
 GYAN_FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+COMMON_ENCODERS = {
+    "libx264",
+    "libx265",
+    "h264_nvenc",
+    "hevc_nvenc",
+    "av1_nvenc",
+    "h264_qsv",
+    "hevc_qsv",
+    "av1_qsv",
+    "h264_amf",
+    "hevc_amf",
+    "av1_amf",
+}
 
 
 class FfmpegDownloadError(RuntimeError):
@@ -152,6 +166,143 @@ def verify_nvenc(ffmpeg_path: Path) -> bool:
         return False
     out = result.stdout.lower()
     return "hevc_nvenc" in out or "h264_nvenc" in out or "av1_nvenc" in out
+
+
+def list_ffmpeg_encoders(ffmpeg_path: Path, timeout: int = 30) -> set[str]:
+    try:
+        result = subprocess.run(
+            [str(ffmpeg_path), "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if result.returncode != 0:
+        return set()
+
+    encoders: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[1].strip()
+        if name in COMMON_ENCODERS or name.endswith(("_nvenc", "_qsv", "_amf")) or name.startswith("libx26"):
+            encoders.add(name)
+    return encoders
+
+
+def encoder_help_text(ffmpeg_path: Path, encoder: str, timeout: int = 20) -> str:
+    try:
+        result = subprocess.run(
+            [str(ffmpeg_path), "-hide_banner", "-h", f"encoder={encoder}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout
+
+
+def encoder_supports_option(help_text: str, option: str) -> bool:
+    return re.search(rf"(^|\s)-{re.escape(option)}(\s|$)", help_text, flags=re.MULTILINE) is not None
+
+
+def split_encode_modes_from_help(help_text: str) -> list[str]:
+    if not encoder_supports_option(help_text, "split_encode_mode"):
+        return []
+    values: list[str] = []
+    capturing = False
+    for line in help_text.splitlines():
+        if "-split_encode_mode" in line:
+            capturing = True
+            continue
+        if not capturing:
+            continue
+        if re.match(r"\s+-[A-Za-z0-9_]", line):
+            break
+        match = re.match(r"\s+([A-Za-z0-9][A-Za-z0-9_-]*)\s+[-+]?\d+(?:\s|$)", line)
+        if not match:
+            continue
+        candidate = match.group(1).lower()
+        if candidate not in values:
+            values.append(candidate)
+    if not values:
+        values.append("auto")
+    elif "auto" not in values:
+        values.insert(0, "auto")
+    return values
+
+
+def encoder_capabilities(ffmpeg_path: Path) -> dict[str, dict[str, object]]:
+    capabilities: dict[str, dict[str, object]] = {}
+    for encoder in sorted(list_ffmpeg_encoders(ffmpeg_path)):
+        help_text = encoder_help_text(ffmpeg_path, encoder)
+        capabilities[encoder] = {
+            "encoder": encoder,
+            "available": True,
+            "split_encode_modes": split_encode_modes_from_help(help_text) if is_nvenc_codec(encoder) else [],
+            "supports_split_encode_mode": encoder_supports_option(help_text, "split_encode_mode"),
+        }
+    return capabilities
+
+
+def smoke_test_encoder(
+    ffmpeg_path: Path,
+    encoder: str,
+    resource_id: str = "",
+    split_encode_mode: str = "",
+    timeout: int = 30,
+) -> tuple[bool, str]:
+    sink = "NUL" if os.name == "nt" else "/dev/null"
+    command = [
+        str(ffmpeg_path),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=size=64x64:rate=1:duration=1",
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        encoder,
+    ]
+    if is_nvenc_codec(encoder):
+        command += ["-gpu", str(resource_index(resource_id))]
+        if split_encode_mode and split_encode_mode not in {"auto", "default"} and encoder in {"hevc_nvenc", "av1_nvenc"}:
+            command += ["-split_encode_mode", split_encode_mode]
+    command += ["-f", "null", sink]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode != 0:
+        return False, (result.stdout or "").strip() or f"exit {result.returncode}"
+    return True, ""
 
 
 def ensure_ffmpeg_available(

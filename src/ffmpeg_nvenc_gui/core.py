@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import json
 import math
+import os
 import re
 import shlex
 import subprocess
@@ -25,6 +27,36 @@ RESOLUTION_PRESETS: Dict[str, Optional[int]] = {
 SAFE_CONTAINER_RE = re.compile(r"^[a-z0-9]{1,8}$")
 FASTSTART_CONTAINERS = {"mp4", "m4v", "mov", "ismv"}
 SEGMENT_SOURCE_STEM_LIMIT = 40
+BACKEND_CPU = "cpu"
+BACKEND_NVENC = "nvenc"
+BACKEND_QSV = "qsv"
+BACKEND_AMF = "amf"
+BACKENDS = {BACKEND_CPU, BACKEND_NVENC, BACKEND_QSV, BACKEND_AMF}
+CPU_RESOURCE_ID = "cpu:0"
+DEFAULT_ENCODER_BY_BACKEND = {
+    BACKEND_CPU: "libx264",
+    BACKEND_NVENC: "hevc_nvenc",
+    BACKEND_QSV: "hevc_qsv",
+    BACKEND_AMF: "hevc_amf",
+}
+DEPRECATED_PROFILE_FIELDS = {
+    "use_gpu",
+    "gpu_index",
+    "gpu_name",
+    "codec",
+    "cpu_codec",
+    "preset",
+    "cpu_preset",
+    "tune",
+    "cpu_tune",
+    "rate_mode",
+    "cq_value",
+    "bitrate",
+    "maxrate",
+    "bufsize",
+    "pix_fmt",
+    "scale_flags",
+}
 
 
 def dataclass_values(cls: Any, data: object) -> Dict[str, Any]:
@@ -50,6 +82,40 @@ class AppPaths:
 class GpuInfo:
     index: int
     name: str
+    vendor: str = "nvidia"
+    encoder_engines: Optional[int] = None
+    detection_error: str = ""
+
+    def __post_init__(self) -> None:
+        self.index = normalize_int(self.index, minimum=0, default=0)
+        self.name = str(self.name or "").strip()
+        self.vendor = str(self.vendor or "nvidia").strip().lower()
+        self.encoder_engines = normalize_optional_int(self.encoder_engines, minimum=1)
+        self.detection_error = str(self.detection_error or "").strip()
+
+
+@dataclass
+class HardwareResource:
+    id: str
+    label: str
+    kind: str
+    backend: str
+    vendor: str = ""
+    index: int = 0
+    concurrency_slots: int = 1
+    detected_encoder_engines: Optional[int] = None
+    detection_error: str = ""
+
+    def __post_init__(self) -> None:
+        self.id = str(self.id or "").strip()
+        self.label = str(self.label or self.id).strip()
+        self.kind = str(self.kind or "").strip().lower()
+        self.backend = normalize_backend(self.backend)
+        self.vendor = str(self.vendor or "").strip().lower()
+        self.index = normalize_int(self.index, minimum=0, default=0)
+        self.concurrency_slots = normalize_int(self.concurrency_slots, minimum=1, default=1)
+        self.detected_encoder_engines = normalize_optional_int(self.detected_encoder_engines, minimum=1)
+        self.detection_error = str(self.detection_error or "").strip()
 
 
 @dataclass
@@ -80,6 +146,11 @@ class OutputVariant:
     audio_codec: str = ""
     audio_bitrate: str = ""
     audio_container: str = ""
+    backend: str = ""
+    ffmpeg_encoder: str = ""
+    resource_ids: List[str] = field(default_factory=list)
+    concurrency_policy: str = "resource_slots"
+    split_encode_mode: str = ""
     extra_input_args: str = ""
     extra_video_args: str = ""
     extra_audio_args: str = ""
@@ -128,6 +199,42 @@ class OutputVariant:
         self.audio_codec = str(self.audio_codec or "").strip()
         self.audio_bitrate = str(self.audio_bitrate or "").strip()
         self.audio_container = normalize_container_extension(self.audio_container, default="") or ""
+        self.ffmpeg_encoder = str(self.ffmpeg_encoder or "").strip()
+        inherit_profile_device = not self.backend and not self.ffmpeg_encoder and self.use_gpu is None and not self.resource_ids
+        if inherit_profile_device:
+            self.backend = ""
+        elif not self.backend:
+            if self.ffmpeg_encoder:
+                self.backend = backend_from_encoder(self.ffmpeg_encoder)
+            elif self.use_gpu is True:
+                self.backend = BACKEND_NVENC
+            else:
+                self.backend = BACKEND_CPU
+        if self.backend:
+            self.backend = normalize_backend(self.backend)
+        if not self.ffmpeg_encoder:
+            if not self.backend:
+                self.ffmpeg_encoder = ""
+            elif self.backend == BACKEND_NVENC:
+                self.ffmpeg_encoder = self.codec or DEFAULT_ENCODER_BY_BACKEND[BACKEND_NVENC]
+            elif self.backend == BACKEND_CPU:
+                self.ffmpeg_encoder = self.cpu_codec or DEFAULT_ENCODER_BY_BACKEND[BACKEND_CPU]
+            else:
+                self.ffmpeg_encoder = DEFAULT_ENCODER_BY_BACKEND[self.backend]
+        if self.backend == BACKEND_NVENC and not self.codec:
+            self.codec = self.ffmpeg_encoder
+        if self.backend == BACKEND_CPU and not self.cpu_codec:
+            self.cpu_codec = self.ffmpeg_encoder
+        if not self.resource_ids and self.backend:
+            if self.backend == BACKEND_CPU:
+                self.resource_ids = [CPU_RESOURCE_ID]
+            elif self.backend == BACKEND_NVENC:
+                self.resource_ids = [resource_id_for_backend(BACKEND_NVENC, self.gpu_index or 0)]
+            else:
+                self.resource_ids = [resource_id_for_backend(self.backend, 0)]
+        self.resource_ids = normalize_resource_id_list(self.resource_ids)
+        self.concurrency_policy = str(self.concurrency_policy or "resource_slots").strip() or "resource_slots"
+        self.split_encode_mode = str(self.split_encode_mode or "").strip().lower()
         self.extra_input_args = str(self.extra_input_args or "").strip()
         self.extra_video_args = str(self.extra_video_args or "").strip()
         self.extra_audio_args = str(self.extra_audio_args or "").strip()
@@ -147,6 +254,9 @@ class OutputVariant:
         }
         base.update(dataclass_values(OutputVariant, data))
         return OutputVariant(**base)
+
+
+EncodeSet = OutputVariant
 
 
 @dataclass
@@ -174,6 +284,8 @@ class EncodeProfile:
     bufsize: str = "80000k"
     pix_fmt: str = "nv12"
     scale_flags: str = "lanczos+accurate_rnd"
+    resource_ids: List[str] = field(default_factory=list)
+    hardware_resources: List[HardwareResource] = field(default_factory=list)
     outputs: List[OutputVariant] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -217,6 +329,30 @@ class EncodeProfile:
             self.use_gpu = self.use_gpu.strip().lower() not in {"0", "false", "no", "off"}
         else:
             self.use_gpu = bool(self.use_gpu)
+
+        self.resource_ids = normalize_resource_id_list(self.resource_ids)
+        raw_resources = self.hardware_resources if isinstance(self.hardware_resources, list) else []
+        resources: List[HardwareResource] = []
+        seen_resource_ids: set[str] = set()
+        for resource in raw_resources:
+            if isinstance(resource, HardwareResource):
+                item = resource
+            elif isinstance(resource, dict):
+                values = {
+                    "id": "",
+                    "label": "",
+                    "kind": "",
+                    "backend": "",
+                }
+                values.update(dataclass_values(HardwareResource, resource))
+                item = HardwareResource(**values)
+            else:
+                continue
+            if not item.id or item.id in seen_resource_ids:
+                continue
+            seen_resource_ids.add(item.id)
+            resources.append(item)
+        self.hardware_resources = resources
 
         raw_outputs = self.outputs if isinstance(self.outputs, list) else []
         normalized_outputs: List[OutputVariant] = []
@@ -263,6 +399,15 @@ class JobSpec:
     src: str
     profile_id: str
     variant_id: str
+    assigned_resource_id: str = ""
+    assigned_slot: int = 0
+
+    def __post_init__(self) -> None:
+        self.src = str(self.src or "")
+        self.profile_id = str(self.profile_id or "")
+        self.variant_id = str(self.variant_id or "")
+        self.assigned_resource_id = str(self.assigned_resource_id or "").strip().lower()
+        self.assigned_slot = normalize_int(self.assigned_slot, minimum=0, default=0)
 
 
 @dataclass
@@ -298,6 +443,16 @@ def normalize_optional_bool(value: object) -> Optional[bool]:
     return bool(value)
 
 
+def normalize_int(value: object, minimum: Optional[int] = None, default: int = 0) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    if minimum is not None:
+        number = max(minimum, number)
+    return number
+
+
 def normalize_optional_int(value: object, minimum: Optional[int] = None) -> Optional[int]:
     if value in ("", None):
         return None
@@ -308,6 +463,75 @@ def normalize_optional_int(value: object, minimum: Optional[int] = None) -> Opti
     if minimum is not None:
         number = max(minimum, number)
     return number
+
+
+def normalize_backend(value: object) -> str:
+    backend = str(value or "").strip().lower()
+    return backend if backend in BACKENDS else BACKEND_CPU
+
+
+def backend_from_encoder(encoder: object) -> str:
+    value = str(encoder or "").strip().lower()
+    if value.endswith("_nvenc"):
+        return BACKEND_NVENC
+    if value.endswith("_qsv"):
+        return BACKEND_QSV
+    if value.endswith("_amf"):
+        return BACKEND_AMF
+    return BACKEND_CPU
+
+
+def resource_id_for_backend(backend: str, index: int = 0) -> str:
+    backend = normalize_backend(backend)
+    if backend == BACKEND_CPU:
+        return CPU_RESOURCE_ID
+    vendor = {
+        BACKEND_NVENC: "nvidia",
+        BACKEND_QSV: "intel",
+        BACKEND_AMF: "amd",
+    }.get(backend, backend)
+    return f"{vendor}:{max(0, int(index))}"
+
+
+def resource_backend(resource_id: str) -> str:
+    prefix = str(resource_id or "").split(":", 1)[0].lower()
+    if prefix == "cpu":
+        return BACKEND_CPU
+    if prefix == "nvidia":
+        return BACKEND_NVENC
+    if prefix == "intel":
+        return BACKEND_QSV
+    if prefix == "amd":
+        return BACKEND_AMF
+    return BACKEND_CPU
+
+
+def resource_index(resource_id: str) -> int:
+    _prefix, sep, suffix = str(resource_id or "").partition(":")
+    if not sep:
+        return 0
+    return normalize_int(suffix, minimum=0, default=0)
+
+
+def normalize_resource_id_list(value: object) -> List[str]:
+    if isinstance(value, str):
+        raw_items = [value]
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = []
+    normalized: List[str] = []
+    for item in raw_items:
+        text = str(item or "").strip().lower()
+        if not text or ":" not in text:
+            continue
+        prefix, _, suffix = text.partition(":")
+        if prefix not in {"cpu", "nvidia", "intel", "amd"}:
+            continue
+        resource_id = f"{prefix}:{normalize_int(suffix, minimum=0, default=0)}"
+        if resource_id not in normalized:
+            normalized.append(resource_id)
+    return normalized
 
 
 def get_base_dir() -> Path:
@@ -438,6 +662,98 @@ def default_outputs() -> List[OutputVariant]:
     ]
 
 
+def detect_nvenc_engine_count(_gpu_index: int = 0) -> Tuple[Optional[int], str]:
+    if os.name != "nt":
+        return None, "NVENC engine probing is only attempted on Windows."
+    try:
+        ctypes.WinDLL("nvEncodeAPI64.dll")
+    except Exception as exc:
+        return None, f"nvEncodeAPI64.dll unavailable: {exc}"
+    # Opening an NVENC session requires a CUDA/D3D device context. The app keeps this
+    # probe optional and falls back to user-tunable slots when no helper context exists.
+    return None, "nvEncodeAPI64.dll loaded; encode-session caps helper unavailable, using manual slots."
+
+
+def hardware_resources_from_gpus(gpus: Optional[List[GpuInfo]]) -> List[HardwareResource]:
+    resources = [
+        HardwareResource(
+            id=CPU_RESOURCE_ID,
+            label="CPU",
+            kind="cpu",
+            backend=BACKEND_CPU,
+            vendor="cpu",
+            index=0,
+            concurrency_slots=1,
+        )
+    ]
+    for gpu in gpus or []:
+        engine_count = gpu.encoder_engines
+        detection_error = gpu.detection_error
+        if gpu.vendor == "nvidia" and engine_count is None:
+            engine_count, detection_error = detect_nvenc_engine_count(gpu.index)
+        slots = engine_count or 1
+        resources.append(
+            HardwareResource(
+                id=resource_id_for_backend(BACKEND_NVENC, gpu.index),
+                label=f"GPU {gpu.index}: {gpu.name}",
+                kind="gpu",
+                backend=BACKEND_NVENC,
+                vendor="nvidia",
+                index=gpu.index,
+                concurrency_slots=slots,
+                detected_encoder_engines=engine_count,
+                detection_error=detection_error,
+            )
+        )
+    resources.extend(
+        [
+            HardwareResource(
+                id=resource_id_for_backend(BACKEND_QSV, 0),
+                label="Intel GPU 0 (QSV/manual)",
+                kind="gpu",
+                backend=BACKEND_QSV,
+                vendor="intel",
+                index=0,
+                concurrency_slots=1,
+                detection_error="Manual resource; availability is checked before encoding.",
+            ),
+            HardwareResource(
+                id=resource_id_for_backend(BACKEND_AMF, 0),
+                label="AMD GPU 0 (AMF/manual)",
+                kind="gpu",
+                backend=BACKEND_AMF,
+                vendor="amd",
+                index=0,
+                concurrency_slots=1,
+                detection_error="Manual resource; availability is checked before encoding.",
+            ),
+        ]
+    )
+    return resources
+
+
+def normalize_hardware_resources(
+    resources: Iterable[HardwareResource],
+    gpus: Optional[List[GpuInfo]],
+) -> List[HardwareResource]:
+    by_id = {resource.id: resource for resource in hardware_resources_from_gpus(gpus)}
+    for resource in resources:
+        if not resource.id:
+            continue
+        by_id[resource.id] = resource
+    if CPU_RESOURCE_ID not in by_id:
+        by_id[CPU_RESOURCE_ID] = HardwareResource(
+            id=CPU_RESOURCE_ID,
+            label="CPU",
+            kind="cpu",
+            backend=BACKEND_CPU,
+            vendor="cpu",
+            index=0,
+            concurrency_slots=1,
+        )
+    return sorted(by_id.values(), key=lambda item: (item.kind != "cpu", item.vendor, item.index, item.id))
+
+
 def detect_nvidia_gpus(timeout: int = 5) -> List[GpuInfo]:
     try:
         result = subprocess.run(
@@ -472,6 +788,17 @@ def detect_nvidia_gpus(timeout: int = 5) -> List[GpuInfo]:
 
 
 def normalize_profile_gpu(profile: EncodeProfile, gpus: Optional[List[GpuInfo]]) -> EncodeProfile:
+    profile.hardware_resources = normalize_hardware_resources(profile.hardware_resources, gpus)
+    resource_by_id = {resource.id: resource for resource in profile.hardware_resources}
+    if not profile.resource_ids:
+        if profile.use_gpu:
+            profile.resource_ids = [resource_id_for_backend(BACKEND_NVENC, profile.gpu_index)]
+        else:
+            profile.resource_ids = [CPU_RESOURCE_ID]
+    profile.resource_ids = [resource_id for resource_id in profile.resource_ids if resource_id in resource_by_id]
+    if not profile.resource_ids:
+        profile.resource_ids = [CPU_RESOURCE_ID]
+
     gpu_by_index = {gpu.index: gpu for gpu in gpus or []}
     if profile.use_gpu:
         gpu = gpu_by_index.get(profile.gpu_index)
@@ -483,22 +810,60 @@ def normalize_profile_gpu(profile: EncodeProfile, gpus: Optional[List[GpuInfo]])
             profile.gpu_name = ""
 
     for variant in profile.outputs:
-        if variant.use_gpu is not True:
-            continue
-        gpu = gpu_by_index.get(variant.gpu_index if variant.gpu_index is not None else profile.gpu_index)
-        if gpu is None:
+        if not variant.backend:
+            if profile.use_gpu:
+                variant.backend = BACKEND_NVENC
+                variant.ffmpeg_encoder = variant.codec or profile.codec or DEFAULT_ENCODER_BY_BACKEND[BACKEND_NVENC]
+                variant.resource_ids = [resource_id_for_backend(BACKEND_NVENC, profile.gpu_index)]
+            else:
+                variant.backend = BACKEND_CPU
+                variant.ffmpeg_encoder = variant.cpu_codec or profile.cpu_codec or DEFAULT_ENCODER_BY_BACKEND[BACKEND_CPU]
+                variant.resource_ids = [CPU_RESOURCE_ID]
+        variant.backend = normalize_backend(variant.backend)
+        if not variant.ffmpeg_encoder:
+            variant.ffmpeg_encoder = DEFAULT_ENCODER_BY_BACKEND[variant.backend]
+        valid_resources = [
+            resource_id
+            for resource_id in variant.resource_ids
+            if resource_id in resource_by_id and resource_backend(resource_id) == variant.backend
+        ]
+        if not valid_resources:
+            if variant.use_gpu is True:
+                candidate = resource_id_for_backend(BACKEND_NVENC, variant.gpu_index if variant.gpu_index is not None else profile.gpu_index)
+                if candidate in resource_by_id:
+                    valid_resources = [candidate]
+            elif variant.backend == BACKEND_CPU and CPU_RESOURCE_ID in resource_by_id:
+                valid_resources = [CPU_RESOURCE_ID]
+        if not valid_resources:
+            variant.backend = BACKEND_CPU
+            variant.ffmpeg_encoder = variant.cpu_codec or DEFAULT_ENCODER_BY_BACKEND[BACKEND_CPU]
             variant.use_gpu = False
             variant.gpu_index = 0
             variant.gpu_name = ""
+            variant.resource_ids = [CPU_RESOURCE_ID]
         else:
-            variant.gpu_index = gpu.index
-            variant.gpu_name = gpu.name
+            variant.resource_ids = valid_resources
+            variant.use_gpu = variant.backend != BACKEND_CPU
+            if variant.backend == BACKEND_NVENC:
+                gpu_index = resource_index(valid_resources[0])
+                gpu = gpu_by_index.get(gpu_index)
+                variant.gpu_index = gpu_index
+                variant.gpu_name = gpu.name if gpu else ""
+                if not variant.codec:
+                    variant.codec = variant.ffmpeg_encoder or DEFAULT_ENCODER_BY_BACKEND[BACKEND_NVENC]
+            elif variant.backend == BACKEND_CPU:
+                variant.gpu_index = 0
+                variant.gpu_name = ""
+                if not variant.cpu_codec:
+                    variant.cpu_codec = variant.ffmpeg_encoder or DEFAULT_ENCODER_BY_BACKEND[BACKEND_CPU]
     return profile
 
 
 def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> EncodeProfile:
     detected = detect_nvidia_gpus() if gpus is None else gpus
     gpu = detected[0] if detected else None
+    hardware_resources = hardware_resources_from_gpus(detected)
+    resource_ids = [resource_id_for_backend(BACKEND_NVENC, gpu.index)] if gpu else [CPU_RESOURCE_ID]
     return EncodeProfile(
         id="default",
         name="Archive Profile",
@@ -518,6 +883,8 @@ def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> En
         bitrate="25000k" if gpu else "8000k",
         maxrate="40000k" if gpu else "12000k",
         bufsize="80000k" if gpu else "24000k",
+        resource_ids=resource_ids,
+        hardware_resources=hardware_resources,
         outputs=default_outputs(),
     )
 
@@ -549,13 +916,31 @@ def load_profiles(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> List
 def save_profiles(paths: AppPaths, profiles: List[EncodeProfile]) -> None:
     ensure_dirs(paths)
     data = {
-        "version": 1,
+        "version": 2,
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "profiles": [asdict(profile) for profile in profiles],
+        "profiles": [profile_to_dict(profile) for profile in profiles],
     }
     tmp_file = paths.config_file.with_suffix(".json.tmp")
     tmp_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_file.replace(paths.config_file)
+
+
+def output_variant_to_dict(variant: OutputVariant) -> Dict[str, Any]:
+    data = asdict(variant)
+    if variant.backend and variant.ffmpeg_encoder:
+        data.pop("use_gpu", None)
+        data.pop("gpu_index", None)
+        data.pop("gpu_name", None)
+    return data
+
+
+def profile_to_dict(profile: EncodeProfile) -> Dict[str, Any]:
+    data = asdict(profile)
+    for key in DEPRECATED_PROFILE_FIELDS:
+        data.pop(key, None)
+    data["outputs"] = [output_variant_to_dict(variant) for variant in profile.outputs]
+    data["hardware_resources"] = [asdict(resource) for resource in profile.hardware_resources]
+    return data
 
 
 def variant_by_id(profile: EncodeProfile, variant_id: str) -> OutputVariant:
@@ -618,15 +1003,50 @@ def scan_profile_files(profile: EncodeProfile) -> List[FileStatus]:
     return items
 
 
+def variant_resource_ids(profile: EncodeProfile, variant: OutputVariant) -> List[str]:
+    backend = effective_backend(profile, variant)
+    resource_by_id = {resource.id: resource for resource in profile.hardware_resources}
+    selected = [
+        resource_id
+        for resource_id in variant.resource_ids
+        if resource_id in resource_by_id and resource_backend(resource_id) == backend
+    ]
+    if selected:
+        return selected
+    profile_selected = [
+        resource_id
+        for resource_id in profile.resource_ids
+        if resource_id in resource_by_id and resource_backend(resource_id) == backend
+    ]
+    if profile_selected:
+        return profile_selected
+    if profile.hardware_resources:
+        return []
+    fallback = CPU_RESOURCE_ID if backend == BACKEND_CPU else resource_id_for_backend(backend, 0)
+    return [fallback]
+
+
 def build_job_specs(profile: EncodeProfile, files: Iterable[Path]) -> List[JobSpec]:
     specs: List[JobSpec] = []
+    next_resource_index: Dict[str, int] = {}
     for src in files:
         src = Path(src)
         for variant in profile.outputs:
             if not variant.enabled:
                 continue
             if not output_path_for(profile, src, variant).exists():
-                specs.append(JobSpec(src=str(src), profile_id=profile.id, variant_id=variant.id))
+                resources = variant_resource_ids(profile, variant)
+                next_index = next_resource_index.get(variant.id, 0)
+                assigned = resources[next_index % len(resources)] if resources else ""
+                next_resource_index[variant.id] = next_index + 1
+                specs.append(
+                    JobSpec(
+                        src=str(src),
+                        profile_id=profile.id,
+                        variant_id=variant.id,
+                        assigned_resource_id=assigned,
+                    )
+                )
     return specs
 
 
@@ -660,12 +1080,26 @@ def variant_setting(profile: EncodeProfile, variant: OutputVariant, name: str, d
 
 
 def variant_use_gpu(profile: EncodeProfile, variant: OutputVariant) -> bool:
+    if variant.backend:
+        return variant.backend != BACKEND_CPU
     if variant.use_gpu is not None:
         return variant.use_gpu
     return profile.use_gpu
 
 
-def variant_gpu_index(profile: EncodeProfile, variant: OutputVariant) -> int:
+def effective_backend(profile: EncodeProfile, variant: OutputVariant) -> str:
+    if variant.backend:
+        return normalize_backend(variant.backend)
+    return BACKEND_NVENC if variant_use_gpu(profile, variant) else BACKEND_CPU
+
+
+def variant_gpu_index(profile: EncodeProfile, variant: OutputVariant, resource_id: str = "") -> int:
+    if resource_id:
+        return resource_index(resource_id)
+    resources = variant_resource_ids(profile, variant)
+    for item in resources:
+        if resource_backend(item) == BACKEND_NVENC:
+            return resource_index(item)
     if variant.gpu_index is not None:
         return max(0, variant.gpu_index)
     return max(0, profile.gpu_index)
@@ -692,17 +1126,34 @@ def is_nvenc_codec(codec: str) -> bool:
     return codec.lower().endswith("_nvenc")
 
 
+def is_qsv_codec(codec: str) -> bool:
+    return codec.lower().endswith("_qsv")
+
+
+def is_amf_codec(codec: str) -> bool:
+    return codec.lower().endswith("_amf")
+
+
+def is_hardware_codec(codec: str) -> bool:
+    return is_nvenc_codec(codec) or is_qsv_codec(codec) or is_amf_codec(codec)
+
+
 def encoder_codec(profile: EncodeProfile, variant: Optional[OutputVariant] = None) -> str:
     if variant is not None:
-        if variant_use_gpu(profile, variant):
+        if variant.ffmpeg_encoder:
+            return variant.ffmpeg_encoder
+        backend = effective_backend(profile, variant)
+        if backend == BACKEND_NVENC:
             return str(variant_setting(profile, variant, "codec", profile.codec) or "hevc_nvenc")
-        return str(variant_setting(profile, variant, "cpu_codec", profile.cpu_codec) or "libx264")
+        if backend == BACKEND_CPU:
+            return str(variant_setting(profile, variant, "cpu_codec", profile.cpu_codec) or "libx264")
+        return DEFAULT_ENCODER_BY_BACKEND.get(backend, "libx264")
     if profile.use_gpu:
         return profile.codec
     return profile.cpu_codec
 
 
-def output_pix_fmt(profile: EncodeProfile, variant: Optional[OutputVariant] = None) -> str:
+def output_pix_fmt(profile: EncodeProfile, variant: Optional[OutputVariant] = None, resource_id: str = "") -> str:
     if is_nvenc_codec(encoder_codec(profile, variant)):
         if variant is not None:
             return str(variant_setting(profile, variant, "pix_fmt", profile.pix_fmt) or "nv12")
@@ -738,20 +1189,28 @@ def validate_rate_settings(profile: EncodeProfile, variant: Optional[OutputVaria
         raise ValueError(f"{mode} requires: {', '.join(missing)}")
 
 
-def build_video_encoder_args(profile: EncodeProfile, variant: Optional[OutputVariant] = None) -> List[str]:
+def build_video_encoder_args(
+    profile: EncodeProfile,
+    variant: Optional[OutputVariant] = None,
+    resource_id: str = "",
+) -> List[str]:
     validate_rate_settings(profile, variant)
     codec = encoder_codec(profile, variant)
     cmd: List[str] = ["-c:v", codec]
 
     if is_nvenc_codec(codec):
-        gpu_index = variant_gpu_index(profile, variant) if variant is not None else max(profile.gpu_index, 0)
+        gpu_index = variant_gpu_index(profile, variant, resource_id) if variant is not None else max(profile.gpu_index, 0)
         preset = str(variant_setting(profile, variant, "preset", profile.preset) if variant is not None else profile.preset)
         tune = str(variant_setting(profile, variant, "tune", profile.tune) if variant is not None else profile.tune)
         cmd += ["-gpu", str(gpu_index)]
         cmd += ["-preset:v", preset]
         if tune != "none":
             cmd += ["-tune:v", tune]
-    else:
+        if variant is not None:
+            split_mode = str(getattr(variant, "split_encode_mode", "") or "").strip()
+            if split_mode and split_mode not in {"auto", "default"} and codec.lower() in {"hevc_nvenc", "av1_nvenc"}:
+                cmd += ["-split_encode_mode", split_mode]
+    elif not is_hardware_codec(codec):
         cpu_preset = str(
             variant_setting(profile, variant, "cpu_preset", profile.cpu_preset) if variant is not None else profile.cpu_preset
         )
@@ -798,6 +1257,17 @@ def build_video_encoder_args(profile: EncodeProfile, variant: Optional[OutputVar
             ]
         else:
             raise ValueError(f"Unknown rate mode: {mode_name}")
+    elif is_hardware_codec(codec):
+        if mode_name == "CQ":
+            raise ValueError(f"{codec} does not use the shared CQ/CRF control. Use VBR, ABR, CBR, or backend-specific extra args.")
+        if mode_name in {"VBR", "ABR"}:
+            cmd += ["-b:v", bitrate]
+            if mode_name == "VBR":
+                cmd += ["-maxrate:v", maxrate, "-bufsize:v", bufsize]
+        elif mode_name == "CBR":
+            cmd += ["-b:v", bitrate, "-maxrate:v", bitrate, "-bufsize:v", bufsize]
+        else:
+            raise ValueError(f"Unknown rate mode: {mode_name}")
     else:
         if mode_name == "CQ":
             cmd += ["-crf", str(cq_value)]
@@ -828,6 +1298,7 @@ def build_ffmpeg_command(
     variant: OutputVariant,
     start_seconds: Optional[float] = None,
     duration_seconds: Optional[float] = None,
+    resource_id: str = "",
 ) -> List[str]:
     cmd: List[str] = [
         str(ffmpeg_path),
@@ -853,9 +1324,9 @@ def build_ffmpeg_command(
         "0:v:0",
         "-an",
         "-pix_fmt",
-        output_pix_fmt(profile, variant),
+        output_pix_fmt(profile, variant, resource_id),
     ]
-    cmd += build_video_encoder_args(profile, variant)
+    cmd += build_video_encoder_args(profile, variant, resource_id)
 
     if variant.height is not None and variant.height > 0:
         scale_flags = str(variant_setting(profile, variant, "scale_flags", profile.scale_flags) or "lanczos+accurate_rnd")
@@ -1089,6 +1560,10 @@ def job_fingerprint(profile: EncodeProfile, variant: OutputVariant) -> str:
         "variant_container": variant.container,
         "variant_filename_template": variant.filename_template,
         "segment_minutes": profile.segment_minutes,
+        "backend": variant.backend,
+        "ffmpeg_encoder": encoder_codec(profile, variant),
+        "resource_ids": variant_resource_ids(profile, variant),
+        "split_encode_mode": variant.split_encode_mode,
         "use_gpu": variant_use_gpu(profile, variant),
         "gpu_index": variant_gpu_index(profile, variant),
         "codec": encoder_codec(profile, variant),
@@ -1197,9 +1672,9 @@ def escape_concat_path(path: Path) -> str:
 def save_state(paths: AppPaths, profile: EncodeProfile, specs: List[JobSpec]) -> None:
     ensure_dirs(paths)
     data = {
-        "version": 2,
+        "version": 3,
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "profile": asdict(profile),
+        "profile": profile_to_dict(profile),
         "jobs": [asdict(spec) for spec in specs],
     }
     tmp_file = paths.state_file.with_suffix(".json.tmp")
@@ -1236,6 +1711,8 @@ def resumable_specs(profile: EncodeProfile, data: Dict[str, Any]) -> List[JobSpe
                 src=str(item["src"]),
                 profile_id=str(item["profile_id"]),
                 variant_id=str(item["variant_id"]),
+                assigned_resource_id=str(item.get("assigned_resource_id", "")),
+                assigned_slot=normalize_int(item.get("assigned_slot", 0), minimum=0, default=0),
             )
         except KeyError:
             continue

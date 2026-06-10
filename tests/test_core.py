@@ -6,8 +6,14 @@ from pathlib import Path
 import ffmpeg_nvenc_gui.app as app_module
 import ffmpeg_nvenc_gui.ffmpeg_downloader as downloader
 from ffmpeg_nvenc_gui.core import (
+    BACKEND_AMF,
+    BACKEND_CPU,
+    BACKEND_NVENC,
+    BACKEND_QSV,
+    CPU_RESOURCE_ID,
     EncodeProfile,
     GpuInfo,
+    HardwareResource,
     JobSpec,
     OutputVariant,
     build_audio_command,
@@ -20,10 +26,12 @@ from ffmpeg_nvenc_gui.core import (
     duplicate_output_targets,
     ensure_profile_dirs,
     format_seconds,
+    hardware_resources_from_gpus,
     load_profiles,
     load_state,
     missing_profile_dirs,
     missing_rate_fields,
+    normalize_profile_gpu,
     normalize_container_extension,
     output_path_for,
     parse_ffmpeg_args,
@@ -32,20 +40,31 @@ from ffmpeg_nvenc_gui.core import (
     profile_from_state,
     profile_input_dir,
     profile_output_dir,
+    profile_to_dict,
     resumable_specs,
     save_state,
     scan_profile_files,
     segment_dir_for,
     segment_file_name,
     segment_ranges,
+    variant_resource_ids,
     write_concat_file,
 )
-from ffmpeg_nvenc_gui.app import EncoderApp, RuntimeJob
+from ffmpeg_nvenc_gui.app import (
+    EncoderApp,
+    RuntimeJob,
+    backend_accepts_rate_mode,
+    default_output_backend_for_resource_ids,
+    profile_uses_nvenc_resource,
+    rate_modes_for_backend,
+    select_compatible_resource_ids,
+)
 from ffmpeg_nvenc_gui.ffmpeg_downloader import (
     FfmpegDownloadError,
     find_binary_member,
     find_ffmpeg_member,
     missing_binaries,
+    split_encode_modes_from_help,
     verify_ffmpeg_basic,
     verify_ffprobe_basic,
 )
@@ -376,7 +395,85 @@ def test_scan_and_job_specs_skip_existing_outputs(tmp_path: Path):
     assert files[0].label(profile) == "残り 1/2"
 
     specs = build_job_specs(profile, [src])
-    assert specs == [JobSpec(src=str(src), profile_id="profile", variant_id="master")]
+    assert specs == [JobSpec(src=str(src), profile_id="profile", variant_id="master", assigned_resource_id="nvidia:0")]
+
+
+def test_build_job_specs_round_robins_encode_set_resources(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="nvidia:0", label="GPU 0", kind="gpu", backend=BACKEND_NVENC, concurrency_slots=2),
+        HardwareResource(id="nvidia:1", label="GPU 1", kind="gpu", backend=BACKEND_NVENC, concurrency_slots=1),
+    ]
+    profile.resource_ids = ["nvidia:0", "nvidia:1"]
+    profile.outputs[0].backend = BACKEND_NVENC
+    profile.outputs[0].ffmpeg_encoder = "hevc_nvenc"
+    profile.outputs[0].resource_ids = ["nvidia:0", "nvidia:1"]
+    profile.outputs[1].enabled = False
+
+    input_dir = Path(profile.input_dir)
+    input_dir.mkdir(parents=True, exist_ok=True)
+    sources = [input_dir / f"video-{index}.mkv" for index in range(3)]
+    for src in sources:
+        src.write_bytes(b"dummy")
+
+    specs = build_job_specs(profile, sources)
+
+    assert [spec.assigned_resource_id for spec in specs] == ["nvidia:0", "nvidia:1", "nvidia:0"]
+
+
+def test_build_ffmpeg_command_uses_assigned_nvenc_resource(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    variant.backend = BACKEND_NVENC
+    variant.ffmpeg_encoder = "hevc_nvenc"
+    variant.resource_ids = ["nvidia:2"]
+
+    cmd = build_ffmpeg_command(
+        tmp_path / "ffmpeg.exe",
+        tmp_path / "input.mkv",
+        tmp_path / "chunk.mp4",
+        profile,
+        variant,
+        resource_id="nvidia:2",
+    )
+
+    assert cmd[cmd.index("-gpu") + 1] == "2"
+
+
+def test_profile_to_dict_omits_deprecated_profile_defaults(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="nvidia:0", label="GPU 0", kind="gpu", backend=BACKEND_NVENC, concurrency_slots=2),
+    ]
+    profile.resource_ids = ["nvidia:0"]
+    profile.outputs[0].backend = BACKEND_NVENC
+    profile.outputs[0].ffmpeg_encoder = "hevc_nvenc"
+    profile.outputs[0].resource_ids = ["nvidia:0"]
+
+    data = profile_to_dict(profile)
+
+    assert "codec" not in data
+    assert "rate_mode" not in data
+    assert data["hardware_resources"][1]["concurrency_slots"] == 2
+    assert data["outputs"][0]["backend"] == BACKEND_NVENC
+    assert data["outputs"][0]["ffmpeg_encoder"] == "hevc_nvenc"
+    assert "use_gpu" not in data["outputs"][0]
+
+
+def test_variant_resources_do_not_fallback_to_disabled_resource(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="nvidia:0", label="GPU 0", kind="gpu", backend=BACKEND_NVENC),
+    ]
+    profile.resource_ids = [CPU_RESOURCE_ID]
+    profile.outputs[0].backend = BACKEND_NVENC
+    profile.outputs[0].ffmpeg_encoder = "hevc_nvenc"
+    profile.outputs[0].resource_ids = []
+
+    assert variant_resource_ids(profile, profile.outputs[0]) == []
 
 
 def test_output_variant_normalizes_safe_container_extensions(tmp_path: Path):
@@ -526,6 +623,18 @@ def test_encode_profile_from_dict_uses_supplied_paths_and_gpus(tmp_path: Path):
     assert stale_gpu_profile.cq_value == 23
     assert synced_gpu_profile.use_gpu is True
     assert synced_gpu_profile.gpu_name == "RTX Test"
+
+
+def test_manual_gpu_resources_do_not_claim_startup_smoke_confirmation():
+    resources = hardware_resources_from_gpus([])
+    manual_messages = {
+        resource.id: resource.detection_error
+        for resource in resources
+        if resource.backend in {BACKEND_QSV, BACKEND_AMF}
+    }
+
+    assert manual_messages["intel:0"] == "Manual resource; availability is checked before encoding."
+    assert manual_messages["amd:0"] == "Manual resource; availability is checked before encoding."
 
 
 def test_load_profiles_defaults_missing_fields_from_supplied_paths(tmp_path: Path):
@@ -760,6 +869,567 @@ def test_encoder_app_output_rate_controls_match_selected_mode():
     assert app.output_bufsize_entry.state == app_module.tk.NORMAL
 
 
+def test_select_compatible_resource_ids_falls_back_to_allowed_resource():
+    assert select_compatible_resource_ids([CPU_RESOURCE_ID], ["nvidia:0"]) == [CPU_RESOURCE_ID]
+    assert select_compatible_resource_ids([CPU_RESOURCE_ID, "nvidia:0"], ["nvidia:0"]) == ["nvidia:0"]
+    assert select_compatible_resource_ids([], ["nvidia:0"]) == []
+
+
+def test_backend_accepts_rate_mode_rejects_cq_for_qsv_and_amf():
+    assert backend_accepts_rate_mode(BACKEND_CPU, "CQ") is True
+    assert backend_accepts_rate_mode(BACKEND_NVENC, "CQ") is True
+    assert backend_accepts_rate_mode(BACKEND_QSV, "CQ") is False
+    assert backend_accepts_rate_mode(BACKEND_AMF, "CQ") is False
+    assert backend_accepts_rate_mode(BACKEND_QSV, "VBR") is True
+    assert rate_modes_for_backend(BACKEND_QSV) == ["VBR", "ABR", "CBR"]
+
+
+def test_default_output_backend_uses_enabled_gpu_backend():
+    assert default_output_backend_for_resource_ids([CPU_RESOURCE_ID]) == BACKEND_CPU
+    assert default_output_backend_for_resource_ids(["intel:0"]) == BACKEND_QSV
+    assert default_output_backend_for_resource_ids(["amd:0"]) == BACKEND_AMF
+    assert default_output_backend_for_resource_ids([CPU_RESOURCE_ID, "intel:0"]) == BACKEND_QSV
+
+
+def test_profile_uses_nvenc_resource_only_tracks_nvenc():
+    assert profile_uses_nvenc_resource([CPU_RESOURCE_ID]) is False
+    assert profile_uses_nvenc_resource(["intel:0"]) is False
+    assert profile_uses_nvenc_resource(["amd:0"]) is False
+    assert profile_uses_nvenc_resource(["nvidia:0"]) is True
+    assert profile_uses_nvenc_resource(["intel:0", "nvidia:0"]) is True
+
+
+def test_normalize_profile_keeps_qsv_output_when_profile_use_gpu_is_false(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.use_gpu = False
+    profile.resource_ids = ["intel:0"]
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="intel:0", label="Intel QSV", kind="gpu", backend=BACKEND_QSV),
+    ]
+    profile.outputs = [
+        OutputVariant(
+            id="qsv",
+            name="QSV",
+            folder_name="qsv",
+            backend=BACKEND_QSV,
+            ffmpeg_encoder="hevc_qsv",
+            resource_ids=["intel:0"],
+        )
+    ]
+
+    normalized = normalize_profile_gpu(profile, [])
+
+    assert normalized.use_gpu is False
+    assert normalized.resource_ids == ["intel:0"]
+    assert normalized.outputs[0].backend == BACKEND_QSV
+    assert normalized.outputs[0].resource_ids == ["intel:0"]
+
+
+def test_selected_profile_resource_ids_does_not_fallback_to_cpu():
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    app = EncoderApp.__new__(EncoderApp)
+    app.resource_enabled_vars = {
+        CPU_RESOURCE_ID: Value(False),
+        "intel:0": Value(False),
+    }
+
+    assert app.selected_profile_resource_ids() == []
+
+    app.resource_enabled_vars["intel:0"] = Value(True)
+    assert app.selected_profile_resource_ids() == ["intel:0"]
+
+
+def test_update_output_encoder_controls_removes_cq_for_qsv():
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    class Widget:
+        def __init__(self):
+            self.config = {}
+
+        def configure(self, **kwargs):
+            self.config.update(kwargs)
+
+    app = EncoderApp.__new__(EncoderApp)
+    app.output_encoder_combo = Widget()
+    app.output_rate_combo = Widget()
+    app.output_split_combo = Widget()
+    app.output_backend_var = Value(BACKEND_QSV)
+    app.output_encoder_var = Value("hevc_qsv")
+    app.output_codec_var = Value("hevc_nvenc")
+    app.output_cpu_codec_var = Value("libx264")
+    app.output_rate_mode_var = Value("CQ")
+    app.output_split_encode_mode_var = Value("auto")
+    app.output_cq_entry = Widget()
+    app.output_bitrate_entry = Widget()
+    app.output_maxrate_entry = Widget()
+    app.output_bufsize_entry = Widget()
+    app.encoder_capabilities = {}
+    app._encoders_for_backend = lambda backend: ["hevc_qsv"]
+    app.selected_output_resource_ids = lambda: ["intel:0"]
+    app.current_profile = lambda: make_profile(Path("unused"))
+    app.render_output_resource_controls = lambda *_args: None
+
+    app.update_output_encoder_controls()
+
+    assert app.output_rate_combo.config["values"] == ["VBR", "ABR", "CBR"]
+    assert app.output_rate_mode_var.get() == "VBR"
+    assert app.output_cq_entry.config["state"] == app_module.tk.DISABLED
+    assert app.output_bitrate_entry.config["state"] == app_module.tk.NORMAL
+    assert app.output_maxrate_entry.config["state"] == app_module.tk.NORMAL
+    assert app.output_bufsize_entry.config["state"] == app_module.tk.NORMAL
+
+
+def test_encoder_app_has_no_unused_ffmpeg_download_button_handler():
+    assert not hasattr(EncoderApp, "download_ffmpeg_button")
+    assert not hasattr(EncoderApp, "_download_ffmpeg_worker")
+
+
+def test_set_output_edit_defaults_uses_qsv_backend_and_encoder(tmp_path: Path):
+    class Value:
+        def __init__(self, value=None):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    app = EncoderApp.__new__(EncoderApp)
+    for name in (
+        "output_name_var",
+        "output_folder_var",
+        "output_resolution_var",
+        "output_custom_height_var",
+        "output_container_var",
+        "output_enabled_var",
+        "output_filename_template_var",
+        "output_backend_var",
+        "output_encoder_var",
+        "output_split_encode_mode_var",
+        "output_gpu_choice_var",
+        "output_codec_var",
+        "output_cpu_codec_var",
+        "output_preset_var",
+        "output_cpu_preset_var",
+        "output_cpu_tune_var",
+        "output_tune_var",
+        "output_rate_mode_var",
+        "output_cq_var",
+        "output_bitrate_var",
+        "output_maxrate_var",
+        "output_bufsize_var",
+        "output_pix_fmt_var",
+        "output_scale_flags_var",
+        "output_audio_codec_var",
+        "output_audio_bitrate_var",
+        "output_audio_container_var",
+        "output_extra_input_args_var",
+        "output_extra_video_args_var",
+        "output_extra_audio_args_var",
+        "output_extra_output_args_var",
+        "output_extra_concat_args_var",
+        "output_extra_mux_args_var",
+    ):
+        setattr(app, name, Value())
+    app.gpus = []
+    app.update_output_cpu_tune_choices = lambda: None
+    app.update_output_rate_controls = lambda: None
+    app.update_resolution_controls = lambda: None
+    app.render_output_resource_controls = lambda *_args: None
+    app.update_output_encoder_controls = lambda: None
+
+    profile = make_profile(tmp_path)
+    profile.resource_ids = ["intel:0"]
+
+    app.set_output_edit_defaults(profile)
+
+    assert app.output_backend_var.get() == BACKEND_QSV
+    assert app.output_encoder_var.get() == "hevc_qsv"
+
+
+def test_refresh_outputs_tree_inserts_full_output_tuple_once():
+    class FakeTree:
+        def __init__(self):
+            self.deleted = None
+            self.insert_calls = []
+
+        def get_children(self):
+            return ("old",)
+
+        def delete(self, *items):
+            self.deleted = items
+
+        def insert(self, parent, index, iid=None, values=()):
+            self.insert_calls.append((parent, index, iid, values))
+
+        def item(self, *_args, **_kwargs):
+            raise AssertionError("refresh_outputs_tree should not rewrite inserted values")
+
+    app = EncoderApp.__new__(EncoderApp)
+    app.outputs_tree = FakeTree()
+    app.editing_outputs = [
+        OutputVariant(
+            id="qsv",
+            name="QSV",
+            folder_name="qsv",
+            height=1080,
+            container="mp4",
+            backend=BACKEND_QSV,
+            ffmpeg_encoder="hevc_qsv",
+        )
+    ]
+
+    app.refresh_outputs_tree()
+
+    assert app.outputs_tree.deleted == ("old",)
+    assert len(app.outputs_tree.insert_calls) == 1
+    _parent, _index, iid, values = app.outputs_tree.insert_calls[0]
+    assert iid == "qsv"
+    assert values[1:] == ("QSV", BACKEND_QSV, "hevc_qsv", "1080p", "qsv", "mp4")
+    assert len(values) == 7
+
+
+def test_add_or_update_output_rejects_cq_for_qsv(tmp_path: Path, monkeypatch):
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    app.current_profile = lambda: profile
+    app.selected_output_id = None
+    app.editing_outputs = []
+    app.output_name_var = Value("QSV")
+    app.output_folder_var = Value("qsv")
+    app.output_container_var = Value("mp4")
+    app.output_resolution_var = Value("Original")
+    app.output_rate_mode_var = Value("CQ")
+    app.output_cq_var = Value("22")
+    app.cq_var = Value("22")
+    app.output_backend_var = Value(BACKEND_QSV)
+    app.output_encoder_var = Value("hevc_qsv")
+    errors = []
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    app.add_or_update_output()
+
+    assert app.editing_outputs == []
+    assert any("CQ" in message and "QSV/AMF" in message for _title, message in errors)
+
+
+def test_add_or_update_output_allows_qsv_vbr_with_blank_cq(tmp_path: Path, monkeypatch):
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    class Tree:
+        def __init__(self):
+            self.selection = None
+
+        def selection_set(self, item):
+            self.selection = item
+
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    app.current_profile = lambda: profile
+    app.selected_output_id = None
+    app.editing_outputs = []
+    app.output_name_var = Value("QSV")
+    app.output_folder_var = Value("qsv")
+    app.output_container_var = Value("mp4")
+    app.output_resolution_var = Value("Original")
+    app.output_rate_mode_var = Value("VBR")
+    app.output_cq_var = Value("")
+    app.cq_var = Value("")
+    app.output_backend_var = Value(BACKEND_QSV)
+    app.output_encoder_var = Value("hevc_qsv")
+    app.selected_output_resource_ids = lambda: ["intel:0"]
+    app.output_enabled_var = Value(True)
+    app.output_filename_template_var = Value("{source}")
+    app.output_codec_var = Value("hevc_nvenc")
+    app.output_cpu_codec_var = Value("libx264")
+    app.output_split_encode_mode_var = Value("auto")
+    app.output_preset_var = Value("p5")
+    app.output_cpu_preset_var = Value("medium")
+    app.output_cpu_tune_var = Value("none")
+    app.output_tune_var = Value("none")
+    app.output_bitrate_var = Value("6000k")
+    app.output_maxrate_var = Value("8000k")
+    app.output_bufsize_var = Value("12000k")
+    app.output_pix_fmt_var = Value("yuv420p")
+    app.output_scale_flags_var = Value("lanczos")
+    app.output_audio_codec_var = Value("copy")
+    app.output_audio_bitrate_var = Value("")
+    app.output_audio_container_var = Value("")
+    app.output_extra_input_args_var = Value("")
+    app.output_extra_video_args_var = Value("")
+    app.output_extra_audio_args_var = Value("")
+    app.output_extra_output_args_var = Value("")
+    app.output_extra_concat_args_var = Value("")
+    app.output_extra_mux_args_var = Value("")
+    app.refresh_outputs_tree = lambda: None
+    app.outputs_tree = Tree()
+    errors = []
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    app.add_or_update_output()
+
+    assert errors == []
+    assert len(app.editing_outputs) == 1
+    variant = app.editing_outputs[0]
+    assert variant.backend == BACKEND_QSV
+    assert variant.rate_mode == "VBR"
+    assert variant.cq_value == profile.cq_value
+    assert app.outputs_tree.selection == variant.id
+
+
+def test_validate_profile_before_run_rejects_cq_for_qsv(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="intel:0", label="Intel QSV", kind="gpu", backend=BACKEND_QSV),
+    ]
+    profile.resource_ids = ["intel:0"]
+    profile.outputs[0].backend = BACKEND_QSV
+    profile.outputs[0].ffmpeg_encoder = "hevc_qsv"
+    profile.outputs[0].resource_ids = ["intel:0"]
+    profile.outputs[0].rate_mode = "CQ"
+    profile.outputs[1].enabled = False
+    errors = []
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    assert app.validate_profile_before_run(profile) is False
+    assert any("CQ" in message and "QSV/AMF" in message for _title, message in errors)
+
+
+def test_validate_encoder_capabilities_ignores_stale_sfe_for_h264_nvenc(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    app.encoder_capabilities = {
+        "h264_nvenc": {
+            "available": True,
+            "supports_split_encode_mode": False,
+            "split_encode_modes": [],
+        }
+    }
+    app.paths = build_paths(tmp_path)
+    app.log = lambda _text: None
+    errors = []
+    smoke_calls = []
+
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    variant.backend = "nvenc"
+    variant.ffmpeg_encoder = "h264_nvenc"
+    variant.split_encode_mode = "2"
+    spec = JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0")
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    def fake_smoke(ffmpeg_path, encoder, resource_id="", split_encode_mode="", timeout=30):
+        smoke_calls.append((encoder, resource_id, split_encode_mode))
+        return True, ""
+
+    monkeypatch.setattr(app_module, "smoke_test_encoder", fake_smoke)
+
+    assert app.validate_encoder_capabilities_before_run(profile, [spec]) is True
+    assert errors == []
+    assert smoke_calls == [("h264_nvenc", "nvidia:0", "")]
+
+
+def test_validate_encoder_capabilities_rejects_invalid_sfe_for_hevc_nvenc(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    app.encoder_capabilities = {
+        "hevc_nvenc": {
+            "available": True,
+            "supports_split_encode_mode": True,
+            "split_encode_modes": ["auto", "disabled"],
+        }
+    }
+    app.paths = build_paths(tmp_path)
+    app.log = lambda _text: None
+    errors = []
+    smoke_calls = []
+
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    variant.backend = "nvenc"
+    variant.ffmpeg_encoder = "hevc_nvenc"
+    variant.split_encode_mode = "2"
+    spec = JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0")
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+    monkeypatch.setattr(app_module, "smoke_test_encoder", lambda *_args, **_kwargs: smoke_calls.append(_args) or (True, ""))
+
+    assert app.validate_encoder_capabilities_before_run(profile, [spec]) is False
+    assert smoke_calls == []
+    assert any("split_encode_mode=2" in message for _title, message in errors)
+
+
+def test_validate_encoder_capabilities_allows_disabled_sfe_when_option_exists(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    app.encoder_capabilities = {
+        "hevc_nvenc": {
+            "available": True,
+            "supports_split_encode_mode": True,
+            "split_encode_modes": [],
+        }
+    }
+    app.paths = build_paths(tmp_path)
+    app.log = lambda _text: None
+    errors = []
+    smoke_calls = []
+
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    variant.backend = "nvenc"
+    variant.ffmpeg_encoder = "hevc_nvenc"
+    variant.split_encode_mode = "disabled"
+    spec = JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0")
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    def fake_smoke(ffmpeg_path, encoder, resource_id="", split_encode_mode="", timeout=30):
+        smoke_calls.append((encoder, resource_id, split_encode_mode))
+        return True, ""
+
+    monkeypatch.setattr(app_module, "smoke_test_encoder", fake_smoke)
+
+    assert app.split_encode_modes_for_encoder("hevc_nvenc") == ["auto", "disabled"]
+    assert app.validate_encoder_capabilities_before_run(profile, [spec]) is True
+    assert errors == []
+    assert smoke_calls == [("hevc_nvenc", "nvidia:0", "disabled")]
+
+
+def test_validate_profile_before_run_rejects_output_without_enabled_resource(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="nvidia:0", label="GPU 0", kind="gpu", backend=BACKEND_NVENC),
+    ]
+    profile.resource_ids = [CPU_RESOURCE_ID]
+    profile.outputs[0].backend = BACKEND_NVENC
+    profile.outputs[0].ffmpeg_encoder = "hevc_nvenc"
+    profile.outputs[0].resource_ids = []
+    profile.outputs[1].enabled = False
+    errors = []
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    assert app.validate_profile_before_run(profile) is False
+    assert any("使用可能なリソース" in message for _title, message in errors)
+
+
+def test_reserve_resource_slots_uses_readable_status(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    app.active_resource_slots = {}
+    app.active_resource_slot_indexes = {}
+    app.active_jobs = {}
+    profile = make_profile(tmp_path)
+    job = RuntimeJob(
+        job_id=1,
+        spec=JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=profile.outputs[0].id),
+        profile=profile,
+        variant=profile.outputs[0],
+        tmp_out=tmp_path / "tmp.mp4",
+        out_file=tmp_path / "out.mp4",
+        log_file=tmp_path / "job.log",
+        resource_id="nvidia:0",
+    )
+
+    assert app.reserve_resource_slots(job, {"nvidia:0": 2}) is True
+    assert job.status == "準備中"
+    assert app.active_resource_slots == {"nvidia:0": 2}
+    assert job.resource_slot_indexes == [0, 1]
+
+
+def test_resource_detail_label_only_reports_reserved_slot_indexes(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    job = RuntimeJob(
+        job_id=1,
+        spec=JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=profile.outputs[0].id),
+        profile=profile,
+        variant=profile.outputs[0],
+        tmp_out=tmp_path / "tmp.mp4",
+        out_file=tmp_path / "out.mp4",
+        log_file=tmp_path / "job.log",
+        resource_id="nvidia:0",
+    )
+
+    assert app.resource_detail_label(job) == "nvidia:0"
+
+    job.resource_slot_indexes = [0]
+    assert app.resource_detail_label(job) == "nvidia:0 slot 1"
+
+    job.resource_slot_indexes = [0, 2]
+    assert app.resource_detail_label(job) == "nvidia:0 slots 1,3"
+
+
+def test_resource_slot_indices_do_not_overlap_after_release(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    app.active_resource_slots = {}
+    app.active_resource_slot_indexes = {}
+    app.active_jobs = {}
+    profile = make_profile(tmp_path)
+    profile.max_parallel_jobs = 1
+
+    def make_job(job_id: int) -> RuntimeJob:
+        return RuntimeJob(
+            job_id=job_id,
+            spec=JobSpec(src=str(tmp_path / f"input-{job_id}.mkv"), profile_id=profile.id, variant_id=profile.outputs[0].id),
+            profile=profile,
+            variant=profile.outputs[0],
+            tmp_out=tmp_path / f"tmp-{job_id}.mp4",
+            out_file=tmp_path / f"out-{job_id}.mp4",
+            log_file=tmp_path / f"job-{job_id}.log",
+            resource_id="nvidia:0",
+        )
+
+    first = make_job(1)
+    second = make_job(2)
+    third = make_job(3)
+
+    assert app.reserve_resource_slots(first, {"nvidia:0": 3}) is True
+    assert app.reserve_resource_slots(second, {"nvidia:0": 3}) is True
+    assert first.resource_slot_indexes == [0]
+    assert second.resource_slot_indexes == [1]
+
+    app.release_resource_slots(first)
+    assert app.active_resource_slot_indexes == {"nvidia:0": {1}}
+
+    assert app.reserve_resource_slots(third, {"nvidia:0": 3}) is True
+    assert third.resource_slot_indexes == [0]
+    assert set(third.resource_slot_indexes).isdisjoint(second.resource_slot_indexes)
+
+
 def test_run_process_publishes_process_under_lock_and_honors_stop(tmp_path: Path):
     app = EncoderApp.__new__(EncoderApp)
     app.lock = threading.Lock()
@@ -863,6 +1533,23 @@ def test_find_ffmpeg_and_ffprobe_members():
     ]
     assert find_ffmpeg_member(names) == "ffmpeg-2026-essentials_build/bin/ffmpeg.exe"
     assert find_binary_member(names, "ffprobe.exe") == "ffmpeg-2026-essentials_build/bin/ffprobe.exe"
+
+
+def test_split_encode_modes_parse_only_option_values():
+    help_text = """
+Encoder hevc_nvenc [NVIDIA NVENC hevc encoder]:
+  unrelated option mentions 2-pass and h264 text.
+  -split_encode_mode <int> E..V....... Set split encoding mode
+     auto            0            E..V.......
+     disabled        1            E..V.......
+     forced          2            E..V.......
+     2               3            E..V.......
+     future-mode     4            E..V.......
+  -gpu <int>         E..V....... Selects which NVENC capable GPU to use
+"""
+
+    assert split_encode_modes_from_help(help_text) == ["auto", "disabled", "forced", "2", "future-mode"]
+    assert split_encode_modes_from_help("h264 mentions 2 but no option") == []
 
 
 def test_missing_binaries_preserves_existing_ffmpeg(tmp_path: Path):

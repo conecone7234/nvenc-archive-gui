@@ -43,6 +43,7 @@ from ffmpeg_nvenc_gui.core import (
     segment_dir_for,
     segment_file_name,
     segment_ranges,
+    variant_resource_ids,
     write_concat_file,
 )
 from ffmpeg_nvenc_gui.app import EncoderApp, RuntimeJob
@@ -449,6 +450,20 @@ def test_profile_to_dict_omits_deprecated_profile_defaults(tmp_path: Path):
     assert "use_gpu" not in data["outputs"][0]
 
 
+def test_variant_resources_do_not_fallback_to_disabled_resource(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="nvidia:0", label="GPU 0", kind="gpu", backend=BACKEND_NVENC),
+    ]
+    profile.resource_ids = [CPU_RESOURCE_ID]
+    profile.outputs[0].backend = BACKEND_NVENC
+    profile.outputs[0].ffmpeg_encoder = "hevc_nvenc"
+    profile.outputs[0].resource_ids = []
+
+    assert variant_resource_ids(profile, profile.outputs[0]) == []
+
+
 def test_output_variant_normalizes_safe_container_extensions(tmp_path: Path):
     profile = make_profile(tmp_path)
     variant = OutputVariant.from_dict(
@@ -828,6 +843,110 @@ def test_encoder_app_output_rate_controls_match_selected_mode():
     assert app.output_bitrate_entry.state == app_module.tk.NORMAL
     assert app.output_maxrate_entry.state == app_module.tk.NORMAL
     assert app.output_bufsize_entry.state == app_module.tk.NORMAL
+
+
+def test_validate_encoder_capabilities_ignores_stale_sfe_for_h264_nvenc(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    app.encoder_capabilities = {
+        "h264_nvenc": {
+            "available": True,
+            "supports_split_encode_mode": False,
+            "split_encode_modes": [],
+        }
+    }
+    app.paths = build_paths(tmp_path)
+    app.log = lambda _text: None
+    errors = []
+    smoke_calls = []
+
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    variant.backend = "nvenc"
+    variant.ffmpeg_encoder = "h264_nvenc"
+    variant.split_encode_mode = "2"
+    spec = JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0")
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    def fake_smoke(ffmpeg_path, encoder, resource_id="", split_encode_mode="", timeout=30):
+        smoke_calls.append((encoder, resource_id, split_encode_mode))
+        return True, ""
+
+    monkeypatch.setattr(app_module, "smoke_test_encoder", fake_smoke)
+
+    assert app.validate_encoder_capabilities_before_run(profile, [spec]) is True
+    assert errors == []
+    assert smoke_calls == [("h264_nvenc", "nvidia:0", "")]
+
+
+def test_validate_encoder_capabilities_rejects_invalid_sfe_for_hevc_nvenc(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    app.encoder_capabilities = {
+        "hevc_nvenc": {
+            "available": True,
+            "supports_split_encode_mode": True,
+            "split_encode_modes": ["auto", "disabled"],
+        }
+    }
+    app.paths = build_paths(tmp_path)
+    app.log = lambda _text: None
+    errors = []
+    smoke_calls = []
+
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    variant.backend = "nvenc"
+    variant.ffmpeg_encoder = "hevc_nvenc"
+    variant.split_encode_mode = "2"
+    spec = JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0")
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+    monkeypatch.setattr(app_module, "smoke_test_encoder", lambda *_args, **_kwargs: smoke_calls.append(_args) or (True, ""))
+
+    assert app.validate_encoder_capabilities_before_run(profile, [spec]) is False
+    assert smoke_calls == []
+    assert any("split_encode_mode=2" in message for _title, message in errors)
+
+
+def test_validate_profile_before_run_rejects_output_without_enabled_resource(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="nvidia:0", label="GPU 0", kind="gpu", backend=BACKEND_NVENC),
+    ]
+    profile.resource_ids = [CPU_RESOURCE_ID]
+    profile.outputs[0].backend = BACKEND_NVENC
+    profile.outputs[0].ffmpeg_encoder = "hevc_nvenc"
+    profile.outputs[0].resource_ids = []
+    profile.outputs[1].enabled = False
+    errors = []
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    assert app.validate_profile_before_run(profile) is False
+    assert any("使用可能なリソース" in message for _title, message in errors)
+
+
+def test_reserve_resource_slots_uses_readable_status(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    app.active_resource_slots = {}
+    app.active_jobs = {}
+    profile = make_profile(tmp_path)
+    job = RuntimeJob(
+        job_id=1,
+        spec=JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=profile.outputs[0].id),
+        profile=profile,
+        variant=profile.outputs[0],
+        tmp_out=tmp_path / "tmp.mp4",
+        out_file=tmp_path / "out.mp4",
+        log_file=tmp_path / "job.log",
+        resource_id="nvidia:0",
+    )
+
+    assert app.reserve_resource_slots(job, {"nvidia:0": 2}) is True
+    assert job.status == "準備中"
+    assert app.active_resource_slots == {"nvidia:0": 2}
 
 
 def test_run_process_publishes_process_under_lock_and_honors_stop(tmp_path: Path):

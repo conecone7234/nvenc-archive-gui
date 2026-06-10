@@ -1302,10 +1302,12 @@ class EncoderApp:
         for variant in profile.outputs:
             if not variant.enabled:
                 continue
-            if not variant_resource_ids(profile, variant):
+            resources = variant_resource_ids(profile, variant)
+            if not resources:
                 messagebox.showerror("入力エラー", f"{variant.name}: 使用可能なリソースを選択してください。")
                 return None
-            if any(resource_backend(resource_id) != variant.backend for resource_id in variant_resource_ids(profile, variant)):
+            expected_backend = variant.backend or resource_backend(resources[0])
+            if any(resource_backend(resource_id) != expected_backend for resource_id in resources):
                 messagebox.showerror("入力エラー", f"{variant.name}: backendの異なるリソースは混在できません。")
                 return None
             missing = missing_rate_fields(profile, variant)
@@ -1744,6 +1746,14 @@ class EncoderApp:
         for variant in profile.outputs:
             if not variant.enabled:
                 continue
+            resources = variant_resource_ids(profile, variant)
+            if not resources:
+                messagebox.showerror("入力エラー", f"{variant.name}: 使用可能なリソースを選択してください。")
+                return False
+            expected_backend = variant.backend or resource_backend(resources[0])
+            if any(resource_backend(resource_id) != expected_backend for resource_id in resources):
+                messagebox.showerror("入力エラー", f"{variant.name}: backendの異なるリソースは混在できません。")
+                return False
             missing = missing_rate_fields(profile, variant)
             if missing:
                 labels = ", ".join(missing)
@@ -1776,6 +1786,9 @@ class EncoderApp:
             resource_ids = variant_resource_ids(profile, variant)
             resource_id = spec.assigned_resource_id if spec.assigned_resource_id in resource_ids else (resource_ids[0] if resource_ids else "")
             split_mode = str(variant.split_encode_mode or "").strip().lower()
+            split_mode_applies = encoder in {"hevc_nvenc", "av1_nvenc"}
+            if not split_mode_applies:
+                split_mode = ""
             caps = self.encoder_capabilities.get(encoder, {})
             supports_split = bool(caps.get("supports_split_encode_mode"))
             split_modes = [str(item) for item in caps.get("split_encode_modes", []) if item]
@@ -1980,7 +1993,7 @@ class EncoderApp:
         job.resource_id = resource_id
         job.resource_slot = used
         job.resource_slots_reserved = weight
-        job.status = "貅門ｙ荳ｭ"
+        job.status = "準備中"
         self.active_jobs[job.job_id] = job
         return True
 

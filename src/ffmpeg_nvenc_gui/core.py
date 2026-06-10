@@ -1020,6 +1020,8 @@ def variant_resource_ids(profile: EncodeProfile, variant: OutputVariant) -> List
     ]
     if profile_selected:
         return profile_selected
+    if profile.hardware_resources:
+        return []
     fallback = CPU_RESOURCE_ID if backend == BACKEND_CPU else resource_id_for_backend(backend, 0)
     return [fallback]
 

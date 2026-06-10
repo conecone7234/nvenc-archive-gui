@@ -682,15 +682,16 @@ class EncoderApp:
         grid_combo("NVENC Codec", self.output_codec_var, GPU_CODECS, 4, 0)
         grid_combo("NVENC Preset", self.output_preset_var, GPU_PRESETS, 4, 1)
         grid_combo("NVENC Tune", self.output_tune_var, GPU_TUNES, 5, 0)
-        grid_combo("Rate", self.output_rate_mode_var, RATE_MODES, 5, 1)
+        self.output_rate_combo = grid_combo("Rate", self.output_rate_mode_var, RATE_MODES, 5, 1)
+        self.output_rate_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_rate_controls())
         self.output_cpu_codec_combo = grid_combo("CPU Codec", self.output_cpu_codec_var, CPU_CODECS, 6, 0)
         self.output_cpu_codec_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_cpu_tune_choices())
         grid_combo("CPU Preset", self.output_cpu_preset_var, CPU_PRESETS, 6, 1)
         self.output_cpu_tune_combo = grid_combo("CPU Tune", self.output_cpu_tune_var, CPU_TUNES_BY_CODEC["libx264"], 7, 0)
-        grid_entry("CQ/CRF", self.output_cq_var, 7, 1)
-        grid_entry("Bitrate", self.output_bitrate_var, 8, 0)
-        grid_entry("Maxrate", self.output_maxrate_var, 8, 1)
-        grid_entry("Bufsize", self.output_bufsize_var, 9, 0)
+        self.output_cq_entry = grid_entry("CQ/CRF", self.output_cq_var, 7, 1)
+        self.output_bitrate_entry = grid_entry("Bitrate", self.output_bitrate_var, 8, 0)
+        self.output_maxrate_entry = grid_entry("Maxrate", self.output_maxrate_var, 8, 1)
+        self.output_bufsize_entry = grid_entry("Bufsize", self.output_bufsize_var, 9, 0)
         grid_entry("Pix fmt", self.output_pix_fmt_var, 9, 1)
         grid_entry("Scale flags", self.output_scale_flags_var, 10, 0)
         grid_entry("Audio codec", self.output_audio_codec_var, 10, 1)
@@ -716,6 +717,7 @@ class EncoderApp:
         self.update_output_cpu_tune_choices()
         self.update_encoder_controls(apply_defaults=False)
         self.update_rate_controls()
+        self.update_output_rate_controls()
         self.update_resolution_controls()
 
     def _labeled_rate_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar) -> tuple[ttk.Label, ttk.Entry]:
@@ -725,12 +727,6 @@ class EncoderApp:
         entry = ttk.Entry(row, textvariable=variable, width=14)
         entry.grid(row=0, column=1, sticky=tk.W)
         return label_widget, entry
-
-    def _stacked_combo(self, parent: ttk.Frame, label: str, variable: tk.StringVar, values: List[str]) -> ttk.Combobox:
-        ttk.Label(parent, text=label, style="Surface.TLabel").pack(anchor=tk.W, pady=(8, 2))
-        combo = ttk.Combobox(parent, textvariable=variable, values=values, width=24, state="readonly")
-        combo.pack(anchor=tk.W)
-        return combo
 
     def browse_dir(self, variable: tk.StringVar) -> None:
         value = filedialog.askdirectory(initialdir=variable.get() or str(self.paths.base_dir))
@@ -917,6 +913,7 @@ class EncoderApp:
         self.output_extra_concat_args_var.set("")
         self.output_extra_mux_args_var.set("")
         self.update_output_cpu_tune_choices()
+        self.update_output_rate_controls()
         self.update_resolution_controls()
 
     def on_device_changed(self, _event: object = None) -> None:
@@ -977,6 +974,25 @@ class EncoderApp:
         if hasattr(self, "cq_label"):
             self.cq_label.configure(text="CQ" if use_gpu else "CRF")
 
+    @staticmethod
+    def _cq_value_for_rate_mode(rate_mode: str, raw_value: str, fallback: int) -> Optional[int]:
+        if rate_mode.upper() not in {"CQ", "VBR"}:
+            return fallback
+        try:
+            return int(raw_value)
+        except ValueError:
+            return None
+
+    def _output_cq_fallback(self) -> int:
+        for variant in self.editing_outputs:
+            if variant.id == self.selected_output_id and variant.cq_value is not None:
+                return variant.cq_value
+        try:
+            return int(self.cq_var.get())
+        except ValueError:
+            pass
+        return self.current_profile().cq_value
+
     def update_rate_controls(self) -> None:
         mode = self.rate_mode_var.get().upper()
         controls = {
@@ -984,6 +1000,19 @@ class EncoderApp:
             self.bitrate_entry: mode in {"VBR", "ABR", "CBR"},
             self.maxrate_entry: mode == "VBR",
             self.bufsize_entry: mode in {"VBR", "CBR"},
+        }
+        for widget, enabled in controls.items():
+            widget.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def update_output_rate_controls(self) -> None:
+        if not hasattr(self, "output_cq_entry"):
+            return
+        mode = self.output_rate_mode_var.get().upper()
+        controls = {
+            self.output_cq_entry: mode in {"CQ", "VBR"},
+            self.output_bitrate_entry: mode in {"VBR", "ABR", "CBR"},
+            self.output_maxrate_entry: mode == "VBR",
+            self.output_bufsize_entry: mode in {"VBR", "CBR"},
         }
         for widget, enabled in controls.items():
             widget.configure(state=tk.NORMAL if enabled else tk.DISABLED)
@@ -1181,6 +1210,7 @@ class EncoderApp:
                 self.output_extra_concat_args_var.set(variant.extra_concat_args)
                 self.output_extra_mux_args_var.set(variant.extra_mux_args)
                 self.update_output_cpu_tune_choices()
+                self.update_output_rate_controls()
                 self.update_resolution_controls()
                 return
 
@@ -1215,9 +1245,8 @@ class EncoderApp:
             height = RESOLUTION_PRESETS.get(preset)
 
         rate_mode = self.output_rate_mode_var.get().upper()
-        try:
-            cq_value = int(self.output_cq_var.get())
-        except ValueError:
+        cq_value = self._cq_value_for_rate_mode(rate_mode, self.output_cq_var.get(), self._output_cq_fallback())
+        if cq_value is None:
             messagebox.showerror("入力エラー", "CQ/CRF は数値で入力してください。")
             return
         use_gpu, gpu_index, gpu_name = self._parse_output_gpu_choice()

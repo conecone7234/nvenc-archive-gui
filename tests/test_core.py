@@ -650,6 +650,77 @@ def test_encoder_app_validate_profile_requires_enabled_output(tmp_path: Path):
     assert any("有効" in message for _, message in messages)
 
 
+def test_encoder_app_output_cq_validation_depends_on_rate_mode():
+    assert EncoderApp._cq_value_for_rate_mode("ABR", "", 18) == 18
+    assert EncoderApp._cq_value_for_rate_mode("CBR", "not-number", 22) == 22
+    assert EncoderApp._cq_value_for_rate_mode("CQ", "19", 18) == 19
+    assert EncoderApp._cq_value_for_rate_mode("VBR", "20", 18) == 20
+    assert EncoderApp._cq_value_for_rate_mode("CQ", "not-number", 18) is None
+
+
+def test_encoder_app_output_cq_fallback_prefers_existing_then_form_value(tmp_path: Path):
+    class Value:
+        def __init__(self, value: str):
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    app.current_profile = lambda: profile
+    app.cq_var = Value("21")
+    app.selected_output_id = None
+    app.editing_outputs = [OutputVariant(id="existing", name="Existing", folder_name="existing", cq_value=25)]
+
+    assert app._output_cq_fallback() == 21
+
+    app.selected_output_id = "existing"
+    assert app._output_cq_fallback() == 25
+
+    app.selected_output_id = None
+    app.cq_var = Value("not-number")
+    assert app._output_cq_fallback() == profile.cq_value
+
+
+def test_encoder_app_output_rate_controls_match_selected_mode():
+    class Value:
+        def __init__(self, value: str):
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+    class Widget:
+        def __init__(self):
+            self.state = None
+
+        def configure(self, **kwargs):
+            self.state = kwargs["state"]
+
+    app = EncoderApp.__new__(EncoderApp)
+    app.output_rate_mode_var = Value("ABR")
+    app.output_cq_entry = Widget()
+    app.output_bitrate_entry = Widget()
+    app.output_maxrate_entry = Widget()
+    app.output_bufsize_entry = Widget()
+
+    app.update_output_rate_controls()
+
+    assert app.output_cq_entry.state == app_module.tk.DISABLED
+    assert app.output_bitrate_entry.state == app_module.tk.NORMAL
+    assert app.output_maxrate_entry.state == app_module.tk.DISABLED
+    assert app.output_bufsize_entry.state == app_module.tk.DISABLED
+
+    app.output_rate_mode_var = Value("VBR")
+    app.update_output_rate_controls()
+
+    assert app.output_cq_entry.state == app_module.tk.NORMAL
+    assert app.output_bitrate_entry.state == app_module.tk.NORMAL
+    assert app.output_maxrate_entry.state == app_module.tk.NORMAL
+    assert app.output_bufsize_entry.state == app_module.tk.NORMAL
+
+
 def test_run_process_publishes_process_under_lock_and_honors_stop(tmp_path: Path):
     app = EncoderApp.__new__(EncoderApp)
     app.lock = threading.Lock()

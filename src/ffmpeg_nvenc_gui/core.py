@@ -1033,7 +1033,7 @@ def probe_duration(ffprobe_path: Path, src: Path) -> Optional[float]:
 
 def probe_has_audio(ffprobe_path: Path, src: Path) -> bool:
     if not ffprobe_path.exists():
-        return True
+        return False
     try:
         result = subprocess.run(
             [
@@ -1057,7 +1057,7 @@ def probe_has_audio(ffprobe_path: Path, src: Path) -> bool:
             check=False,
         )
     except Exception:
-        return True
+        return False
     return result.returncode == 0 and bool(result.stdout.strip())
 
 

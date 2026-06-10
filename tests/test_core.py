@@ -27,6 +27,7 @@ from ffmpeg_nvenc_gui.core import (
     normalize_container_extension,
     output_path_for,
     parse_ffmpeg_args,
+    probe_has_audio,
     profile_archive_dir,
     profile_from_state,
     profile_input_dir,
@@ -217,6 +218,22 @@ def test_audio_and_mux_commands_are_separate_from_video_segments(tmp_path: Path)
     assert ["-c", "copy"] == mux_cmd[mux_cmd.index("-c") : mux_cmd.index("-c") + 2]
     assert "-shortest" in mux_cmd
     assert "-map_metadata" in mux_cmd
+
+
+def test_probe_has_audio_falls_back_to_video_only_when_ffprobe_is_unavailable(tmp_path: Path, monkeypatch):
+    src = tmp_path / "video.mp4"
+
+    assert probe_has_audio(tmp_path / "missing-ffprobe.exe", src) is False
+
+    ffprobe = tmp_path / "ffprobe.exe"
+    ffprobe.write_text("", encoding="utf-8")
+
+    def raise_probe_error(*_args, **_kwargs):
+        raise OSError("ffprobe failed")
+
+    monkeypatch.setattr("ffmpeg_nvenc_gui.core.subprocess.run", raise_probe_error)
+
+    assert probe_has_audio(ffprobe, src) is False
 
 
 def test_faststart_is_only_used_for_mov_mp4_family(tmp_path: Path):

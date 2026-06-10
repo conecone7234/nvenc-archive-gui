@@ -5,13 +5,13 @@ Windows native GUI encoder for FFmpeg/NVENC archive jobs.
 ## Features
 
 - Home screen focused on Start / Pause / Stop, logs, and file-by-file progress
-- Settings-based input, output, and source archive folders
+- Settings-based default input, output, and source archive folders
 - Multiple output profiles per source file, such as `Master 2160p` and `Reference 1080p`
-- Per-output-profile file name templates, resolution, container, codec, rate control, GPU, audio, and advanced FFmpeg arguments
+- Per-output-profile input/output folder overrides, file name templates, segment length, resolution, container, codec, rate control, resources, audio, and advanced FFmpeg arguments
 - Resolution presets plus custom output height
 - CQ/CRF, VBR, ABR, and CBR modes
-- Manual GPU selection with CPU-only fallback when no NVIDIA GPU is detected
-- Parallel segment count per setting
+- Detected hardware resources only by default, with an advanced manual fallback for GPU resources
+- Segment parallelism follows the selected resource's slot count
 - One-source-at-a-time processing order, with each source's output profiles completed before the next source starts
 - Video-only segment encoding, video concat, source audio processing once, then final video/audio mux
 - Automatic FFmpeg and FFprobe install when the bundled executables are missing
@@ -47,10 +47,12 @@ Folders are created when the setting is executed, not at app startup.
 
 The app does not pause an active video encoder process in the middle of a write.
 Instead, each output profile is encoded as fixed-duration video-only segments.
-Segments for one output profile can run in parallel. After the video segments are
-concatenated, audio is processed once from the original source and muxed with the
-joined video. Pause waits before launching more segments, and Stop leaves
-completed segments in `tmp/segments`.
+The segment length is configured per output profile, with the setting default used
+when the output profile leaves it blank. Segments for one output profile can run
+in parallel according to the selected resource's slot count. After the video
+segments are concatenated, audio is processed once from the original source and
+muxed with the joined video. Pause waits before launching more segments, and Stop
+leaves completed segments in `tmp/segments`.
 Use `保存状態から再開` to continue after an app crash, forced shutdown, or manual stop.
 
 ## Run From Source

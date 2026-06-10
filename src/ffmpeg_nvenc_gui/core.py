@@ -715,7 +715,7 @@ def hardware_resources_from_gpus(gpus: Optional[List[GpuInfo]]) -> List[Hardware
                 vendor="intel",
                 index=0,
                 concurrency_slots=1,
-                detection_error="Manual resource; FFmpeg smoke test confirms availability.",
+                detection_error="Manual resource; availability is checked before encoding.",
             ),
             HardwareResource(
                 id=resource_id_for_backend(BACKEND_AMF, 0),
@@ -725,7 +725,7 @@ def hardware_resources_from_gpus(gpus: Optional[List[GpuInfo]]) -> List[Hardware
                 vendor="amd",
                 index=0,
                 concurrency_slots=1,
-                detection_error="Manual resource; FFmpeg smoke test confirms availability.",
+                detection_error="Manual resource; availability is checked before encoding.",
             ),
         ]
     )

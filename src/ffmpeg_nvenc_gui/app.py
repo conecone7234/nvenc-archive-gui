@@ -881,12 +881,11 @@ class EncoderApp:
         return resources
 
     def selected_profile_resource_ids(self) -> List[str]:
-        selected = [
+        return [
             resource_id
             for resource_id, var in self.resource_enabled_vars.items()
             if var.get()
         ]
-        return selected or [CPU_RESOURCE_ID]
 
     def _encoders_for_backend(self, backend: str) -> List[str]:
         backend = backend or BACKEND_CPU
@@ -1528,14 +1527,18 @@ class EncoderApp:
         else:
             height = RESOLUTION_PRESETS.get(preset)
 
-        rate_mode = self.output_rate_mode_var.get().upper()
-        cq_value = self._cq_value_for_rate_mode(rate_mode, self.output_cq_var.get(), self._output_cq_fallback())
-        if cq_value is None:
-            messagebox.showerror("入力エラー", "CQ/CRF は数値で入力してください。")
-            return
         backend = self.output_backend_var.get() or BACKEND_CPU
+        rate_mode = self.output_rate_mode_var.get().upper()
         if not backend_accepts_rate_mode(backend, rate_mode):
             messagebox.showerror("入力エラー", "CQ は CPU/NVENC のみで使用できます。QSV/AMF では VBR/ABR/CBR を選択してください。")
+            return
+        cq_value = (
+            self._cq_value_for_rate_mode(rate_mode, self.output_cq_var.get(), self._output_cq_fallback())
+            if backend_allows_cq(backend)
+            else self._output_cq_fallback()
+        )
+        if cq_value is None:
+            messagebox.showerror("入力エラー", "CQ/CRF は数値で入力してください。")
             return
         encoder = self.output_encoder_var.get().strip()
         resource_ids = self.selected_output_resource_ids()
@@ -2042,7 +2045,9 @@ class EncoderApp:
     def resource_detail_label(self, job: RuntimeJob) -> str:
         if not job.resource_id:
             return ""
-        indexes = job.resource_slot_indexes or [job.resource_slot]
+        if not job.resource_slot_indexes:
+            return job.resource_id
+        indexes = job.resource_slot_indexes
         labels = ",".join(str(index + 1) for index in indexes)
         return f"{job.resource_id} slots {labels}" if len(indexes) > 1 else f"{job.resource_id} slot {labels}"
 

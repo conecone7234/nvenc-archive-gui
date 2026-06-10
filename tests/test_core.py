@@ -5,6 +5,15 @@ from pathlib import Path
 
 import ffmpeg_nvenc_gui.app as app_module
 import ffmpeg_nvenc_gui.ffmpeg_downloader as downloader
+from ffmpeg_nvenc_gui.app import (
+    EncoderApp,
+    RuntimeJob,
+    backend_accepts_rate_mode,
+    default_output_backend_for_resource_ids,
+    profile_uses_nvenc_resource,
+    rate_modes_for_backend,
+    select_compatible_resource_ids,
+)
 from ffmpeg_nvenc_gui.core import (
     BACKEND_AMF,
     BACKEND_CPU,
@@ -31,8 +40,8 @@ from ffmpeg_nvenc_gui.core import (
     load_state,
     missing_profile_dirs,
     missing_rate_fields,
-    normalize_profile_gpu,
     normalize_container_extension,
+    normalize_profile_gpu,
     output_path_for,
     parse_ffmpeg_args,
     probe_has_audio,
@@ -52,15 +61,6 @@ from ffmpeg_nvenc_gui.core import (
     variant_resource_ids,
     variant_segment_minutes,
     write_concat_file,
-)
-from ffmpeg_nvenc_gui.app import (
-    EncoderApp,
-    RuntimeJob,
-    backend_accepts_rate_mode,
-    default_output_backend_for_resource_ids,
-    profile_uses_nvenc_resource,
-    rate_modes_for_backend,
-    select_compatible_resource_ids,
 )
 from ffmpeg_nvenc_gui.ffmpeg_downloader import (
     FfmpegDownloadError,
@@ -560,7 +560,9 @@ def test_profile_and_variant_loading_ignore_unknown_keys_and_normalize_types(tmp
     fallback = EncodeProfile.from_dict({"outputs": None}, paths, [])
     assert fallback.outputs
 
-    direct = EncodeProfile(id="direct", name="Direct", input_dir="in", output_dir="out", archive_dir="arch", outputs=None)
+    direct = EncodeProfile(
+        id="direct", name="Direct", input_dir="in", output_dir="out", archive_dir="arch", outputs=None
+    )
     assert direct.outputs == []
 
     duplicate_ids = EncodeProfile.from_dict(
@@ -1352,7 +1354,9 @@ def test_validate_encoder_capabilities_ignores_stale_sfe_for_h264_nvenc(tmp_path
     variant.backend = "nvenc"
     variant.ffmpeg_encoder = "h264_nvenc"
     variant.split_encode_mode = "2"
-    spec = JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0")
+    spec = JobSpec(
+        src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0"
+    )
 
     monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
 
@@ -1386,10 +1390,14 @@ def test_validate_encoder_capabilities_rejects_invalid_sfe_for_hevc_nvenc(tmp_pa
     variant.backend = "nvenc"
     variant.ffmpeg_encoder = "hevc_nvenc"
     variant.split_encode_mode = "2"
-    spec = JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0")
+    spec = JobSpec(
+        src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0"
+    )
 
     monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
-    monkeypatch.setattr(app_module, "smoke_test_encoder", lambda *_args, **_kwargs: smoke_calls.append(_args) or (True, ""))
+    monkeypatch.setattr(
+        app_module, "smoke_test_encoder", lambda *_args, **_kwargs: smoke_calls.append(_args) or (True, "")
+    )
 
     assert app.validate_encoder_capabilities_before_run(profile, [spec]) is False
     assert smoke_calls == []
@@ -1415,7 +1423,9 @@ def test_validate_encoder_capabilities_allows_disabled_sfe_when_option_exists(tm
     variant.backend = "nvenc"
     variant.ffmpeg_encoder = "hevc_nvenc"
     variant.split_encode_mode = "disabled"
-    spec = JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0")
+    spec = JobSpec(
+        src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0"
+    )
 
     monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
 
@@ -1530,7 +1540,9 @@ def test_resource_slot_indices_do_not_overlap_after_release(tmp_path: Path):
     def make_job(job_id: int) -> RuntimeJob:
         return RuntimeJob(
             job_id=job_id,
-            spec=JobSpec(src=str(tmp_path / f"input-{job_id}.mkv"), profile_id=profile.id, variant_id=profile.outputs[0].id),
+            spec=JobSpec(
+                src=str(tmp_path / f"input-{job_id}.mkv"), profile_id=profile.id, variant_id=profile.outputs[0].id
+            ),
             profile=profile,
             variant=profile.outputs[0],
             tmp_out=tmp_path / f"tmp-{job_id}.mp4",

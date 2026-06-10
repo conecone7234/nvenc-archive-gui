@@ -284,7 +284,11 @@ def smoke_test_encoder(
     ]
     if is_nvenc_codec(encoder):
         command += ["-gpu", str(resource_index(resource_id))]
-        if split_encode_mode and split_encode_mode not in {"auto", "default"} and encoder in {"hevc_nvenc", "av1_nvenc"}:
+        if (
+            split_encode_mode
+            and split_encode_mode not in {"auto", "default"}
+            and encoder in {"hevc_nvenc", "av1_nvenc"}
+        ):
             command += ["-split_encode_mode", split_encode_mode]
     command += ["-f", "null", sink]
     try:

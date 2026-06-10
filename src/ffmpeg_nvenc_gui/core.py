@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import ctypes
+import hashlib
 import json
 import math
 import os
@@ -211,7 +211,9 @@ class OutputVariant:
         self.audio_bitrate = str(self.audio_bitrate or "").strip()
         self.audio_container = normalize_container_extension(self.audio_container, default="") or ""
         self.ffmpeg_encoder = str(self.ffmpeg_encoder or "").strip()
-        inherit_profile_device = not self.backend and not self.ffmpeg_encoder and self.use_gpu is None and not self.resource_ids
+        inherit_profile_device = (
+            not self.backend and not self.ffmpeg_encoder and self.use_gpu is None and not self.resource_ids
+        )
         if inherit_profile_device:
             self.backend = ""
         elif not self.backend:
@@ -430,11 +432,7 @@ class FileStatus:
     outputs: Dict[str, bool]
 
     def label(self, profile: EncodeProfile) -> str:
-        enabled = [
-            variant
-            for variant in profile.outputs
-            if variant.enabled and variant.id in self.outputs
-        ]
+        enabled = [variant for variant in profile.outputs if variant.enabled and variant.id in self.outputs]
         if not enabled:
             enabled = [variant for variant in profile.outputs if variant.enabled]
         done = sum(1 for variant in enabled if self.outputs.get(variant.id, False))
@@ -827,7 +825,9 @@ def normalize_profile_gpu(profile: EncodeProfile, gpus: Optional[List[GpuInfo]])
                 variant.resource_ids = [resource_id_for_backend(BACKEND_NVENC, profile.gpu_index)]
             else:
                 variant.backend = BACKEND_CPU
-                variant.ffmpeg_encoder = variant.cpu_codec or profile.cpu_codec or DEFAULT_ENCODER_BY_BACKEND[BACKEND_CPU]
+                variant.ffmpeg_encoder = (
+                    variant.cpu_codec or profile.cpu_codec or DEFAULT_ENCODER_BY_BACKEND[BACKEND_CPU]
+                )
                 variant.resource_ids = [CPU_RESOURCE_ID]
         variant.backend = normalize_backend(variant.backend)
         if not variant.ffmpeg_encoder:
@@ -839,7 +839,9 @@ def normalize_profile_gpu(profile: EncodeProfile, gpus: Optional[List[GpuInfo]])
         ]
         if not valid_resources:
             if variant.use_gpu is True:
-                candidate = resource_id_for_backend(BACKEND_NVENC, variant.gpu_index if variant.gpu_index is not None else profile.gpu_index)
+                candidate = resource_id_for_backend(
+                    BACKEND_NVENC, variant.gpu_index if variant.gpu_index is not None else profile.gpu_index
+                )
                 if candidate in resource_by_id:
                     valid_resources = [candidate]
             elif variant.backend == BACKEND_CPU and CPU_RESOURCE_ID in resource_by_id:
@@ -1017,7 +1019,11 @@ def output_file_stem_for(profile: EncodeProfile, src: Path, variant: OutputVaria
 
 def output_path_for(profile: EncodeProfile, src: Path, variant: OutputVariant) -> Path:
     container = normalize_container_extension(variant.container)
-    return variant_output_dir(profile, variant) / variant.folder_name / f"{output_file_stem_for(profile, src, variant)}.{container}"
+    return (
+        variant_output_dir(profile, variant)
+        / variant.folder_name
+        / f"{output_file_stem_for(profile, src, variant)}.{container}"
+    )
 
 
 def scan_profile_files(profile: EncodeProfile) -> List[FileStatus]:
@@ -1226,7 +1232,11 @@ def missing_rate_fields(profile: EncodeProfile, variant: Optional[OutputVariant]
 def validate_rate_settings(profile: EncodeProfile, variant: Optional[OutputVariant] = None) -> None:
     missing = missing_rate_fields(profile, variant)
     if missing:
-        mode = profile.rate_mode if variant is None else str(variant_setting(profile, variant, "rate_mode", profile.rate_mode))
+        mode = (
+            profile.rate_mode
+            if variant is None
+            else str(variant_setting(profile, variant, "rate_mode", profile.rate_mode))
+        )
         raise ValueError(f"{mode} requires: {', '.join(missing)}")
 
 
@@ -1240,8 +1250,12 @@ def build_video_encoder_args(
     cmd: List[str] = ["-c:v", codec]
 
     if is_nvenc_codec(codec):
-        gpu_index = variant_gpu_index(profile, variant, resource_id) if variant is not None else max(profile.gpu_index, 0)
-        preset = str(variant_setting(profile, variant, "preset", profile.preset) if variant is not None else profile.preset)
+        gpu_index = (
+            variant_gpu_index(profile, variant, resource_id) if variant is not None else max(profile.gpu_index, 0)
+        )
+        preset = str(
+            variant_setting(profile, variant, "preset", profile.preset) if variant is not None else profile.preset
+        )
         tune = str(variant_setting(profile, variant, "tune", profile.tune) if variant is not None else profile.tune)
         cmd += ["-gpu", str(gpu_index)]
         cmd += ["-preset:v", preset]
@@ -1253,7 +1267,9 @@ def build_video_encoder_args(
                 cmd += ["-split_encode_mode", split_mode]
     elif not is_hardware_codec(codec):
         cpu_preset = str(
-            variant_setting(profile, variant, "cpu_preset", profile.cpu_preset) if variant is not None else profile.cpu_preset
+            variant_setting(profile, variant, "cpu_preset", profile.cpu_preset)
+            if variant is not None
+            else profile.cpu_preset
         )
         cpu_tune = str(
             variant_setting(profile, variant, "cpu_tune", profile.cpu_tune) if variant is not None else profile.cpu_tune
@@ -1262,11 +1278,21 @@ def build_video_encoder_args(
         if cpu_tune != "none":
             cmd += ["-tune:v", cpu_tune]
 
-    mode_name = str(variant_setting(profile, variant, "rate_mode", profile.rate_mode) if variant is not None else profile.rate_mode).upper()
-    cq_value = int(variant_setting(profile, variant, "cq_value", profile.cq_value) if variant is not None else profile.cq_value)
-    bitrate = str(variant_setting(profile, variant, "bitrate", profile.bitrate) if variant is not None else profile.bitrate)
-    maxrate = str(variant_setting(profile, variant, "maxrate", profile.maxrate) if variant is not None else profile.maxrate)
-    bufsize = str(variant_setting(profile, variant, "bufsize", profile.bufsize) if variant is not None else profile.bufsize)
+    mode_name = str(
+        variant_setting(profile, variant, "rate_mode", profile.rate_mode) if variant is not None else profile.rate_mode
+    ).upper()
+    cq_value = int(
+        variant_setting(profile, variant, "cq_value", profile.cq_value) if variant is not None else profile.cq_value
+    )
+    bitrate = str(
+        variant_setting(profile, variant, "bitrate", profile.bitrate) if variant is not None else profile.bitrate
+    )
+    maxrate = str(
+        variant_setting(profile, variant, "maxrate", profile.maxrate) if variant is not None else profile.maxrate
+    )
+    bufsize = str(
+        variant_setting(profile, variant, "bufsize", profile.bufsize) if variant is not None else profile.bufsize
+    )
     if is_nvenc_codec(codec):
         if mode_name == "CQ":
             cmd += ["-b:v", "0", "-cq:v", str(cq_value)]
@@ -1300,7 +1326,9 @@ def build_video_encoder_args(
             raise ValueError(f"Unknown rate mode: {mode_name}")
     elif is_hardware_codec(codec):
         if mode_name == "CQ":
-            raise ValueError(f"{codec} does not use the shared CQ/CRF control. Use VBR, ABR, CBR, or backend-specific extra args.")
+            raise ValueError(
+                f"{codec} does not use the shared CQ/CRF control. Use VBR, ABR, CBR, or backend-specific extra args."
+            )
         if mode_name in {"VBR", "ABR"}:
             cmd += ["-b:v", bitrate]
             if mode_name == "VBR":
@@ -1370,7 +1398,9 @@ def build_ffmpeg_command(
     cmd += build_video_encoder_args(profile, variant, resource_id)
 
     if variant.height is not None and variant.height > 0:
-        scale_flags = str(variant_setting(profile, variant, "scale_flags", profile.scale_flags) or "lanczos+accurate_rnd")
+        scale_flags = str(
+            variant_setting(profile, variant, "scale_flags", profile.scale_flags) or "lanczos+accurate_rnd"
+        )
         scale = f"scale=-2:{variant.height}:flags={scale_flags}"
         cmd += ["-vf", scale]
 
@@ -1388,7 +1418,9 @@ def build_concat_command(
     profile: Optional[EncodeProfile] = None,
     variant: Optional[OutputVariant] = None,
 ) -> List[str]:
-    extra_args = parse_ffmpeg_args(variant_setting(profile, variant, "extra_concat_args", "") if profile and variant else "")
+    extra_args = parse_ffmpeg_args(
+        variant_setting(profile, variant, "extra_concat_args", "") if profile and variant else ""
+    )
     cmd = [
         str(ffmpeg_path),
         "-hide_banner",

@@ -1049,16 +1049,20 @@ def probe_has_audio(ffprobe_path: Path, src: Path) -> bool:
                 str(src),
             ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=30,
             check=False,
         )
-    except Exception:
-        return False
-    return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception as exc:
+        raise RuntimeError(f"ffprobe audio probe failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"ffprobe audio probe failed: exit {result.returncode}{suffix}")
+    return bool(result.stdout.strip())
 
 
 def segment_ranges(duration: Optional[float], segment_seconds: int) -> List[Tuple[float, Optional[float]]]:

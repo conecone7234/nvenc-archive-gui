@@ -220,20 +220,59 @@ def test_audio_and_mux_commands_are_separate_from_video_segments(tmp_path: Path)
     assert "-map_metadata" in mux_cmd
 
 
-def test_probe_has_audio_falls_back_to_video_only_when_ffprobe_is_unavailable(tmp_path: Path, monkeypatch):
+def test_probe_has_audio_handles_missing_and_stream_results(tmp_path: Path, monkeypatch):
     src = tmp_path / "video.mp4"
-
-    assert probe_has_audio(tmp_path / "missing-ffprobe.exe", src) is False
-
     ffprobe = tmp_path / "ffprobe.exe"
     ffprobe.write_text("", encoding="utf-8")
 
+    assert probe_has_audio(tmp_path / "missing-ffprobe.exe", src) is False
+
+    class Result:
+        def __init__(self, stdout: str):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    monkeypatch.setattr("ffmpeg_nvenc_gui.core.subprocess.run", lambda *_args, **_kwargs: Result(""))
+
+    assert probe_has_audio(ffprobe, src) is False
+
+    monkeypatch.setattr("ffmpeg_nvenc_gui.core.subprocess.run", lambda *_args, **_kwargs: Result("0\n"))
+
+    assert probe_has_audio(ffprobe, src) is True
+
+
+def test_probe_has_audio_fails_fast_on_probe_errors(tmp_path: Path, monkeypatch):
+    src = tmp_path / "video.mp4"
+    ffprobe = tmp_path / "ffprobe.exe"
+    ffprobe.write_text("", encoding="utf-8")
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "invalid input"
+
+    monkeypatch.setattr("ffmpeg_nvenc_gui.core.subprocess.run", lambda *_args, **_kwargs: Result())
+
+    try:
+        probe_has_audio(ffprobe, src)
+    except RuntimeError as exc:
+        assert "exit 1" in str(exc)
+        assert "invalid input" in str(exc)
+    else:
+        raise AssertionError("expected ffprobe return code failure to raise")
+
     def raise_probe_error(*_args, **_kwargs):
-        raise OSError("ffprobe failed")
+        raise OSError("permission denied")
 
     monkeypatch.setattr("ffmpeg_nvenc_gui.core.subprocess.run", raise_probe_error)
 
-    assert probe_has_audio(ffprobe, src) is False
+    try:
+        probe_has_audio(ffprobe, src)
+    except RuntimeError as exc:
+        assert "permission denied" in str(exc)
+    else:
+        raise AssertionError("expected ffprobe invocation failure to raise")
 
 
 def test_faststart_is_only_used_for_mov_mp4_family(tmp_path: Path):
@@ -742,6 +781,35 @@ def test_run_process_publishes_process_under_lock_and_honors_stop(tmp_path: Path
 
     assert ret != 0
     assert job.process is None
+
+
+def test_skip_audio_output_logs_reason_and_moves_joined_video(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    log_messages = []
+    app.log = log_messages.append
+    profile = make_profile(tmp_path)
+    job = RuntimeJob(
+        job_id=1,
+        spec=JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=profile.outputs[0].id),
+        profile=profile,
+        variant=profile.outputs[0],
+        tmp_out=tmp_path / "tmp.mp4",
+        out_file=tmp_path / "out.mp4",
+        log_file=tmp_path / "job.log",
+    )
+    joined_video = tmp_path / "joined.mp4"
+    joined_video.write_bytes(b"video")
+
+    with open(job.log_file, "w", encoding="utf-8") as log_fp:
+        app.skip_audio_output(job, Path(job.spec.src), joined_video, log_fp, "No audio stream detected")
+
+    assert job.tmp_out.read_bytes() == b"video"
+    assert not joined_video.exists()
+    assert job.status == "映像のみ"
+    assert job.message == "video-only"
+    assert any("No audio stream detected" in message for message in log_messages)
+    assert "Audio skipped: No audio stream detected" in job.log_file.read_text(encoding="utf-8")
 
 
 def test_state_resume_filters_completed_jobs(tmp_path: Path):

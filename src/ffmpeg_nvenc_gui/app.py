@@ -1718,6 +1718,7 @@ class EncoderApp:
                         self._mark_job_failed(job, f"concat failed: exit {ret}")
                     return
 
+                ffprobe_available = self.paths.ffprobe_path.exists()
                 has_audio = probe_has_audio(self.paths.ffprobe_path, src)
                 if has_audio:
                     if not self.wait_until_unpaused(job):
@@ -1769,9 +1770,8 @@ class EncoderApp:
                             self._mark_job_failed(job, f"mux failed: exit {ret}")
                         return
                 else:
-                    if job.tmp_out.exists():
-                        job.tmp_out.unlink(missing_ok=True)
-                    shutil.move(str(joined_video), str(job.tmp_out))
+                    reason = "No audio stream detected" if ffprobe_available else "FFprobe unavailable"
+                    self.skip_audio_output(job, src, joined_video, log_fp, reason)
 
                 job.out_file.parent.mkdir(parents=True, exist_ok=True)
                 if job.out_file.exists():
@@ -1893,6 +1893,18 @@ class EncoderApp:
             self._mark_job_failed(job, failure_message["text"] or "segment failed")
             return False
         return True
+
+    def skip_audio_output(self, job: RuntimeJob, src: Path, joined_video: Path, log_fp, reason: str) -> None:
+        message = f"{reason}; keeping video-only output."
+        log_fp.write(f"\nAudio skipped: {message}\n\n")
+        log_fp.flush()
+        self.log(f"{src.name}: {message}")
+        with self.lock:
+            job.status = "映像のみ"
+            job.message = "video-only"
+        if job.tmp_out.exists():
+            job.tmp_out.unlink(missing_ok=True)
+        shutil.move(str(joined_video), str(job.tmp_out))
 
     def run_process(
         self,

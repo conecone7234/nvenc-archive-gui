@@ -31,6 +31,7 @@ from ffmpeg_nvenc_gui.core import (
     load_state,
     missing_profile_dirs,
     missing_rate_fields,
+    normalize_profile_gpu,
     normalize_container_extension,
     output_path_for,
     parse_ffmpeg_args,
@@ -54,6 +55,7 @@ from ffmpeg_nvenc_gui.app import (
     RuntimeJob,
     backend_accepts_rate_mode,
     default_output_backend_for_resource_ids,
+    profile_uses_nvenc_resource,
     rate_modes_for_backend,
     select_compatible_resource_ids,
 )
@@ -887,6 +889,41 @@ def test_default_output_backend_uses_enabled_gpu_backend():
     assert default_output_backend_for_resource_ids(["intel:0"]) == BACKEND_QSV
     assert default_output_backend_for_resource_ids(["amd:0"]) == BACKEND_AMF
     assert default_output_backend_for_resource_ids([CPU_RESOURCE_ID, "intel:0"]) == BACKEND_QSV
+
+
+def test_profile_uses_nvenc_resource_only_tracks_nvenc():
+    assert profile_uses_nvenc_resource([CPU_RESOURCE_ID]) is False
+    assert profile_uses_nvenc_resource(["intel:0"]) is False
+    assert profile_uses_nvenc_resource(["amd:0"]) is False
+    assert profile_uses_nvenc_resource(["nvidia:0"]) is True
+    assert profile_uses_nvenc_resource(["intel:0", "nvidia:0"]) is True
+
+
+def test_normalize_profile_keeps_qsv_output_when_profile_use_gpu_is_false(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.use_gpu = False
+    profile.resource_ids = ["intel:0"]
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="intel:0", label="Intel QSV", kind="gpu", backend=BACKEND_QSV),
+    ]
+    profile.outputs = [
+        OutputVariant(
+            id="qsv",
+            name="QSV",
+            folder_name="qsv",
+            backend=BACKEND_QSV,
+            ffmpeg_encoder="hevc_qsv",
+            resource_ids=["intel:0"],
+        )
+    ]
+
+    normalized = normalize_profile_gpu(profile, [])
+
+    assert normalized.use_gpu is False
+    assert normalized.resource_ids == ["intel:0"]
+    assert normalized.outputs[0].backend == BACKEND_QSV
+    assert normalized.outputs[0].resource_ids == ["intel:0"]
 
 
 def test_selected_profile_resource_ids_does_not_fallback_to_cpu():

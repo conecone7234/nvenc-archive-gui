@@ -200,6 +200,10 @@ def default_output_backend_for_resource_ids(resource_ids: List[str]) -> str:
     return BACKEND_CPU
 
 
+def profile_uses_nvenc_resource(resource_ids: List[str]) -> bool:
+    return any(resource_backend(resource_id) == BACKEND_NVENC for resource_id in resource_ids)
+
+
 class SearchableCombobox(ttk.Combobox):
     def __init__(self, master: tk.Widget, values: List[str], **kwargs: object) -> None:
         self._search_values = list(values)
@@ -1313,8 +1317,8 @@ class EncoderApp:
         if not profile_resource_ids:
             messagebox.showerror("入力エラー", "処理リソースを1つ以上有効にしてください。")
             return None
-        use_gpu = any(resource_backend(resource_id) != BACKEND_CPU for resource_id in profile_resource_ids)
         first_gpu = next((resource_id for resource_id in profile_resource_ids if resource_backend(resource_id) == BACKEND_NVENC), "")
+        use_gpu = profile_uses_nvenc_resource(profile_resource_ids)
         gpu_index = resource_index(first_gpu) if first_gpu else 0
         gpu_name = ""
         for resource in hardware_resources:

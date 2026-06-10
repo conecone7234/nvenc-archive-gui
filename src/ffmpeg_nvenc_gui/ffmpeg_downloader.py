@@ -224,7 +224,6 @@ def split_encode_modes_from_help(help_text: str) -> list[str]:
         return []
     values: list[str] = []
     capturing = False
-    allowed = {"auto", "forced", "2", "3", "4", "disabled"}
     for line in help_text.splitlines():
         if "-split_encode_mode" in line:
             capturing = True
@@ -233,11 +232,11 @@ def split_encode_modes_from_help(help_text: str) -> list[str]:
             continue
         if re.match(r"\s+-[A-Za-z0-9_]", line):
             break
-        match = re.match(r"\s+([A-Za-z0-9_]+)\s+", line)
+        match = re.match(r"\s+([A-Za-z0-9][A-Za-z0-9_-]*)\s+[-+]?\d+(?:\s|$)", line)
         if not match:
             continue
         candidate = match.group(1).lower()
-        if candidate in allowed and candidate not in values:
+        if candidate not in values:
             values.append(candidate)
     if not values:
         values.append("auto")

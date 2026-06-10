@@ -22,6 +22,7 @@ try:
         BACKEND_NVENC,
         BACKEND_QSV,
         CPU_RESOURCE_ID,
+        DEFAULT_ENCODER_BY_BACKEND,
         EncodeProfile,
         FileStatus,
         GpuInfo,
@@ -89,6 +90,7 @@ except ModuleNotFoundError:
         BACKEND_NVENC,
         BACKEND_QSV,
         CPU_RESOURCE_ID,
+        DEFAULT_ENCODER_BY_BACKEND,
         EncodeProfile,
         FileStatus,
         GpuInfo,
@@ -188,6 +190,14 @@ def rate_modes_for_backend(backend: str) -> List[str]:
     if backend_allows_cq(backend):
         return RATE_MODES
     return [mode for mode in RATE_MODES if mode != "CQ"]
+
+
+def default_output_backend_for_resource_ids(resource_ids: List[str]) -> str:
+    for resource_id in resource_ids:
+        backend = resource_backend(resource_id)
+        if backend != BACKEND_CPU:
+            return backend
+    return BACKEND_CPU
 
 
 class SearchableCombobox(ttk.Combobox):
@@ -1112,9 +1122,11 @@ class EncoderApp:
         self.output_container_var.set("mp4")
         self.output_enabled_var.set(True)
         self.output_filename_template_var.set("{source}")
-        default_backend = BACKEND_NVENC if any(resource_backend(item) == BACKEND_NVENC for item in profile.resource_ids) else BACKEND_CPU
+        default_backend = default_output_backend_for_resource_ids(profile.resource_ids)
         self.output_backend_var.set(default_backend)
-        self.output_encoder_var.set("hevc_nvenc" if default_backend == BACKEND_NVENC else "libx264")
+        self.output_encoder_var.set(
+            DEFAULT_ENCODER_BY_BACKEND.get(default_backend, DEFAULT_ENCODER_BY_BACKEND[BACKEND_CPU])
+        )
         self.output_split_encode_mode_var.set("auto")
         self.output_gpu_choice_var.set(self._choice_for_profile_gpu(profile))
         self.output_codec_var.set(profile.codec)

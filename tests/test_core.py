@@ -52,6 +52,7 @@ from ffmpeg_nvenc_gui.app import (
     EncoderApp,
     RuntimeJob,
     backend_accepts_rate_mode,
+    default_output_backend_for_resource_ids,
     rate_modes_for_backend,
     select_compatible_resource_ids,
 )
@@ -868,6 +869,13 @@ def test_backend_accepts_rate_mode_rejects_cq_for_qsv_and_amf():
     assert rate_modes_for_backend(BACKEND_QSV) == ["VBR", "ABR", "CBR"]
 
 
+def test_default_output_backend_uses_enabled_gpu_backend():
+    assert default_output_backend_for_resource_ids([CPU_RESOURCE_ID]) == BACKEND_CPU
+    assert default_output_backend_for_resource_ids(["intel:0"]) == BACKEND_QSV
+    assert default_output_backend_for_resource_ids(["amd:0"]) == BACKEND_AMF
+    assert default_output_backend_for_resource_ids([CPU_RESOURCE_ID, "intel:0"]) == BACKEND_QSV
+
+
 def test_update_output_encoder_controls_removes_cq_for_qsv():
     class Value:
         def __init__(self, value):
@@ -907,6 +915,70 @@ def test_update_output_encoder_controls_removes_cq_for_qsv():
 
     assert app.output_rate_combo.config["values"] == ["VBR", "ABR", "CBR"]
     assert app.output_rate_mode_var.get() == "VBR"
+
+
+def test_set_output_edit_defaults_uses_qsv_backend_and_encoder(tmp_path: Path):
+    class Value:
+        def __init__(self, value=None):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    app = EncoderApp.__new__(EncoderApp)
+    for name in (
+        "output_name_var",
+        "output_folder_var",
+        "output_resolution_var",
+        "output_custom_height_var",
+        "output_container_var",
+        "output_enabled_var",
+        "output_filename_template_var",
+        "output_backend_var",
+        "output_encoder_var",
+        "output_split_encode_mode_var",
+        "output_gpu_choice_var",
+        "output_codec_var",
+        "output_cpu_codec_var",
+        "output_preset_var",
+        "output_cpu_preset_var",
+        "output_cpu_tune_var",
+        "output_tune_var",
+        "output_rate_mode_var",
+        "output_cq_var",
+        "output_bitrate_var",
+        "output_maxrate_var",
+        "output_bufsize_var",
+        "output_pix_fmt_var",
+        "output_scale_flags_var",
+        "output_audio_codec_var",
+        "output_audio_bitrate_var",
+        "output_audio_container_var",
+        "output_extra_input_args_var",
+        "output_extra_video_args_var",
+        "output_extra_audio_args_var",
+        "output_extra_output_args_var",
+        "output_extra_concat_args_var",
+        "output_extra_mux_args_var",
+    ):
+        setattr(app, name, Value())
+    app.gpus = []
+    app.update_output_cpu_tune_choices = lambda: None
+    app.update_output_rate_controls = lambda: None
+    app.update_resolution_controls = lambda: None
+    app.render_output_resource_controls = lambda *_args: None
+    app.update_output_encoder_controls = lambda: None
+
+    profile = make_profile(tmp_path)
+    profile.resource_ids = ["intel:0"]
+
+    app.set_output_edit_defaults(profile)
+
+    assert app.output_backend_var.get() == BACKEND_QSV
+    assert app.output_encoder_var.get() == "hevc_qsv"
 
 
 def test_refresh_outputs_tree_inserts_full_output_tuple_once():
@@ -1297,10 +1369,11 @@ Encoder hevc_nvenc [NVIDIA NVENC hevc encoder]:
      disabled        1            E..V.......
      forced          2            E..V.......
      2               3            E..V.......
+     future-mode     4            E..V.......
   -gpu <int>         E..V....... Selects which NVENC capable GPU to use
 """
 
-    assert split_encode_modes_from_help(help_text) == ["auto", "disabled", "forced", "2"]
+    assert split_encode_modes_from_help(help_text) == ["auto", "disabled", "forced", "2", "future-mode"]
     assert split_encode_modes_from_help("h264 mentions 2 but no option") == []
 
 

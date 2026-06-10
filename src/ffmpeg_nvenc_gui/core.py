@@ -39,7 +39,12 @@ DEFAULT_ENCODER_BY_BACKEND = {
     BACKEND_QSV: "hevc_qsv",
     BACKEND_AMF: "hevc_amf",
 }
+STALE_AUTO_RESOURCE_ERRORS = {
+    "Manual resource; availability is checked before encoding.",
+}
+MANUAL_RESOURCE_ERROR_PREFIX = "Manual fallback resource;"
 DEPRECATED_PROFILE_FIELDS = {
+    "max_parallel_jobs",
     "use_gpu",
     "gpu_index",
     "gpu_name",
@@ -127,6 +132,9 @@ class OutputVariant:
     container: str = "mp4"
     enabled: bool = True
     filename_template: str = "{source}"
+    input_dir: str = ""
+    output_dir: str = ""
+    segment_minutes: Optional[int] = None
     use_gpu: Optional[bool] = None
     gpu_index: Optional[int] = None
     gpu_name: str = ""
@@ -180,6 +188,9 @@ class OutputVariant:
         self.folder_name = safe_folder_name(self.folder_name or self.name or self.id)
         self.container = normalize_container_extension(self.container)
         self.filename_template = str(self.filename_template or "{source}").strip() or "{source}"
+        self.input_dir = str(self.input_dir or "").strip()
+        self.output_dir = str(self.output_dir or "").strip()
+        self.segment_minutes = normalize_optional_int(self.segment_minutes, minimum=1)
         self.use_gpu = normalize_optional_bool(self.use_gpu)
         self.gpu_index = normalize_optional_int(self.gpu_index, minimum=0)
         self.gpu_name = str(self.gpu_name or "").strip()
@@ -251,6 +262,9 @@ class OutputVariant:
             "height": None,
             "container": "mp4",
             "enabled": True,
+            "input_dir": "",
+            "output_dir": "",
+            "segment_minutes": None,
         }
         base.update(dataclass_values(OutputVariant, data))
         return OutputVariant(**base)
@@ -416,7 +430,13 @@ class FileStatus:
     outputs: Dict[str, bool]
 
     def label(self, profile: EncodeProfile) -> str:
-        enabled = [variant for variant in profile.outputs if variant.enabled]
+        enabled = [
+            variant
+            for variant in profile.outputs
+            if variant.enabled and variant.id in self.outputs
+        ]
+        if not enabled:
+            enabled = [variant for variant in profile.outputs if variant.enabled]
         done = sum(1 for variant in enabled if self.outputs.get(variant.id, False))
         total = len(enabled)
         if total == 0:
@@ -588,7 +608,8 @@ def ensure_profile_dirs(profile: EncodeProfile) -> None:
     archive_dir.mkdir(parents=True, exist_ok=True)
     for variant in profile.outputs:
         if variant.enabled:
-            (output_dir / variant.folder_name).mkdir(parents=True, exist_ok=True)
+            variant_input_dir(profile, variant).mkdir(parents=True, exist_ok=True)
+            (variant_output_dir(profile, variant) / variant.folder_name).mkdir(parents=True, exist_ok=True)
 
 
 def safe_folder_name(text: str) -> str:
@@ -687,48 +708,29 @@ def hardware_resources_from_gpus(gpus: Optional[List[GpuInfo]]) -> List[Hardware
         )
     ]
     for gpu in gpus or []:
+        backend = {
+            "nvidia": BACKEND_NVENC,
+            "intel": BACKEND_QSV,
+            "amd": BACKEND_AMF,
+        }.get(gpu.vendor, BACKEND_NVENC)
         engine_count = gpu.encoder_engines
         detection_error = gpu.detection_error
-        if gpu.vendor == "nvidia" and engine_count is None:
+        if backend == BACKEND_NVENC and engine_count is None:
             engine_count, detection_error = detect_nvenc_engine_count(gpu.index)
         slots = engine_count or 1
         resources.append(
             HardwareResource(
-                id=resource_id_for_backend(BACKEND_NVENC, gpu.index),
+                id=resource_id_for_backend(backend, gpu.index),
                 label=f"GPU {gpu.index}: {gpu.name}",
                 kind="gpu",
-                backend=BACKEND_NVENC,
-                vendor="nvidia",
+                backend=backend,
+                vendor=gpu.vendor,
                 index=gpu.index,
                 concurrency_slots=slots,
                 detected_encoder_engines=engine_count,
                 detection_error=detection_error,
             )
         )
-    resources.extend(
-        [
-            HardwareResource(
-                id=resource_id_for_backend(BACKEND_QSV, 0),
-                label="Intel GPU 0 (QSV/manual)",
-                kind="gpu",
-                backend=BACKEND_QSV,
-                vendor="intel",
-                index=0,
-                concurrency_slots=1,
-                detection_error="Manual resource; availability is checked before encoding.",
-            ),
-            HardwareResource(
-                id=resource_id_for_backend(BACKEND_AMF, 0),
-                label="AMD GPU 0 (AMF/manual)",
-                kind="gpu",
-                backend=BACKEND_AMF,
-                vendor="amd",
-                index=0,
-                concurrency_slots=1,
-                detection_error="Manual resource; availability is checked before encoding.",
-            ),
-        ]
-    )
     return resources
 
 
@@ -739,6 +741,14 @@ def normalize_hardware_resources(
     by_id = {resource.id: resource for resource in hardware_resources_from_gpus(gpus)}
     for resource in resources:
         if not resource.id:
+            continue
+        if resource.id not in by_id and resource.detection_error in STALE_AUTO_RESOURCE_ERRORS:
+            continue
+        if (
+            resource.id not in by_id
+            and resource_backend(resource.id) == BACKEND_NVENC
+            and not resource.detection_error.startswith(MANUAL_RESOURCE_ERROR_PREFIX)
+        ):
             continue
         by_id[resource.id] = resource
     if CPU_RESOURCE_ID not in by_id:
@@ -962,6 +972,33 @@ def profile_archive_dir(profile: EncodeProfile) -> Path:
     return Path(profile.archive_dir).expanduser().resolve()
 
 
+def variant_input_dir(profile: EncodeProfile, variant: OutputVariant) -> Path:
+    value = str(getattr(variant, "input_dir", "") or "").strip()
+    return Path(value).expanduser().resolve() if value else profile_input_dir(profile)
+
+
+def variant_output_dir(profile: EncodeProfile, variant: OutputVariant) -> Path:
+    value = str(getattr(variant, "output_dir", "") or "").strip()
+    return Path(value).expanduser().resolve() if value else profile_output_dir(profile)
+
+
+def variant_segment_minutes(profile: EncodeProfile, variant: OutputVariant) -> int:
+    value = getattr(variant, "segment_minutes", None)
+    if value not in (None, ""):
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            pass
+    return max(1, int(getattr(profile, "segment_minutes", 10) or 10))
+
+
+def variant_accepts_source(profile: EncodeProfile, variant: OutputVariant, src: Path) -> bool:
+    try:
+        return src.parent.resolve() == variant_input_dir(profile, variant)
+    except OSError:
+        return False
+
+
 def output_file_stem_for(profile: EncodeProfile, src: Path, variant: OutputVariant) -> str:
     height = "" if variant.height is None else str(variant.height)
     replacements = {
@@ -980,27 +1017,29 @@ def output_file_stem_for(profile: EncodeProfile, src: Path, variant: OutputVaria
 
 def output_path_for(profile: EncodeProfile, src: Path, variant: OutputVariant) -> Path:
     container = normalize_container_extension(variant.container)
-    return profile_output_dir(profile) / variant.folder_name / f"{output_file_stem_for(profile, src, variant)}.{container}"
+    return variant_output_dir(profile, variant) / variant.folder_name / f"{output_file_stem_for(profile, src, variant)}.{container}"
 
 
 def scan_profile_files(profile: EncodeProfile) -> List[FileStatus]:
     if missing_profile_dirs(profile):
         return []
-    input_dir = profile_input_dir(profile)
-    if not input_dir.exists():
-        return []
 
-    items: List[FileStatus] = []
-    for path in sorted(input_dir.iterdir(), key=lambda p: p.name.lower()):
-        if not path.is_file() or path.suffix.lower() not in VIDEO_EXTS:
+    outputs_by_path: Dict[Path, Dict[str, bool]] = {}
+    for variant in profile.outputs:
+        if not variant.enabled:
             continue
-        outputs = {
-            variant.id: output_path_for(profile, path, variant).exists()
-            for variant in profile.outputs
-            if variant.enabled
-        }
-        items.append(FileStatus(path=path, outputs=outputs))
-    return items
+        input_dir = variant_input_dir(profile, variant)
+        if not input_dir.exists():
+            continue
+        for path in sorted(input_dir.iterdir(), key=lambda p: p.name.lower()):
+            if not path.is_file() or path.suffix.lower() not in VIDEO_EXTS:
+                continue
+            outputs = outputs_by_path.setdefault(path.resolve(), {})
+            outputs[variant.id] = output_path_for(profile, path, variant).exists()
+    return [
+        FileStatus(path=path, outputs=outputs)
+        for path, outputs in sorted(outputs_by_path.items(), key=lambda item: str(item[0]).lower())
+    ]
 
 
 def variant_resource_ids(profile: EncodeProfile, variant: OutputVariant) -> List[str]:
@@ -1033,6 +1072,8 @@ def build_job_specs(profile: EncodeProfile, files: Iterable[Path]) -> List[JobSp
         src = Path(src)
         for variant in profile.outputs:
             if not variant.enabled:
+                continue
+            if not variant_accepts_source(profile, variant, src):
                 continue
             if not output_path_for(profile, src, variant).exists():
                 resources = variant_resource_ids(profile, variant)
@@ -1559,7 +1600,9 @@ def job_fingerprint(profile: EncodeProfile, variant: OutputVariant) -> str:
         "variant_height": variant.height,
         "variant_container": variant.container,
         "variant_filename_template": variant.filename_template,
-        "segment_minutes": profile.segment_minutes,
+        "variant_input_dir": str(variant_input_dir(profile, variant)),
+        "variant_output_dir": str(variant_output_dir(profile, variant)),
+        "segment_minutes": variant_segment_minutes(profile, variant),
         "backend": variant.backend,
         "ffmpeg_encoder": encoder_codec(profile, variant),
         "resource_ids": variant_resource_ids(profile, variant),

@@ -47,7 +47,10 @@ from ffmpeg_nvenc_gui.core import (
     segment_dir_for,
     segment_file_name,
     segment_ranges,
+    variant_input_dir,
+    variant_output_dir,
     variant_resource_ids,
+    variant_segment_minutes,
     write_concat_file,
 )
 from ffmpeg_nvenc_gui.app import (
@@ -454,6 +457,7 @@ def test_profile_to_dict_omits_deprecated_profile_defaults(tmp_path: Path):
 
     data = profile_to_dict(profile)
 
+    assert "max_parallel_jobs" not in data
     assert "codec" not in data
     assert "rate_mode" not in data
     assert data["hardware_resources"][1]["concurrency_slots"] == 2
@@ -625,16 +629,54 @@ def test_encode_profile_from_dict_uses_supplied_paths_and_gpus(tmp_path: Path):
     assert synced_gpu_profile.gpu_name == "RTX Test"
 
 
-def test_manual_gpu_resources_do_not_claim_startup_smoke_confirmation():
+def test_hardware_resources_only_include_detected_devices_by_default():
     resources = hardware_resources_from_gpus([])
-    manual_messages = {
-        resource.id: resource.detection_error
-        for resource in resources
-        if resource.backend in {BACKEND_QSV, BACKEND_AMF}
-    }
 
-    assert manual_messages["intel:0"] == "Manual resource; availability is checked before encoding."
-    assert manual_messages["amd:0"] == "Manual resource; availability is checked before encoding."
+    assert [resource.id for resource in resources] == [CPU_RESOURCE_ID]
+
+
+def test_normalize_hardware_resources_keeps_explicit_manual_resource(tmp_path: Path):
+    profile = EncodeProfile.from_dict(
+        {
+            "hardware_resources": [
+                {
+                    "id": "intel:0",
+                    "label": "Intel GPU 0 (manual)",
+                    "kind": "gpu",
+                    "backend": BACKEND_QSV,
+                    "vendor": "intel",
+                    "detection_error": "Manual fallback resource; availability is checked before encoding.",
+                }
+            ],
+            "resource_ids": ["intel:0"],
+        },
+        build_paths(tmp_path),
+        [],
+    )
+
+    assert [resource.id for resource in profile.hardware_resources] == [CPU_RESOURCE_ID, "intel:0"]
+
+
+def test_normalize_hardware_resources_drops_stale_detected_nvidia(tmp_path: Path):
+    profile = EncodeProfile.from_dict(
+        {
+            "hardware_resources": [
+                {
+                    "id": "nvidia:0",
+                    "label": "Old RTX",
+                    "kind": "gpu",
+                    "backend": BACKEND_NVENC,
+                    "vendor": "nvidia",
+                }
+            ],
+            "resource_ids": ["nvidia:0"],
+        },
+        build_paths(tmp_path),
+        [],
+    )
+
+    assert [resource.id for resource in profile.hardware_resources] == [CPU_RESOURCE_ID]
+    assert profile.resource_ids == [CPU_RESOURCE_ID]
 
 
 def test_load_profiles_defaults_missing_fields_from_supplied_paths(tmp_path: Path):
@@ -686,6 +728,47 @@ def test_ensure_profile_dirs_uses_resolved_profile_paths(tmp_path: Path):
     assert (profile_output_dir(profile) / profile.outputs[0].folder_name).exists()
 
 
+def test_output_variant_input_and_output_dirs_fallback_or_override(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+
+    assert variant_input_dir(profile, variant) == profile_input_dir(profile)
+    assert variant_output_dir(profile, variant) == profile_output_dir(profile)
+
+    variant.input_dir = str(tmp_path / "VariantIn")
+    variant.output_dir = str(tmp_path / "VariantOut")
+
+    assert variant_input_dir(profile, variant) == (tmp_path / "VariantIn").resolve()
+    assert variant_output_dir(profile, variant) == (tmp_path / "VariantOut").resolve()
+
+
+def test_scan_and_job_specs_use_variant_input_and_output_dirs(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.outputs[0].input_dir = str(tmp_path / "MasterIn")
+    profile.outputs[0].output_dir = str(tmp_path / "MasterOut")
+    profile.outputs[1].input_dir = str(tmp_path / "ReviewIn")
+    profile.outputs[1].output_dir = str(tmp_path / "ReviewOut")
+    master_src = Path(profile.outputs[0].input_dir) / "master.mkv"
+    review_src = Path(profile.outputs[1].input_dir) / "review.mkv"
+    master_src.parent.mkdir(parents=True)
+    review_src.parent.mkdir(parents=True)
+    master_src.write_bytes(b"master")
+    review_src.write_bytes(b"review")
+
+    files = scan_profile_files(profile)
+    specs = build_job_specs(profile, [item.path for item in files])
+
+    assert {item.path.name: set(item.outputs) for item in files} == {
+        "master.mkv": {"master"},
+        "review.mkv": {"review"},
+    }
+    assert [(Path(spec.src).name, spec.variant_id) for spec in specs] == [
+        ("master.mkv", "master"),
+        ("review.mkv", "review"),
+    ]
+    assert output_path_for(profile, master_src, profile.outputs[0]).is_relative_to((tmp_path / "MasterOut").resolve())
+
+
 def test_format_seconds_carries_rounded_milliseconds():
     assert format_seconds(1.9999) == "00:00:02.000"
     assert format_seconds(3599.9999) == "01:00:00.000"
@@ -714,16 +797,31 @@ def test_segment_dir_includes_profile_and_encode_settings(tmp_path: Path):
     same_variant_other_profile.id = "other-profile"
     edited_settings = make_profile(tmp_path)
     edited_settings.cq_value = profile.cq_value + 1
+    edited_variant_segment = make_profile(tmp_path)
+    edited_variant_segment.outputs[0].segment_minutes = 3
 
     base_dir = segment_dir_for(paths, src, profile, variant)
     other_profile_dir = segment_dir_for(paths, src, same_variant_other_profile, same_variant_other_profile.outputs[0])
     edited_settings_dir = segment_dir_for(paths, src, edited_settings, edited_settings.outputs[0])
+    edited_variant_segment_dir = segment_dir_for(paths, src, edited_variant_segment, edited_variant_segment.outputs[0])
     src.write_bytes(b"second source content")
     replaced_source_dir = segment_dir_for(paths, src, profile, variant)
 
     assert base_dir != other_profile_dir
     assert base_dir != edited_settings_dir
+    assert base_dir != edited_variant_segment_dir
     assert base_dir != replaced_source_dir
+
+
+def test_variant_segment_minutes_falls_back_to_profile_default(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+
+    assert variant_segment_minutes(profile, variant) == profile.segment_minutes
+
+    variant.segment_minutes = 4
+
+    assert variant_segment_minutes(profile, variant) == 4
 
 
 def test_segment_file_name_normalizes_container_and_partial_marker():
@@ -979,7 +1077,7 @@ def test_update_output_encoder_controls_removes_cq_for_qsv():
     app.output_maxrate_entry = Widget()
     app.output_bufsize_entry = Widget()
     app.encoder_capabilities = {}
-    app._encoders_for_backend = lambda backend: ["hevc_qsv"]
+    app._encoders_for_backend = lambda backend, resource_ids=None, verify_nvenc=False: ["hevc_qsv"]
     app.selected_output_resource_ids = lambda: ["intel:0"]
     app.current_profile = lambda: make_profile(Path("unused"))
     app.render_output_resource_controls = lambda *_args: None
@@ -1019,6 +1117,9 @@ def test_set_output_edit_defaults_uses_qsv_backend_and_encoder(tmp_path: Path):
         "output_container_var",
         "output_enabled_var",
         "output_filename_template_var",
+        "output_input_dir_var",
+        "output_output_dir_var",
+        "output_segment_minutes_var",
         "output_backend_var",
         "output_encoder_var",
         "output_split_encode_mode_var",
@@ -1122,6 +1223,7 @@ def test_add_or_update_output_rejects_cq_for_qsv(tmp_path: Path, monkeypatch):
     app.output_folder_var = Value("qsv")
     app.output_container_var = Value("mp4")
     app.output_resolution_var = Value("Original")
+    app.output_segment_minutes_var = Value("")
     app.output_rate_mode_var = Value("CQ")
     app.output_cq_var = Value("22")
     app.cq_var = Value("22")
@@ -1169,6 +1271,9 @@ def test_add_or_update_output_allows_qsv_vbr_with_blank_cq(tmp_path: Path, monke
     app.selected_output_resource_ids = lambda: ["intel:0"]
     app.output_enabled_var = Value(True)
     app.output_filename_template_var = Value("{source}")
+    app.output_input_dir_var = Value("")
+    app.output_output_dir_var = Value("")
+    app.output_segment_minutes_var = Value("")
     app.output_codec_var = Value("hevc_nvenc")
     app.output_cpu_codec_var = Value("libx264")
     app.output_split_encode_mode_var = Value("auto")
@@ -1326,6 +1431,28 @@ def test_validate_encoder_capabilities_allows_disabled_sfe_when_option_exists(tm
     assert smoke_calls == [("hevc_nvenc", "nvidia:0", "disabled")]
 
 
+def test_nvenc_encoder_choices_use_common_resource_support(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    app.paths = build_paths(tmp_path)
+    app.encoder_smoke_cache = {}
+    app.encoder_capabilities = {
+        "h264_nvenc": {"available": True, "supports_split_encode_mode": False, "split_encode_modes": []},
+        "hevc_nvenc": {"available": True, "supports_split_encode_mode": True, "split_encode_modes": ["auto"]},
+        "av1_nvenc": {"available": True, "supports_split_encode_mode": True, "split_encode_modes": ["auto"]},
+    }
+
+    def fake_smoke(_ffmpeg_path, encoder, resource_id="", split_encode_mode="", timeout=30):
+        if encoder == "av1_nvenc" and resource_id == "nvidia:0":
+            return False, "unsupported"
+        return True, ""
+
+    monkeypatch.setattr(app_module, "smoke_test_encoder", fake_smoke)
+
+    encoders = app._encoders_for_backend(BACKEND_NVENC, ["nvidia:0", "nvidia:1"], verify_nvenc=True)
+
+    assert encoders == ["h264_nvenc", "hevc_nvenc"]
+
+
 def test_validate_profile_before_run_rejects_output_without_enabled_resource(tmp_path: Path, monkeypatch):
     app = EncoderApp.__new__(EncoderApp)
     profile = make_profile(tmp_path)
@@ -1399,7 +1526,6 @@ def test_resource_slot_indices_do_not_overlap_after_release(tmp_path: Path):
     app.active_resource_slot_indexes = {}
     app.active_jobs = {}
     profile = make_profile(tmp_path)
-    profile.max_parallel_jobs = 1
 
     def make_job(job_id: int) -> RuntimeJob:
         return RuntimeJob(
@@ -1418,16 +1544,14 @@ def test_resource_slot_indices_do_not_overlap_after_release(tmp_path: Path):
     third = make_job(3)
 
     assert app.reserve_resource_slots(first, {"nvidia:0": 3}) is True
-    assert app.reserve_resource_slots(second, {"nvidia:0": 3}) is True
-    assert first.resource_slot_indexes == [0]
-    assert second.resource_slot_indexes == [1]
+    assert app.reserve_resource_slots(second, {"nvidia:0": 3}) is False
+    assert first.resource_slot_indexes == [0, 1, 2]
 
     app.release_resource_slots(first)
-    assert app.active_resource_slot_indexes == {"nvidia:0": {1}}
+    assert app.active_resource_slot_indexes == {}
 
     assert app.reserve_resource_slots(third, {"nvidia:0": 3}) is True
-    assert third.resource_slot_indexes == [0]
-    assert set(third.resource_slot_indexes).isdisjoint(second.resource_slot_indexes)
+    assert third.resource_slot_indexes == [0, 1, 2]
 
 
 def test_run_process_publishes_process_under_lock_and_honors_stop(tmp_path: Path):

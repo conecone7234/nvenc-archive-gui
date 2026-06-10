@@ -17,9 +17,15 @@ from tkinter.scrolledtext import ScrolledText
 try:
     from ffmpeg_nvenc_gui.core import (
         AppPaths,
+        BACKEND_AMF,
+        BACKEND_CPU,
+        BACKEND_NVENC,
+        BACKEND_QSV,
+        CPU_RESOURCE_ID,
         EncodeProfile,
         FileStatus,
         GpuInfo,
+        HardwareResource,
         JobSpec,
         OutputVariant,
         RESOLUTION_PRESETS,
@@ -35,6 +41,7 @@ try:
         detect_nvidia_gpus,
         duplicate_output_targets,
         duplicate_output_targets_for_outputs,
+        encoder_codec,
         ensure_dirs,
         ensure_profile_dirs,
         load_profiles,
@@ -62,16 +69,30 @@ try:
         segment_ranges,
         temp_audio_path_for,
         temp_output_path_for,
+        resource_backend,
+        resource_index,
         variant_by_id,
+        variant_resource_ids,
         write_concat_file,
     )
-    from ffmpeg_nvenc_gui.ffmpeg_downloader import FfmpegDownloadError, ensure_ffmpeg_available
+    from ffmpeg_nvenc_gui.ffmpeg_downloader import (
+        FfmpegDownloadError,
+        encoder_capabilities,
+        ensure_ffmpeg_available,
+        smoke_test_encoder,
+    )
 except ModuleNotFoundError:
     from core import (  # type: ignore
         AppPaths,
+        BACKEND_AMF,
+        BACKEND_CPU,
+        BACKEND_NVENC,
+        BACKEND_QSV,
+        CPU_RESOURCE_ID,
         EncodeProfile,
         FileStatus,
         GpuInfo,
+        HardwareResource,
         JobSpec,
         OutputVariant,
         RESOLUTION_PRESETS,
@@ -87,6 +108,7 @@ except ModuleNotFoundError:
         detect_nvidia_gpus,
         duplicate_output_targets,
         duplicate_output_targets_for_outputs,
+        encoder_codec,
         ensure_dirs,
         ensure_profile_dirs,
         load_profiles,
@@ -114,10 +136,18 @@ except ModuleNotFoundError:
         segment_ranges,
         temp_audio_path_for,
         temp_output_path_for,
+        resource_backend,
+        resource_index,
         variant_by_id,
+        variant_resource_ids,
         write_concat_file,
     )
-    from ffmpeg_downloader import FfmpegDownloadError, ensure_ffmpeg_available  # type: ignore
+    from ffmpeg_downloader import (  # type: ignore
+        FfmpegDownloadError,
+        encoder_capabilities,
+        ensure_ffmpeg_available,
+        smoke_test_encoder,
+    )
 
 
 PROFILE_DIR_LABELS = {
@@ -171,6 +201,9 @@ class RuntimeJob:
     tmp_out: Path
     out_file: Path
     log_file: Path
+    resource_id: str = ""
+    resource_slot: int = 0
+    resource_slots_reserved: int = 1
     process: Optional[subprocess.Popen] = None
     processes: Dict[int, subprocess.Popen] = field(default_factory=dict)
     status: str = "waiting"
@@ -205,6 +238,8 @@ class EncoderApp:
         self.active_jobs: Dict[int, RuntimeJob] = {}
         self.all_jobs: Dict[int, RuntimeJob] = {}
         self.job_rows: Dict[int, str] = {}
+        self.active_resource_slots: Dict[str, int] = {}
+        self.encoder_capabilities: Dict[str, Dict[str, object]] = {}
 
         self.lock = threading.Lock()
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -515,6 +550,9 @@ class EncoderApp:
         self.bitrate_var = tk.StringVar(value="25000k")
         self.maxrate_var = tk.StringVar(value="40000k")
         self.bufsize_var = tk.StringVar(value="80000k")
+        self.resource_enabled_vars: Dict[str, tk.BooleanVar] = {}
+        self.resource_slot_vars: Dict[str, tk.IntVar] = {}
+        self.output_resource_vars: Dict[str, tk.BooleanVar] = {}
 
         general = self._section(form, "基本設定")
         self._entry_row(general, "設定名", self.profile_name_var)
@@ -523,30 +561,11 @@ class EncoderApp:
         self._path_row(general, "処理済みソース退避先", self.archive_dir_var)
 
         runtime = self._section(form, "実行設定")
-        self.gpu_combo = self._combo_row(runtime, "処理デバイス", self.gpu_choice_var, self._gpu_choices())
-        self.gpu_combo.bind("<<ComboboxSelected>>", self.on_device_changed)
+        ttk.Label(runtime, text="Processing resources", style="Surface.TLabel").pack(anchor=tk.W)
+        self.resource_frame = ttk.Frame(runtime, style="Surface.TFrame")
+        self.resource_frame.pack(fill=tk.X, pady=(4, 8))
         self._spin_row(runtime, "並列セグメント数", self.max_jobs_var, 1, 8)
         self._spin_row(runtime, "分割間隔(分)", self.segment_minutes_var, 1, 120)
-
-        encoder = self._section(form, "エンコード既定値")
-        self.gpu_settings_frame = ttk.Frame(encoder, style="Surface.TFrame")
-        self.cpu_settings_frame = ttk.Frame(encoder, style="Surface.TFrame")
-        self.gpu_codec_combo = self._combo_row(self.gpu_settings_frame, "GPU Codec", self.codec_var, GPU_CODECS, width=18)
-        self.gpu_preset_combo = self._combo_row(self.gpu_settings_frame, "NVENC Preset", self.preset_var, GPU_PRESETS, width=12)
-        self.gpu_tune_combo = self._combo_row(self.gpu_settings_frame, "NVENC Tune", self.tune_var, GPU_TUNES, width=16)
-        self.cpu_codec_combo = self._combo_row(self.cpu_settings_frame, "CPU Codec", self.cpu_codec_var, CPU_CODECS, width=18)
-        self.cpu_codec_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_cpu_tune_choices())
-        self.cpu_preset_combo = self._combo_row(self.cpu_settings_frame, "CPU Preset", self.cpu_preset_var, CPU_PRESETS, width=18)
-        self.cpu_tune_combo = self._combo_row(self.cpu_settings_frame, "CPU Tune", self.cpu_tune_var, CPU_TUNES_BY_CODEC["libx264"], width=18)
-
-        self.rate_frame = ttk.Frame(encoder, style="Surface.TFrame")
-        self.rate_frame.pack(fill=tk.X, pady=(8, 0))
-        self.rate_combo = self._combo_row(self.rate_frame, "品質/レート制御", self.rate_mode_var, RATE_MODES, width=12)
-        self.rate_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_rate_controls())
-        self.cq_label, self.cq_entry = self._labeled_rate_entry(self.rate_frame, "CQ", self.cq_var)
-        self.bitrate_label, self.bitrate_entry = self._labeled_rate_entry(self.rate_frame, "Bitrate", self.bitrate_var)
-        self.maxrate_label, self.maxrate_entry = self._labeled_rate_entry(self.rate_frame, "Maxrate", self.maxrate_var)
-        self.bufsize_label, self.bufsize_entry = self._labeled_rate_entry(self.rate_frame, "Bufsize", self.bufsize_var)
 
         outputs = self._surface(tab)
         outputs.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
@@ -559,7 +578,7 @@ class EncoderApp:
         output_body.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
         tree_frame = ttk.Frame(output_body, style="Surface.TFrame")
         tree_frame.pack(fill=tk.BOTH, expand=True)
-        columns = ("enabled", "name", "resolution", "folder", "container")
+        columns = ("enabled", "name", "backend", "encoder", "resolution", "folder", "container")
         self.outputs_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=7)
         for key, text, width in [
             ("enabled", "有効", 60),
@@ -568,6 +587,9 @@ class EncoderApp:
             ("folder", "フォルダ名", 190),
             ("container", "コンテナ", 90),
         ]:
+            self.outputs_tree.heading(key, text=text)
+            self.outputs_tree.column(key, width=width, anchor=tk.W)
+        for key, text, width in [("backend", "Backend", 90), ("encoder", "Encoder", 120)]:
             self.outputs_tree.heading(key, text=text)
             self.outputs_tree.column(key, width=width, anchor=tk.W)
         self.outputs_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -587,6 +609,9 @@ class EncoderApp:
         self.output_container_var = tk.StringVar(value="mp4")
         self.output_enabled_var = tk.BooleanVar(value=True)
         self.output_filename_template_var = tk.StringVar(value="{source}")
+        self.output_backend_var = tk.StringVar(value=BACKEND_NVENC if self.gpus else BACKEND_CPU)
+        self.output_encoder_var = tk.StringVar(value="hevc_nvenc" if self.gpus else "libx264")
+        self.output_split_encode_mode_var = tk.StringVar(value="auto")
         self.output_gpu_choice_var = tk.StringVar(value=CPU_DEVICE_LABEL)
         self.output_codec_var = tk.StringVar(value="hevc_nvenc")
         self.output_cpu_codec_var = tk.StringVar(value="libx264")
@@ -678,40 +703,42 @@ class EncoderApp:
             state="normal",
         )
         self.output_container_combo.grid(row=3, column=1, sticky="ew", pady=4)
-        self.output_gpu_combo = grid_combo("処理デバイス", self.output_gpu_choice_var, self._gpu_choices(), 3, 1, width=26)
-        grid_combo("NVENC Codec", self.output_codec_var, GPU_CODECS, 4, 0)
-        grid_combo("NVENC Preset", self.output_preset_var, GPU_PRESETS, 4, 1)
-        grid_combo("NVENC Tune", self.output_tune_var, GPU_TUNES, 5, 0)
-        self.output_rate_combo = grid_combo("Rate", self.output_rate_mode_var, RATE_MODES, 5, 1)
+        self.output_backend_combo = grid_combo("Backend", self.output_backend_var, [BACKEND_CPU, BACKEND_NVENC, BACKEND_QSV, BACKEND_AMF], 3, 1, width=14)
+        self.output_backend_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_encoder_controls())
+        self.output_encoder_combo = grid_combo("Encoder", self.output_encoder_var, self._encoders_for_backend(self.output_backend_var.get()), 4, 0, width=18)
+        self.output_encoder_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_encoder_controls())
+        self.output_preset_combo = grid_combo("NVENC Preset", self.output_preset_var, GPU_PRESETS, 4, 1)
+        self.output_tune_combo = grid_combo("NVENC Tune", self.output_tune_var, GPU_TUNES, 5, 0)
+        self.output_split_combo = grid_combo("SFE", self.output_split_encode_mode_var, ["auto"], 5, 1, width=18)
+        self.output_rate_combo = grid_combo("Rate", self.output_rate_mode_var, RATE_MODES, 6, 0)
         self.output_rate_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_rate_controls())
-        self.output_cpu_codec_combo = grid_combo("CPU Codec", self.output_cpu_codec_var, CPU_CODECS, 6, 0)
+        self.output_cpu_codec_combo = grid_combo("CPU Codec", self.output_cpu_codec_var, CPU_CODECS, 6, 1)
         self.output_cpu_codec_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_cpu_tune_choices())
-        grid_combo("CPU Preset", self.output_cpu_preset_var, CPU_PRESETS, 6, 1)
-        self.output_cpu_tune_combo = grid_combo("CPU Tune", self.output_cpu_tune_var, CPU_TUNES_BY_CODEC["libx264"], 7, 0)
-        self.output_cq_entry = grid_entry("CQ/CRF", self.output_cq_var, 7, 1)
-        self.output_bitrate_entry = grid_entry("Bitrate", self.output_bitrate_var, 8, 0)
-        self.output_maxrate_entry = grid_entry("Maxrate", self.output_maxrate_var, 8, 1)
-        self.output_bufsize_entry = grid_entry("Bufsize", self.output_bufsize_var, 9, 0)
-        grid_entry("Pix fmt", self.output_pix_fmt_var, 9, 1)
-        grid_entry("Scale flags", self.output_scale_flags_var, 10, 0)
-        grid_entry("Audio codec", self.output_audio_codec_var, 10, 1)
-        grid_entry("Audio bitrate", self.output_audio_bitrate_var, 11, 0)
-        grid_entry("Audio container", self.output_audio_container_var, 11, 1)
-        grid_entry("FFmpeg input args", self.output_extra_input_args_var, 12, 0)
-        grid_entry("FFmpeg video args", self.output_extra_video_args_var, 12, 1)
-        grid_entry("FFmpeg audio args", self.output_extra_audio_args_var, 13, 0)
-        grid_entry("FFmpeg output args", self.output_extra_output_args_var, 13, 1)
-        grid_entry("FFmpeg concat args", self.output_extra_concat_args_var, 14, 0)
-        grid_entry("FFmpeg mux args", self.output_extra_mux_args_var, 14, 1)
+        self.output_cpu_preset_combo = grid_combo("CPU Preset", self.output_cpu_preset_var, CPU_PRESETS, 7, 0)
+        self.output_cpu_tune_combo = grid_combo("CPU Tune", self.output_cpu_tune_var, CPU_TUNES_BY_CODEC["libx264"], 7, 1)
+        ttk.Label(edit, text="Resources", style="Surface.TLabel").grid(row=8, column=0, sticky=tk.W, pady=4, padx=(0, 8))
+        self.output_resource_frame = ttk.Frame(edit, style="Surface.TFrame")
+        self.output_resource_frame.grid(row=8, column=1, columnspan=3, sticky="ew", pady=4)
+        self.output_cq_entry = grid_entry("CQ/CRF", self.output_cq_var, 9, 0)
+        self.output_bitrate_entry = grid_entry("Bitrate", self.output_bitrate_var, 9, 1)
+        self.output_maxrate_entry = grid_entry("Maxrate", self.output_maxrate_var, 10, 0)
+        self.output_bufsize_entry = grid_entry("Bufsize", self.output_bufsize_var, 10, 1)
+        grid_entry("Pix fmt", self.output_pix_fmt_var, 11, 0)
+        grid_entry("Scale flags", self.output_scale_flags_var, 11, 1)
+        grid_entry("Audio codec", self.output_audio_codec_var, 12, 0)
+        grid_entry("Audio bitrate", self.output_audio_bitrate_var, 12, 1)
+        grid_entry("Audio container", self.output_audio_container_var, 13, 0)
+        grid_entry("FFmpeg input args", self.output_extra_input_args_var, 13, 1)
+        grid_entry("FFmpeg video args", self.output_extra_video_args_var, 14, 0)
+        grid_entry("FFmpeg audio args", self.output_extra_audio_args_var, 14, 1)
+        grid_entry("FFmpeg output args", self.output_extra_output_args_var, 15, 0)
+        grid_entry("FFmpeg concat args", self.output_extra_concat_args_var, 15, 1)
+        grid_entry("FFmpeg mux args", self.output_extra_mux_args_var, 16, 0)
 
         buttons = ttk.Frame(edit, style="Surface.TFrame")
-        buttons.grid(row=15, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        buttons.grid(row=17, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         ttk.Button(buttons, text="追加/更新", style="Accent.TButton", command=self.add_or_update_output).pack(side=tk.RIGHT, padx=(8, 0))
         ttk.Button(buttons, text="削除", command=self.remove_output).pack(side=tk.RIGHT)
-
-        footer = ttk.Frame(tab, style="App.TFrame")
-        footer.pack(fill=tk.X, pady=(12, 0))
-        ttk.Button(footer, text="FFmpegを確認/導入", command=self.download_ffmpeg_button).pack(side=tk.RIGHT)
 
         self.update_cpu_tune_choices()
         self.update_output_cpu_tune_choices()
@@ -719,6 +746,7 @@ class EncoderApp:
         self.update_rate_controls()
         self.update_output_rate_controls()
         self.update_resolution_controls()
+        self.update_output_encoder_controls()
 
     def _labeled_rate_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar) -> tuple[ttk.Label, ttk.Entry]:
         row = self._row(parent)
@@ -752,10 +780,6 @@ class EncoderApp:
     def refresh_profile_choices(self) -> None:
         values = self._profile_labels()
         self.profile_combo.configure(values=values)
-        gpu_choices = self._gpu_choices()
-        self.gpu_combo.configure(values=gpu_choices)
-        if hasattr(self, "output_gpu_combo"):
-            self.output_gpu_combo.configure(values=gpu_choices)
 
         profile_ids = [profile.id for profile in self.profiles]
         if self.active_profile_id not in profile_ids:
@@ -773,6 +797,166 @@ class EncoderApp:
         choices = [CPU_DEVICE_LABEL]
         choices.extend([f"{GPU_DEVICE_PREFIX}{gpu.index}: {gpu.name}" for gpu in self.gpus])
         return choices
+
+    def render_resource_controls(self, profile: EncodeProfile) -> None:
+        if not hasattr(self, "resource_frame"):
+            return
+        for child in self.resource_frame.winfo_children():
+            child.destroy()
+        self.resource_enabled_vars = {}
+        self.resource_slot_vars = {}
+        selected = set(profile.resource_ids or [CPU_RESOURCE_ID])
+        for row, resource in enumerate(profile.hardware_resources):
+            enabled_var = tk.BooleanVar(value=resource.id in selected)
+            slot_var = tk.IntVar(value=max(1, resource.concurrency_slots))
+            self.resource_enabled_vars[resource.id] = enabled_var
+            self.resource_slot_vars[resource.id] = slot_var
+            ttk.Checkbutton(
+                self.resource_frame,
+                text=f"{resource.label} ({resource.backend})",
+                variable=enabled_var,
+                command=self.update_output_encoder_controls,
+            ).grid(row=row, column=0, sticky=tk.W, pady=2)
+            ttk.Label(self.resource_frame, text="slots", style="Surface.TLabel").grid(row=row, column=1, sticky=tk.W, padx=(16, 4))
+            ttk.Spinbox(self.resource_frame, from_=1, to=16, textvariable=slot_var, width=5).grid(row=row, column=2, sticky=tk.W, pady=2)
+            if resource.detected_encoder_engines:
+                detail = f"detected NVENC: {resource.detected_encoder_engines}"
+            elif resource.detection_error:
+                detail = "manual fallback"
+            else:
+                detail = ""
+            if detail:
+                ttk.Label(self.resource_frame, text=detail, style="Muted.TLabel").grid(row=row, column=3, sticky=tk.W, padx=(10, 0))
+        self.update_output_encoder_controls()
+
+    def collect_hardware_resources_from_form(self, current: EncodeProfile) -> List[HardwareResource]:
+        resources: List[HardwareResource] = []
+        for resource in current.hardware_resources:
+            slots_var = self.resource_slot_vars.get(resource.id)
+            slots = slots_var.get() if slots_var is not None else resource.concurrency_slots
+            resources.append(
+                HardwareResource(
+                    id=resource.id,
+                    label=resource.label,
+                    kind=resource.kind,
+                    backend=resource.backend,
+                    vendor=resource.vendor,
+                    index=resource.index,
+                    concurrency_slots=slots,
+                    detected_encoder_engines=resource.detected_encoder_engines,
+                    detection_error=resource.detection_error,
+                )
+            )
+        return resources
+
+    def selected_profile_resource_ids(self) -> List[str]:
+        selected = [
+            resource_id
+            for resource_id, var in self.resource_enabled_vars.items()
+            if var.get()
+        ]
+        return selected or [CPU_RESOURCE_ID]
+
+    def _encoders_for_backend(self, backend: str) -> List[str]:
+        backend = backend or BACKEND_CPU
+        if self.encoder_capabilities:
+            encoders = [
+                name
+                for name in self.encoder_capabilities
+                if (
+                    (backend == BACKEND_CPU and name in CPU_CODECS)
+                    or (backend == BACKEND_NVENC and name.endswith("_nvenc"))
+                    or (backend == BACKEND_QSV and name.endswith("_qsv"))
+                    or (backend == BACKEND_AMF and name.endswith("_amf"))
+                )
+            ]
+            if encoders:
+                return sorted(encoders)
+        if backend == BACKEND_NVENC:
+            return GPU_CODECS
+        if backend == BACKEND_QSV:
+            return ["h264_qsv", "hevc_qsv", "av1_qsv"]
+        if backend == BACKEND_AMF:
+            return ["h264_amf", "hevc_amf", "av1_amf"]
+        return CPU_CODECS
+
+    def selected_output_resource_ids(self) -> List[str]:
+        selected = [
+            resource_id
+            for resource_id, var in self.output_resource_vars.items()
+            if var.get()
+        ]
+        return selected
+
+    def render_output_resource_controls(self, profile: EncodeProfile, backend: str, selected: List[str]) -> None:
+        if not hasattr(self, "output_resource_frame"):
+            return
+        for child in self.output_resource_frame.winfo_children():
+            child.destroy()
+        self.output_resource_vars = {}
+        active_profile_resources = set(self.selected_profile_resource_ids())
+        allowed = [
+            resource
+            for resource in profile.hardware_resources
+            if resource.id in active_profile_resources and resource_backend(resource.id) == backend
+        ]
+        if not selected:
+            selected = [resource.id for resource in allowed[:1]]
+        for index, resource in enumerate(allowed):
+            var = tk.BooleanVar(value=resource.id in selected)
+            self.output_resource_vars[resource.id] = var
+            ttk.Checkbutton(
+                self.output_resource_frame,
+                text=resource.label,
+                variable=var,
+            ).grid(row=0, column=index, sticky=tk.W, padx=(0 if index == 0 else 12, 0))
+        if not allowed:
+            ttk.Label(self.output_resource_frame, text="No compatible resource enabled", style="Muted.TLabel").grid(row=0, column=0, sticky=tk.W)
+
+    def update_output_encoder_controls(self) -> None:
+        if not hasattr(self, "output_encoder_combo"):
+            return
+        backend = self.output_backend_var.get() or BACKEND_CPU
+        encoders = self._encoders_for_backend(backend)
+        self.output_encoder_combo.configure(values=encoders)
+        if self.output_encoder_var.get() not in encoders:
+            self.output_encoder_var.set(encoders[0] if encoders else "")
+
+        encoder = self.output_encoder_var.get()
+        self.output_codec_var.set(encoder if backend == BACKEND_NVENC else self.output_codec_var.get())
+        self.output_cpu_codec_var.set(encoder if backend == BACKEND_CPU else self.output_cpu_codec_var.get())
+
+        nvenc_state = tk.NORMAL if backend == BACKEND_NVENC else tk.DISABLED
+        cpu_state = tk.NORMAL if backend == BACKEND_CPU else tk.DISABLED
+        for widget in (getattr(self, "output_preset_combo", None), getattr(self, "output_tune_combo", None)):
+            if widget is not None:
+                widget.configure(state=nvenc_state)
+        for widget in (
+            getattr(self, "output_cpu_codec_combo", None),
+            getattr(self, "output_cpu_preset_combo", None),
+            getattr(self, "output_cpu_tune_combo", None),
+        ):
+            if widget is not None:
+                widget.configure(state=cpu_state)
+
+        split_modes = ["auto"]
+        caps = self.encoder_capabilities.get(encoder, {})
+        detected_modes = caps.get("split_encode_modes", [])
+        if isinstance(detected_modes, list) and detected_modes:
+            split_modes = [str(item) for item in detected_modes]
+        supports_split = bool(caps.get("supports_split_encode_mode"))
+        if backend == BACKEND_NVENC and encoder in {"hevc_nvenc", "av1_nvenc"} and supports_split:
+            if "disabled" not in split_modes:
+                split_modes.append("disabled")
+            self.output_split_combo.configure(values=split_modes, state=tk.NORMAL)
+        else:
+            self.output_split_encode_mode_var.set("auto")
+            self.output_split_combo.configure(values=["auto"], state=tk.DISABLED)
+        if self.output_split_encode_mode_var.get() not in split_modes:
+            self.output_split_encode_mode_var.set(split_modes[0])
+
+        selected = self.selected_output_resource_ids()
+        self.render_output_resource_controls(self.current_profile(), backend, selected)
 
     def profile_index_by_id(self, profile_id: Optional[str]) -> Optional[int]:
         if profile_id is None:
@@ -826,6 +1010,7 @@ class EncoderApp:
         self.archive_dir_var.set(profile.archive_dir)
         self.max_jobs_var.set(profile.max_parallel_jobs)
         self.segment_minutes_var.set(profile.segment_minutes)
+        self.render_resource_controls(profile)
         self.gpu_choice_var.set(self._choice_for_profile_gpu(profile))
         self.codec_var.set(profile.codec)
         self.cpu_codec_var.set(profile.cpu_codec)
@@ -847,6 +1032,7 @@ class EncoderApp:
         self.update_encoder_controls(apply_defaults=False)
         self.update_rate_controls()
         self.update_resolution_controls()
+        self.update_output_encoder_controls()
 
     def _choice_for_profile_gpu(self, profile: EncodeProfile) -> str:
         if not profile.use_gpu:
@@ -889,6 +1075,10 @@ class EncoderApp:
         self.output_container_var.set("mp4")
         self.output_enabled_var.set(True)
         self.output_filename_template_var.set("{source}")
+        default_backend = BACKEND_NVENC if any(resource_backend(item) == BACKEND_NVENC for item in profile.resource_ids) else BACKEND_CPU
+        self.output_backend_var.set(default_backend)
+        self.output_encoder_var.set("hevc_nvenc" if default_backend == BACKEND_NVENC else "libx264")
+        self.output_split_encode_mode_var.set("auto")
         self.output_gpu_choice_var.set(self._choice_for_profile_gpu(profile))
         self.output_codec_var.set(profile.codec)
         self.output_cpu_codec_var.set(profile.cpu_codec)
@@ -915,6 +1105,8 @@ class EncoderApp:
         self.update_output_cpu_tune_choices()
         self.update_output_rate_controls()
         self.update_resolution_controls()
+        self.render_output_resource_controls(profile, default_backend, [])
+        self.update_output_encoder_controls()
 
     def on_device_changed(self, _event: object = None) -> None:
         use_gpu, _gpu_index, _gpu_name = self._parse_gpu_choice()
@@ -994,6 +1186,8 @@ class EncoderApp:
         return self.current_profile().cq_value
 
     def update_rate_controls(self) -> None:
+        if not hasattr(self, "cq_entry"):
+            return
         mode = self.rate_mode_var.get().upper()
         controls = {
             self.cq_entry: mode in {"CQ", "VBR"},
@@ -1066,7 +1260,19 @@ class EncoderApp:
             messagebox.showerror("入力エラー", "入力先、出力先、処理済みソース退避先を入力してください。")
             return None
 
-        use_gpu, gpu_index, gpu_name = self._parse_gpu_choice()
+        hardware_resources = self.collect_hardware_resources_from_form(current)
+        profile_resource_ids = self.selected_profile_resource_ids()
+        if not profile_resource_ids:
+            messagebox.showerror("入力エラー", "処理リソースを1つ以上有効にしてください。")
+            return None
+        use_gpu = any(resource_backend(resource_id) != BACKEND_CPU for resource_id in profile_resource_ids)
+        first_gpu = next((resource_id for resource_id in profile_resource_ids if resource_backend(resource_id) == BACKEND_NVENC), "")
+        gpu_index = resource_index(first_gpu) if first_gpu else 0
+        gpu_name = ""
+        for resource in hardware_resources:
+            if resource.id == first_gpu:
+                gpu_name = resource.label
+                break
         profile = EncodeProfile(
             id=current.id,
             name=self.profile_name_var.get().strip() or current.name,
@@ -1089,11 +1295,19 @@ class EncoderApp:
             bitrate=self.bitrate_var.get().strip(),
             maxrate=self.maxrate_var.get().strip(),
             bufsize=self.bufsize_var.get().strip(),
+            resource_ids=profile_resource_ids,
+            hardware_resources=hardware_resources,
             outputs=[OutputVariant.from_dict(asdict(item)) for item in self.editing_outputs],
         )
         for variant in profile.outputs:
             if not variant.enabled:
                 continue
+            if not variant_resource_ids(profile, variant):
+                messagebox.showerror("入力エラー", f"{variant.name}: 使用可能なリソースを選択してください。")
+                return None
+            if any(resource_backend(resource_id) != variant.backend for resource_id in variant_resource_ids(profile, variant)):
+                messagebox.showerror("入力エラー", f"{variant.name}: backendの異なるリソースは混在できません。")
+                return None
             missing = missing_rate_fields(profile, variant)
             if missing:
                 labels = ", ".join(missing)
@@ -1156,11 +1370,25 @@ class EncoderApp:
         self.outputs_tree.delete(*self.outputs_tree.get_children())
         for variant in self.editing_outputs:
             resolution = "Original" if variant.height is None else f"{variant.height}p"
+            backend = variant.backend or (BACKEND_NVENC if variant.use_gpu else BACKEND_CPU)
+            encoder = variant.ffmpeg_encoder or variant.codec or variant.cpu_codec
             self.outputs_tree.insert(
                 "",
                 tk.END,
                 iid=variant.id,
                 values=("有効" if variant.enabled else "無効", variant.name, resolution, variant.folder_name, variant.container),
+            )
+            self.outputs_tree.item(
+                variant.id,
+                values=(
+                    "有効" if variant.enabled else "無効",
+                    variant.name,
+                    backend,
+                    encoder,
+                    resolution,
+                    variant.folder_name,
+                    variant.container,
+                ),
             )
 
     def on_output_select(self, _event: object = None) -> None:
@@ -1186,6 +1414,9 @@ class EncoderApp:
                     self.output_custom_height_var.set(str(variant.height))
                 self.output_container_var.set(variant.container)
                 self.output_filename_template_var.set(variant.filename_template or "{source}")
+                self.output_backend_var.set(variant.backend or (BACKEND_NVENC if variant.use_gpu else BACKEND_CPU))
+                self.output_encoder_var.set(variant.ffmpeg_encoder or variant.codec or variant.cpu_codec)
+                self.output_split_encode_mode_var.set(variant.split_encode_mode or "auto")
                 self.output_gpu_choice_var.set(self._choice_for_variant_gpu(profile, variant))
                 self.output_codec_var.set(variant.codec or profile.codec)
                 self.output_cpu_codec_var.set(variant.cpu_codec or profile.cpu_codec)
@@ -1212,6 +1443,8 @@ class EncoderApp:
                 self.update_output_cpu_tune_choices()
                 self.update_output_rate_controls()
                 self.update_resolution_controls()
+                self.render_output_resource_controls(profile, self.output_backend_var.get(), variant.resource_ids)
+                self.update_output_encoder_controls()
                 return
 
     def clear_output_selection(self) -> None:
@@ -1249,7 +1482,26 @@ class EncoderApp:
         if cq_value is None:
             messagebox.showerror("入力エラー", "CQ/CRF は数値で入力してください。")
             return
-        use_gpu, gpu_index, gpu_name = self._parse_output_gpu_choice()
+        backend = self.output_backend_var.get() or BACKEND_CPU
+        encoder = self.output_encoder_var.get().strip()
+        resource_ids = self.selected_output_resource_ids()
+        if not encoder:
+            messagebox.showerror("入力エラー", "Encoder を選択してください。")
+            return
+        if not resource_ids:
+            messagebox.showerror("入力エラー", "このエンコードセットで使うリソースを1つ以上選択してください。")
+            return
+        if any(resource_backend(resource_id) != backend for resource_id in resource_ids):
+            messagebox.showerror("入力エラー", "1つのエンコードセット内で異なるbackendのリソースは混在できません。")
+            return
+        use_gpu = backend != BACKEND_CPU
+        gpu_index = resource_index(resource_ids[0]) if use_gpu else 0
+        gpu_name = ""
+        if use_gpu:
+            for resource in self.current_profile().hardware_resources:
+                if resource.id == resource_ids[0]:
+                    gpu_name = resource.label
+                    break
         variant = OutputVariant(
             id=self.selected_output_id or new_id("variant"),
             name=name,
@@ -1261,8 +1513,12 @@ class EncoderApp:
             use_gpu=use_gpu,
             gpu_index=gpu_index,
             gpu_name=gpu_name,
-            codec=self.output_codec_var.get(),
-            cpu_codec=self.output_cpu_codec_var.get(),
+            codec=encoder if backend == BACKEND_NVENC else self.output_codec_var.get(),
+            cpu_codec=encoder if backend == BACKEND_CPU else self.output_cpu_codec_var.get(),
+            backend=backend,
+            ffmpeg_encoder=encoder,
+            resource_ids=resource_ids,
+            split_encode_mode=self.output_split_encode_mode_var.get(),
             preset=self.output_preset_var.get(),
             cpu_preset=self.output_cpu_preset_var.get(),
             cpu_tune=self.output_cpu_tune_var.get(),
@@ -1358,7 +1614,9 @@ class EncoderApp:
             if not row_id or not self.progress_tree.exists(row_id):
                 continue
             file_name = Path(job.spec.src).name
-            detail = job.message or f"{job.completed_segments}/{job.total_segments} segments"
+            resource_detail = f"{job.resource_id} slot {job.resource_slot + 1}" if job.resource_id else ""
+            message = job.message or f"{job.completed_segments}/{job.total_segments} segments"
+            detail = f"{resource_detail} / {message}" if resource_detail else message
             self.progress_tree.item(
                 row_id,
                 values=(file_name, job.variant.name, job.status, f"{job.progress:.0f}%  {detail}"),
@@ -1426,16 +1684,36 @@ class EncoderApp:
     def _download_ffmpeg_worker(self) -> None:
         try:
             ensure_ffmpeg_available(self.paths, auto_download=True, progress=self.log)
+            self.refresh_encoder_capabilities(show_errors=False)
             self.log("FFmpeg / FFprobe is ready.")
         except Exception as exc:
             self.log(f"FFmpeg install failed: {exc}")
             self.root.after(0, lambda: messagebox.showerror("FFmpeg install failed", str(exc)))
 
+    def refresh_encoder_capabilities(self, show_errors: bool = True) -> bool:
+        try:
+            self.encoder_capabilities = encoder_capabilities(self.paths.ffmpeg_path)
+        except Exception as exc:
+            self.encoder_capabilities = {}
+            self.log(f"FFmpeg capability scan failed: {exc}")
+            if show_errors:
+                messagebox.showerror("FFmpeg error", f"FFmpeg encoder capability scan failed.\n{exc}")
+            return False
+
+        count = len(self.encoder_capabilities)
+        if count:
+            self.log(f"FFmpeg encoder capabilities loaded: {count} encoder(s).")
+        else:
+            self.log("FFmpeg encoder capability scan returned no encoders.")
+        if hasattr(self, "root"):
+            self.root.after(0, self.update_output_encoder_controls)
+        return True
+
     def ensure_ffmpeg_before_run(self) -> bool:
         if self.paths.ffmpeg_path.exists() and self.paths.ffprobe_path.exists():
             try:
                 ensure_ffmpeg_available(self.paths, auto_download=False, progress=self.log)
-                return True
+                return self.refresh_encoder_capabilities()
             except Exception as exc:
                 messagebox.showerror("FFmpeg error", str(exc))
                 return False
@@ -1447,7 +1725,7 @@ class EncoderApp:
         try:
             ensure_ffmpeg_available(self.paths, auto_download=True, progress=self.log)
             self.log("FFmpeg / FFprobe is ready.")
-            return True
+            return self.refresh_encoder_capabilities()
         except FfmpegDownloadError as exc:
             messagebox.showerror("FFmpeg install failed", str(exc))
             return False
@@ -1475,6 +1753,64 @@ class EncoderApp:
         if duplicates:
             messagebox.showerror("入力エラー", f"同じ出力先が重複しています: {', '.join(duplicates)}")
             return False
+        return True
+
+    def validate_encoder_capabilities_before_run(self, profile: EncodeProfile, specs: List[JobSpec]) -> bool:
+        if not self.encoder_capabilities and not self.refresh_encoder_capabilities():
+            return False
+        if not self.encoder_capabilities:
+            messagebox.showerror("FFmpeg error", "FFmpeg encoder list could not be read.")
+            return False
+
+        smoke_targets: Dict[tuple[str, str, str], str] = {}
+        for spec in specs:
+            try:
+                variant = variant_by_id(profile, spec.variant_id)
+            except ValueError:
+                continue
+            encoder = encoder_codec(profile, variant)
+            if encoder not in self.encoder_capabilities:
+                messagebox.showerror("FFmpeg error", f"{variant.name}: FFmpeg encoder is not available: {encoder}")
+                return False
+
+            resource_ids = variant_resource_ids(profile, variant)
+            resource_id = spec.assigned_resource_id if spec.assigned_resource_id in resource_ids else (resource_ids[0] if resource_ids else "")
+            split_mode = str(variant.split_encode_mode or "").strip().lower()
+            caps = self.encoder_capabilities.get(encoder, {})
+            supports_split = bool(caps.get("supports_split_encode_mode"))
+            split_modes = [str(item) for item in caps.get("split_encode_modes", []) if item]
+            if split_mode and split_mode not in {"auto", "default"}:
+                if not supports_split:
+                    messagebox.showerror(
+                        "FFmpeg error",
+                        f"{variant.name}: {encoder} does not expose -split_encode_mode in this FFmpeg build.",
+                    )
+                    return False
+                if split_modes and split_mode not in split_modes:
+                    messagebox.showerror(
+                        "FFmpeg error",
+                        f"{variant.name}: split_encode_mode={split_mode} is not exposed by this FFmpeg build.",
+                    )
+                    return False
+
+            smoke_targets[(encoder, resource_id, split_mode)] = variant.name
+
+        for (encoder, resource_id, split_mode), variant_name in smoke_targets.items():
+            self.log(f"Smoke test: {encoder} on {resource_id or 'default'}")
+            ok, detail = smoke_test_encoder(
+                self.paths.ffmpeg_path,
+                encoder,
+                resource_id=resource_id,
+                split_encode_mode=split_mode,
+                timeout=30,
+            )
+            if not ok:
+                messagebox.showerror(
+                    "FFmpeg error",
+                    f"{variant_name}: encoder smoke test failed for {encoder} on {resource_id or 'default'}.\n{detail}",
+                )
+                self.log(f"Smoke test failed: {encoder} / {resource_id or 'default'} / {detail}")
+                return False
         return True
 
     def ensure_profile_dirs_or_show_error(self, profile: EncodeProfile) -> bool:
@@ -1518,6 +1854,8 @@ class EncoderApp:
 
         if not self.ensure_ffmpeg_before_run():
             return
+        if not self.validate_encoder_capabilities_before_run(profile, specs):
+            return
 
         self.start_specs(profile, specs, save=True)
 
@@ -1541,10 +1879,24 @@ class EncoderApp:
 
         if not self.ensure_ffmpeg_before_run():
             return
+        if not self.validate_encoder_capabilities_before_run(profile, specs):
+            return
 
         self.start_specs(profile, specs, save=True)
 
+    def assign_resources_to_specs(self, profile: EncodeProfile, specs: List[JobSpec]) -> List[JobSpec]:
+        for spec in specs:
+            try:
+                variant = variant_by_id(profile, spec.variant_id)
+            except ValueError:
+                continue
+            resource_ids = variant_resource_ids(profile, variant)
+            if spec.assigned_resource_id not in resource_ids:
+                spec.assigned_resource_id = resource_ids[0] if resource_ids else CPU_RESOURCE_ID
+        return specs
+
     def start_specs(self, profile: EncodeProfile, specs: List[JobSpec], save: bool) -> None:
+        specs = self.assign_resources_to_specs(profile, specs)
         with self.lock:
             if self.running:
                 messagebox.showwarning("実行中", "すでにジョブが実行中です。")
@@ -1555,6 +1907,7 @@ class EncoderApp:
             self.active_jobs.clear()
             self.all_jobs.clear()
             self.job_rows.clear()
+            self.active_resource_slots.clear()
             while not self.pending_jobs.empty():
                 try:
                     self.pending_jobs.get_nowait()
@@ -1583,6 +1936,9 @@ class EncoderApp:
         self.job_counter += 1
         src = Path(spec.src)
         variant = variant_by_id(profile, spec.variant_id)
+        resource_ids = variant_resource_ids(profile, variant)
+        resource_id = spec.assigned_resource_id if spec.assigned_resource_id in resource_ids else (resource_ids[0] if resource_ids else "")
+        spec.assigned_resource_id = resource_id
         tmp_out = temp_output_path_for(self.paths, src, profile, variant)
         out_file = output_path_for(profile, src, variant)
         log_file = self.paths.log_dir / f"job_{self.job_counter}_{variant.folder_name}.log"
@@ -1594,7 +1950,68 @@ class EncoderApp:
             tmp_out=tmp_out,
             out_file=out_file,
             log_file=log_file,
+            resource_id=resource_id,
         )
+
+    def resource_slot_limits(self, profile: EncodeProfile) -> Dict[str, int]:
+        limits = {
+            resource.id: max(1, int(resource.concurrency_slots))
+            for resource in profile.hardware_resources
+        }
+        for variant in profile.outputs:
+            for resource_id in variant_resource_ids(profile, variant):
+                limits.setdefault(resource_id, 1)
+        limits.setdefault(CPU_RESOURCE_ID, 1)
+        return limits
+
+    def resource_slot_weight(self, job: RuntimeJob, slot_limits: Dict[str, int]) -> int:
+        limit = max(1, slot_limits.get(job.resource_id, 1))
+        requested_segments = max(1, int(job.profile.max_parallel_jobs))
+        return min(requested_segments, limit)
+
+    def reserve_resource_slots(self, job: RuntimeJob, slot_limits: Dict[str, int]) -> bool:
+        resource_id = job.resource_id or CPU_RESOURCE_ID
+        limit = max(1, slot_limits.get(resource_id, 1))
+        weight = self.resource_slot_weight(job, slot_limits)
+        used = self.active_resource_slots.get(resource_id, 0)
+        if used + weight > limit:
+            return False
+        self.active_resource_slots[resource_id] = used + weight
+        job.resource_id = resource_id
+        job.resource_slot = used
+        job.resource_slots_reserved = weight
+        job.status = "貅門ｙ荳ｭ"
+        self.active_jobs[job.job_id] = job
+        return True
+
+    def release_resource_slots(self, job: RuntimeJob) -> None:
+        resource_id = job.resource_id or CPU_RESOURCE_ID
+        reserved = max(1, int(job.resource_slots_reserved))
+        with self.lock:
+            used = max(0, self.active_resource_slots.get(resource_id, 0) - reserved)
+            if used:
+                self.active_resource_slots[resource_id] = used
+            else:
+                self.active_resource_slots.pop(resource_id, None)
+            self.active_jobs.pop(job.job_id, None)
+
+    def dequeue_runnable_jobs(self, profile: EncodeProfile) -> List[RuntimeJob]:
+        slot_limits = self.resource_slot_limits(profile)
+        runnable: List[RuntimeJob] = []
+        deferred: List[RuntimeJob] = []
+        with self.lock:
+            while not self.pending_jobs.empty():
+                try:
+                    job = self.pending_jobs.get_nowait()
+                except queue.Empty:
+                    break
+                if self.reserve_resource_slots(job, slot_limits):
+                    runnable.append(job)
+                else:
+                    deferred.append(job)
+            for job in deferred:
+                self.pending_jobs.put(job)
+        return runnable
 
     def scheduler_loop(self, profile: EncodeProfile) -> None:
         self.log("Scheduler started.")
@@ -1611,14 +2028,8 @@ class EncoderApp:
                 break
 
             if not is_paused:
-                while active_count < 1:
-                    try:
-                        job = self.pending_jobs.get_nowait()
-                    except queue.Empty:
-                        break
+                for job in self.dequeue_runnable_jobs(profile):
                     self.start_job_thread(job)
-                    with self.lock:
-                        active_count = len(self.active_jobs)
 
             with self.lock:
                 active_count = len(self.active_jobs)
@@ -1663,7 +2074,7 @@ class EncoderApp:
         segment_root = segment_dir_for(self.paths, src, job.profile, job.variant)
         joined_video = joined_video_path_for(self.paths, src, job.profile, job.variant)
         audio_out = temp_audio_path_for(self.paths, src, job.profile, job.variant)
-        self.log(f"Start {job.variant.name}: {src.name}")
+        self.log(f"Start {job.variant.name}: {src.name} / {job.resource_id or 'default'} slot {job.resource_slot + 1}")
         self.log(f"Log file: {job.log_file}")
 
         segment_root.mkdir(parents=True, exist_ok=True)
@@ -1789,8 +2200,7 @@ class EncoderApp:
             self._mark_job_failed(job, str(exc))
             self.log(f"Exception in job {job.job_id}: {exc}")
         finally:
-            with self.lock:
-                self.active_jobs.pop(job.job_id, None)
+            self.release_resource_slots(job)
 
     def encode_segments_parallel(
         self,
@@ -1814,7 +2224,11 @@ class EncoderApp:
         failed = threading.Event()
         failure_message = {"text": ""}
         log_lock = threading.Lock()
-        worker_count = min(max(1, int(job.profile.max_parallel_jobs)), pending.qsize())
+        worker_count = min(
+            max(1, int(job.profile.max_parallel_jobs)),
+            max(1, int(job.resource_slots_reserved)),
+            pending.qsize(),
+        )
 
         def fail(message: str) -> None:
             if not failed.is_set():
@@ -1848,6 +2262,7 @@ class EncoderApp:
                         job.variant,
                         start_seconds=start,
                         duration_seconds=duration_seconds,
+                        resource_id=job.resource_id,
                     )
                     with log_lock:
                         log_fp.write(f"\nSegment {index + 1}/{len(ranges)} command:\n")

@@ -6,8 +6,12 @@ from pathlib import Path
 import ffmpeg_nvenc_gui.app as app_module
 import ffmpeg_nvenc_gui.ffmpeg_downloader as downloader
 from ffmpeg_nvenc_gui.core import (
+    BACKEND_CPU,
+    BACKEND_NVENC,
+    CPU_RESOURCE_ID,
     EncodeProfile,
     GpuInfo,
+    HardwareResource,
     JobSpec,
     OutputVariant,
     build_audio_command,
@@ -32,6 +36,7 @@ from ffmpeg_nvenc_gui.core import (
     profile_from_state,
     profile_input_dir,
     profile_output_dir,
+    profile_to_dict,
     resumable_specs,
     save_state,
     scan_profile_files,
@@ -46,6 +51,7 @@ from ffmpeg_nvenc_gui.ffmpeg_downloader import (
     find_binary_member,
     find_ffmpeg_member,
     missing_binaries,
+    split_encode_modes_from_help,
     verify_ffmpeg_basic,
     verify_ffprobe_basic,
 )
@@ -376,7 +382,71 @@ def test_scan_and_job_specs_skip_existing_outputs(tmp_path: Path):
     assert files[0].label(profile) == "残り 1/2"
 
     specs = build_job_specs(profile, [src])
-    assert specs == [JobSpec(src=str(src), profile_id="profile", variant_id="master")]
+    assert specs == [JobSpec(src=str(src), profile_id="profile", variant_id="master", assigned_resource_id="nvidia:0")]
+
+
+def test_build_job_specs_round_robins_encode_set_resources(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="nvidia:0", label="GPU 0", kind="gpu", backend=BACKEND_NVENC, concurrency_slots=2),
+        HardwareResource(id="nvidia:1", label="GPU 1", kind="gpu", backend=BACKEND_NVENC, concurrency_slots=1),
+    ]
+    profile.resource_ids = ["nvidia:0", "nvidia:1"]
+    profile.outputs[0].backend = BACKEND_NVENC
+    profile.outputs[0].ffmpeg_encoder = "hevc_nvenc"
+    profile.outputs[0].resource_ids = ["nvidia:0", "nvidia:1"]
+    profile.outputs[1].enabled = False
+
+    input_dir = Path(profile.input_dir)
+    input_dir.mkdir(parents=True, exist_ok=True)
+    sources = [input_dir / f"video-{index}.mkv" for index in range(3)]
+    for src in sources:
+        src.write_bytes(b"dummy")
+
+    specs = build_job_specs(profile, sources)
+
+    assert [spec.assigned_resource_id for spec in specs] == ["nvidia:0", "nvidia:1", "nvidia:0"]
+
+
+def test_build_ffmpeg_command_uses_assigned_nvenc_resource(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    variant.backend = BACKEND_NVENC
+    variant.ffmpeg_encoder = "hevc_nvenc"
+    variant.resource_ids = ["nvidia:2"]
+
+    cmd = build_ffmpeg_command(
+        tmp_path / "ffmpeg.exe",
+        tmp_path / "input.mkv",
+        tmp_path / "chunk.mp4",
+        profile,
+        variant,
+        resource_id="nvidia:2",
+    )
+
+    assert cmd[cmd.index("-gpu") + 1] == "2"
+
+
+def test_profile_to_dict_omits_deprecated_profile_defaults(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="nvidia:0", label="GPU 0", kind="gpu", backend=BACKEND_NVENC, concurrency_slots=2),
+    ]
+    profile.resource_ids = ["nvidia:0"]
+    profile.outputs[0].backend = BACKEND_NVENC
+    profile.outputs[0].ffmpeg_encoder = "hevc_nvenc"
+    profile.outputs[0].resource_ids = ["nvidia:0"]
+
+    data = profile_to_dict(profile)
+
+    assert "codec" not in data
+    assert "rate_mode" not in data
+    assert data["hardware_resources"][1]["concurrency_slots"] == 2
+    assert data["outputs"][0]["backend"] == BACKEND_NVENC
+    assert data["outputs"][0]["ffmpeg_encoder"] == "hevc_nvenc"
+    assert "use_gpu" not in data["outputs"][0]
 
 
 def test_output_variant_normalizes_safe_container_extensions(tmp_path: Path):
@@ -863,6 +933,22 @@ def test_find_ffmpeg_and_ffprobe_members():
     ]
     assert find_ffmpeg_member(names) == "ffmpeg-2026-essentials_build/bin/ffmpeg.exe"
     assert find_binary_member(names, "ffprobe.exe") == "ffmpeg-2026-essentials_build/bin/ffprobe.exe"
+
+
+def test_split_encode_modes_parse_only_option_values():
+    help_text = """
+Encoder hevc_nvenc [NVIDIA NVENC hevc encoder]:
+  unrelated option mentions 2-pass and h264 text.
+  -split_encode_mode <int> E..V....... Set split encoding mode
+     auto            0            E..V.......
+     disabled        1            E..V.......
+     forced          2            E..V.......
+     2               3            E..V.......
+  -gpu <int>         E..V....... Selects which NVENC capable GPU to use
+"""
+
+    assert split_encode_modes_from_help(help_text) == ["auto", "disabled", "forced", "2"]
+    assert split_encode_modes_from_help("h264 mentions 2 but no option") == []
 
 
 def test_missing_binaries_preserves_existing_ffmpeg(tmp_path: Path):

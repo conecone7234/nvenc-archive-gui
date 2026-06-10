@@ -83,10 +83,10 @@ dist\NvencArchiveGui.exe
 
 ## CI/CD
 
-- Pull request to `main`, `preview`, or `develop`: tests only
-- Push or merge to `main`: tests + Windows exe build + stable GitHub Release
-- Push or merge to `preview`: tests + Windows exe build + preview pre-release
-- Push or merge to `develop`: tests + Windows exe build + nightly pre-release
+- Pull request to `main`, `preview`, or `develop`: lint + tests only
+- Push or merge to `main`: lint + tests + Windows exe build + stable GitHub Release
+- Push or merge to `preview`: lint + tests + Windows exe build + preview pre-release
+- Push or merge to `develop`: lint + tests + Windows exe build + nightly pre-release
 
 Release channels:
 

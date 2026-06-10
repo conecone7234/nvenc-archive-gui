@@ -6,8 +6,10 @@ from pathlib import Path
 import ffmpeg_nvenc_gui.app as app_module
 import ffmpeg_nvenc_gui.ffmpeg_downloader as downloader
 from ffmpeg_nvenc_gui.core import (
+    BACKEND_AMF,
     BACKEND_CPU,
     BACKEND_NVENC,
+    BACKEND_QSV,
     CPU_RESOURCE_ID,
     EncodeProfile,
     GpuInfo,
@@ -46,7 +48,13 @@ from ffmpeg_nvenc_gui.core import (
     variant_resource_ids,
     write_concat_file,
 )
-from ffmpeg_nvenc_gui.app import EncoderApp, RuntimeJob
+from ffmpeg_nvenc_gui.app import (
+    EncoderApp,
+    RuntimeJob,
+    backend_accepts_rate_mode,
+    rate_modes_for_backend,
+    select_compatible_resource_ids,
+)
 from ffmpeg_nvenc_gui.ffmpeg_downloader import (
     FfmpegDownloadError,
     find_binary_member,
@@ -843,6 +851,157 @@ def test_encoder_app_output_rate_controls_match_selected_mode():
     assert app.output_bitrate_entry.state == app_module.tk.NORMAL
     assert app.output_maxrate_entry.state == app_module.tk.NORMAL
     assert app.output_bufsize_entry.state == app_module.tk.NORMAL
+
+
+def test_select_compatible_resource_ids_falls_back_to_allowed_resource():
+    assert select_compatible_resource_ids([CPU_RESOURCE_ID], ["nvidia:0"]) == [CPU_RESOURCE_ID]
+    assert select_compatible_resource_ids([CPU_RESOURCE_ID, "nvidia:0"], ["nvidia:0"]) == ["nvidia:0"]
+    assert select_compatible_resource_ids([], ["nvidia:0"]) == []
+
+
+def test_backend_accepts_rate_mode_rejects_cq_for_qsv_and_amf():
+    assert backend_accepts_rate_mode(BACKEND_CPU, "CQ") is True
+    assert backend_accepts_rate_mode(BACKEND_NVENC, "CQ") is True
+    assert backend_accepts_rate_mode(BACKEND_QSV, "CQ") is False
+    assert backend_accepts_rate_mode(BACKEND_AMF, "CQ") is False
+    assert backend_accepts_rate_mode(BACKEND_QSV, "VBR") is True
+    assert rate_modes_for_backend(BACKEND_QSV) == ["VBR", "ABR", "CBR"]
+
+
+def test_update_output_encoder_controls_removes_cq_for_qsv():
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    class Widget:
+        def __init__(self):
+            self.config = {}
+
+        def configure(self, **kwargs):
+            self.config.update(kwargs)
+
+    app = EncoderApp.__new__(EncoderApp)
+    app.output_encoder_combo = Widget()
+    app.output_rate_combo = Widget()
+    app.output_split_combo = Widget()
+    app.output_backend_var = Value(BACKEND_QSV)
+    app.output_encoder_var = Value("hevc_qsv")
+    app.output_codec_var = Value("hevc_nvenc")
+    app.output_cpu_codec_var = Value("libx264")
+    app.output_rate_mode_var = Value("CQ")
+    app.output_split_encode_mode_var = Value("auto")
+    app.encoder_capabilities = {}
+    app.update_output_rate_controls = lambda: None
+    app._encoders_for_backend = lambda backend: ["hevc_qsv"]
+    app.selected_output_resource_ids = lambda: ["intel:0"]
+    app.current_profile = lambda: make_profile(Path("unused"))
+    app.render_output_resource_controls = lambda *_args: None
+
+    app.update_output_encoder_controls()
+
+    assert app.output_rate_combo.config["values"] == ["VBR", "ABR", "CBR"]
+    assert app.output_rate_mode_var.get() == "VBR"
+
+
+def test_refresh_outputs_tree_inserts_full_output_tuple_once():
+    class FakeTree:
+        def __init__(self):
+            self.deleted = None
+            self.insert_calls = []
+
+        def get_children(self):
+            return ("old",)
+
+        def delete(self, *items):
+            self.deleted = items
+
+        def insert(self, parent, index, iid=None, values=()):
+            self.insert_calls.append((parent, index, iid, values))
+
+        def item(self, *_args, **_kwargs):
+            raise AssertionError("refresh_outputs_tree should not rewrite inserted values")
+
+    app = EncoderApp.__new__(EncoderApp)
+    app.outputs_tree = FakeTree()
+    app.editing_outputs = [
+        OutputVariant(
+            id="qsv",
+            name="QSV",
+            folder_name="qsv",
+            height=1080,
+            container="mp4",
+            backend=BACKEND_QSV,
+            ffmpeg_encoder="hevc_qsv",
+        )
+    ]
+
+    app.refresh_outputs_tree()
+
+    assert app.outputs_tree.deleted == ("old",)
+    assert len(app.outputs_tree.insert_calls) == 1
+    _parent, _index, iid, values = app.outputs_tree.insert_calls[0]
+    assert iid == "qsv"
+    assert values[1:] == ("QSV", BACKEND_QSV, "hevc_qsv", "1080p", "qsv", "mp4")
+    assert len(values) == 7
+
+
+def test_add_or_update_output_rejects_cq_for_qsv(tmp_path: Path, monkeypatch):
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    app.current_profile = lambda: profile
+    app.selected_output_id = None
+    app.editing_outputs = []
+    app.output_name_var = Value("QSV")
+    app.output_folder_var = Value("qsv")
+    app.output_container_var = Value("mp4")
+    app.output_resolution_var = Value("Original")
+    app.output_rate_mode_var = Value("CQ")
+    app.output_cq_var = Value("22")
+    app.cq_var = Value("22")
+    app.output_backend_var = Value(BACKEND_QSV)
+    app.output_encoder_var = Value("hevc_qsv")
+    errors = []
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    app.add_or_update_output()
+
+    assert app.editing_outputs == []
+    assert any("CQ" in message and "QSV/AMF" in message for _title, message in errors)
+
+
+def test_validate_profile_before_run_rejects_cq_for_qsv(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="intel:0", label="Intel QSV", kind="gpu", backend=BACKEND_QSV),
+    ]
+    profile.resource_ids = ["intel:0"]
+    profile.outputs[0].backend = BACKEND_QSV
+    profile.outputs[0].ffmpeg_encoder = "hevc_qsv"
+    profile.outputs[0].resource_ids = ["intel:0"]
+    profile.outputs[0].rate_mode = "CQ"
+    profile.outputs[1].enabled = False
+    errors = []
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    assert app.validate_profile_before_run(profile) is False
+    assert any("CQ" in message and "QSV/AMF" in message for _title, message in errors)
 
 
 def test_validate_encoder_capabilities_ignores_stale_sfe_for_h264_nvenc(tmp_path: Path, monkeypatch):

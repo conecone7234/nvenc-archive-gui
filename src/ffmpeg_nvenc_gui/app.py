@@ -171,6 +171,25 @@ RATE_MODES = ["CQ", "VBR", "ABR", "CBR"]
 CONTAINER_CHOICES = ["mp4", "mkv", "mov", "m4v", "webm", "ts", "m2ts"]
 
 
+def select_compatible_resource_ids(allowed_ids: List[str], selected_ids: List[str]) -> List[str]:
+    selected = [resource_id for resource_id in selected_ids if resource_id in allowed_ids]
+    return selected or allowed_ids[:1]
+
+
+def backend_allows_cq(backend: str) -> bool:
+    return backend in {BACKEND_CPU, BACKEND_NVENC}
+
+
+def backend_accepts_rate_mode(backend: str, rate_mode: str) -> bool:
+    return rate_mode.upper() != "CQ" or backend_allows_cq(backend)
+
+
+def rate_modes_for_backend(backend: str) -> List[str]:
+    if backend_allows_cq(backend):
+        return RATE_MODES
+    return [mode for mode in RATE_MODES if mode != "CQ"]
+
+
 class SearchableCombobox(ttk.Combobox):
     def __init__(self, master: tk.Widget, values: List[str], **kwargs: object) -> None:
         self._search_values = list(values)
@@ -919,8 +938,7 @@ class EncoderApp:
             for resource in profile.hardware_resources
             if resource.id in active_profile_resources and resource_backend(resource.id) == backend
         ]
-        if not selected:
-            selected = [resource.id for resource in allowed[:1]]
+        selected = select_compatible_resource_ids([resource.id for resource in allowed], selected)
         for index, resource in enumerate(allowed):
             var = tk.BooleanVar(value=resource.id in selected)
             self.output_resource_vars[resource.id] = var
@@ -944,6 +962,12 @@ class EncoderApp:
         encoder = self.output_encoder_var.get()
         self.output_codec_var.set(encoder if backend == BACKEND_NVENC else self.output_codec_var.get())
         self.output_cpu_codec_var.set(encoder if backend == BACKEND_CPU else self.output_cpu_codec_var.get())
+        rate_modes = rate_modes_for_backend(backend)
+        if hasattr(self, "output_rate_combo"):
+            self.output_rate_combo.configure(values=rate_modes)
+        if self.output_rate_mode_var.get().upper() not in rate_modes:
+            self.output_rate_mode_var.set(rate_modes[0])
+            self.update_output_rate_controls()
 
         nvenc_state = tk.NORMAL if backend == BACKEND_NVENC else tk.DISABLED
         cpu_state = tk.NORMAL if backend == BACKEND_CPU else tk.DISABLED
@@ -1323,6 +1347,10 @@ class EncoderApp:
             if any(resource_backend(resource_id) != expected_backend for resource_id in resources):
                 messagebox.showerror("入力エラー", f"{variant.name}: backendの異なるリソースは混在できません。")
                 return None
+            rate_mode = (variant.rate_mode or profile.rate_mode or "CQ").upper()
+            if not backend_accepts_rate_mode(expected_backend, rate_mode):
+                messagebox.showerror("入力エラー", f"{variant.name}: CQ は CPU/NVENC のみで使用できます。QSV/AMF では VBR/ABR/CBR を選択してください。")
+                return None
             missing = missing_rate_fields(profile, variant)
             if missing:
                 labels = ", ".join(missing)
@@ -1391,10 +1419,6 @@ class EncoderApp:
                 "",
                 tk.END,
                 iid=variant.id,
-                values=("有効" if variant.enabled else "無効", variant.name, resolution, variant.folder_name, variant.container),
-            )
-            self.outputs_tree.item(
-                variant.id,
                 values=(
                     "有効" if variant.enabled else "無効",
                     variant.name,
@@ -1498,6 +1522,9 @@ class EncoderApp:
             messagebox.showerror("入力エラー", "CQ/CRF は数値で入力してください。")
             return
         backend = self.output_backend_var.get() or BACKEND_CPU
+        if not backend_accepts_rate_mode(backend, rate_mode):
+            messagebox.showerror("入力エラー", "CQ は CPU/NVENC のみで使用できます。QSV/AMF では VBR/ABR/CBR を選択してください。")
+            return
         encoder = self.output_encoder_var.get().strip()
         resource_ids = self.selected_output_resource_ids()
         if not encoder:
@@ -1766,6 +1793,10 @@ class EncoderApp:
             expected_backend = variant.backend or resource_backend(resources[0])
             if any(resource_backend(resource_id) != expected_backend for resource_id in resources):
                 messagebox.showerror("入力エラー", f"{variant.name}: backendの異なるリソースは混在できません。")
+                return False
+            rate_mode = (variant.rate_mode or profile.rate_mode or "CQ").upper()
+            if not backend_accepts_rate_mode(expected_backend, rate_mode):
+                messagebox.showerror("入力エラー", f"{variant.name}: CQ は CPU/NVENC のみで使用できます。QSV/AMF では VBR/ABR/CBR を選択してください。")
                 return False
             missing = missing_rate_fields(profile, variant)
             if missing:

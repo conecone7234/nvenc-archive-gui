@@ -908,6 +908,41 @@ def test_validate_encoder_capabilities_rejects_invalid_sfe_for_hevc_nvenc(tmp_pa
     assert any("split_encode_mode=2" in message for _title, message in errors)
 
 
+def test_validate_encoder_capabilities_allows_disabled_sfe_when_option_exists(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    app.encoder_capabilities = {
+        "hevc_nvenc": {
+            "available": True,
+            "supports_split_encode_mode": True,
+            "split_encode_modes": [],
+        }
+    }
+    app.paths = build_paths(tmp_path)
+    app.log = lambda _text: None
+    errors = []
+    smoke_calls = []
+
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    variant.backend = "nvenc"
+    variant.ffmpeg_encoder = "hevc_nvenc"
+    variant.split_encode_mode = "disabled"
+    spec = JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=variant.id, assigned_resource_id="nvidia:0")
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    def fake_smoke(ffmpeg_path, encoder, resource_id="", split_encode_mode="", timeout=30):
+        smoke_calls.append((encoder, resource_id, split_encode_mode))
+        return True, ""
+
+    monkeypatch.setattr(app_module, "smoke_test_encoder", fake_smoke)
+
+    assert app.split_encode_modes_for_encoder("hevc_nvenc") == ["auto", "disabled"]
+    assert app.validate_encoder_capabilities_before_run(profile, [spec]) is True
+    assert errors == []
+    assert smoke_calls == [("hevc_nvenc", "nvidia:0", "disabled")]
+
+
 def test_validate_profile_before_run_rejects_output_without_enabled_resource(tmp_path: Path, monkeypatch):
     app = EncoderApp.__new__(EncoderApp)
     profile = make_profile(tmp_path)
@@ -931,6 +966,7 @@ def test_validate_profile_before_run_rejects_output_without_enabled_resource(tmp
 def test_reserve_resource_slots_uses_readable_status(tmp_path: Path):
     app = EncoderApp.__new__(EncoderApp)
     app.active_resource_slots = {}
+    app.active_resource_slot_indexes = {}
     app.active_jobs = {}
     profile = make_profile(tmp_path)
     job = RuntimeJob(
@@ -947,6 +983,45 @@ def test_reserve_resource_slots_uses_readable_status(tmp_path: Path):
     assert app.reserve_resource_slots(job, {"nvidia:0": 2}) is True
     assert job.status == "準備中"
     assert app.active_resource_slots == {"nvidia:0": 2}
+    assert job.resource_slot_indexes == [0, 1]
+
+
+def test_resource_slot_indices_do_not_overlap_after_release(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    app.active_resource_slots = {}
+    app.active_resource_slot_indexes = {}
+    app.active_jobs = {}
+    profile = make_profile(tmp_path)
+    profile.max_parallel_jobs = 1
+
+    def make_job(job_id: int) -> RuntimeJob:
+        return RuntimeJob(
+            job_id=job_id,
+            spec=JobSpec(src=str(tmp_path / f"input-{job_id}.mkv"), profile_id=profile.id, variant_id=profile.outputs[0].id),
+            profile=profile,
+            variant=profile.outputs[0],
+            tmp_out=tmp_path / f"tmp-{job_id}.mp4",
+            out_file=tmp_path / f"out-{job_id}.mp4",
+            log_file=tmp_path / f"job-{job_id}.log",
+            resource_id="nvidia:0",
+        )
+
+    first = make_job(1)
+    second = make_job(2)
+    third = make_job(3)
+
+    assert app.reserve_resource_slots(first, {"nvidia:0": 3}) is True
+    assert app.reserve_resource_slots(second, {"nvidia:0": 3}) is True
+    assert first.resource_slot_indexes == [0]
+    assert second.resource_slot_indexes == [1]
+
+    app.release_resource_slots(first)
+    assert app.active_resource_slot_indexes == {"nvidia:0": {1}}
+
+    assert app.reserve_resource_slots(third, {"nvidia:0": 3}) is True
+    assert third.resource_slot_indexes == [0]
+    assert set(third.resource_slot_indexes).isdisjoint(second.resource_slot_indexes)
 
 
 def test_run_process_publishes_process_under_lock_and_honors_stop(tmp_path: Path):

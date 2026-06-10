@@ -204,6 +204,7 @@ class RuntimeJob:
     resource_id: str = ""
     resource_slot: int = 0
     resource_slots_reserved: int = 1
+    resource_slot_indexes: List[int] = field(default_factory=list)
     process: Optional[subprocess.Popen] = None
     processes: Dict[int, subprocess.Popen] = field(default_factory=dict)
     status: str = "waiting"
@@ -239,6 +240,7 @@ class EncoderApp:
         self.all_jobs: Dict[int, RuntimeJob] = {}
         self.job_rows: Dict[int, str] = {}
         self.active_resource_slots: Dict[str, int] = {}
+        self.active_resource_slot_indexes: Dict[str, set[int]] = {}
         self.encoder_capabilities: Dict[str, Dict[str, object]] = {}
 
         self.lock = threading.Lock()
@@ -888,6 +890,23 @@ class EncoderApp:
         ]
         return selected
 
+    def split_encode_modes_for_encoder(self, encoder: str) -> List[str]:
+        caps = self.encoder_capabilities.get(encoder, {})
+        if not bool(caps.get("supports_split_encode_mode")):
+            return []
+        detected_modes = caps.get("split_encode_modes", [])
+        modes: List[str] = []
+        if isinstance(detected_modes, list):
+            for item in detected_modes:
+                value = str(item or "").strip().lower()
+                if value and value not in modes:
+                    modes.append(value)
+        if "auto" not in modes:
+            modes.insert(0, "auto")
+        if "disabled" not in modes:
+            modes.append("disabled")
+        return modes
+
     def render_output_resource_controls(self, profile: EncodeProfile, backend: str, selected: List[str]) -> None:
         if not hasattr(self, "output_resource_frame"):
             return
@@ -939,17 +958,11 @@ class EncoderApp:
             if widget is not None:
                 widget.configure(state=cpu_state)
 
-        split_modes = ["auto"]
-        caps = self.encoder_capabilities.get(encoder, {})
-        detected_modes = caps.get("split_encode_modes", [])
-        if isinstance(detected_modes, list) and detected_modes:
-            split_modes = [str(item) for item in detected_modes]
-        supports_split = bool(caps.get("supports_split_encode_mode"))
-        if backend == BACKEND_NVENC and encoder in {"hevc_nvenc", "av1_nvenc"} and supports_split:
-            if "disabled" not in split_modes:
-                split_modes.append("disabled")
+        split_modes = self.split_encode_modes_for_encoder(encoder)
+        if backend == BACKEND_NVENC and encoder in {"hevc_nvenc", "av1_nvenc"} and split_modes:
             self.output_split_combo.configure(values=split_modes, state=tk.NORMAL)
         else:
+            split_modes = ["auto"]
             self.output_split_encode_mode_var.set("auto")
             self.output_split_combo.configure(values=["auto"], state=tk.DISABLED)
         if self.output_split_encode_mode_var.get() not in split_modes:
@@ -1616,7 +1629,7 @@ class EncoderApp:
             if not row_id or not self.progress_tree.exists(row_id):
                 continue
             file_name = Path(job.spec.src).name
-            resource_detail = f"{job.resource_id} slot {job.resource_slot + 1}" if job.resource_id else ""
+            resource_detail = self.resource_detail_label(job)
             message = job.message or f"{job.completed_segments}/{job.total_segments} segments"
             detail = f"{resource_detail} / {message}" if resource_detail else message
             self.progress_tree.item(
@@ -1791,7 +1804,7 @@ class EncoderApp:
                 split_mode = ""
             caps = self.encoder_capabilities.get(encoder, {})
             supports_split = bool(caps.get("supports_split_encode_mode"))
-            split_modes = [str(item) for item in caps.get("split_encode_modes", []) if item]
+            split_modes = self.split_encode_modes_for_encoder(encoder)
             if split_mode and split_mode not in {"auto", "default"}:
                 if not supports_split:
                     messagebox.showerror(
@@ -1921,6 +1934,7 @@ class EncoderApp:
             self.all_jobs.clear()
             self.job_rows.clear()
             self.active_resource_slots.clear()
+            self.active_resource_slot_indexes.clear()
             while not self.pending_jobs.empty():
                 try:
                     self.pending_jobs.get_nowait()
@@ -1982,16 +1996,27 @@ class EncoderApp:
         requested_segments = max(1, int(job.profile.max_parallel_jobs))
         return min(requested_segments, limit)
 
+    def resource_detail_label(self, job: RuntimeJob) -> str:
+        if not job.resource_id:
+            return ""
+        indexes = job.resource_slot_indexes or [job.resource_slot]
+        labels = ",".join(str(index + 1) for index in indexes)
+        return f"{job.resource_id} slots {labels}" if len(indexes) > 1 else f"{job.resource_id} slot {labels}"
+
     def reserve_resource_slots(self, job: RuntimeJob, slot_limits: Dict[str, int]) -> bool:
         resource_id = job.resource_id or CPU_RESOURCE_ID
         limit = max(1, slot_limits.get(resource_id, 1))
         weight = self.resource_slot_weight(job, slot_limits)
-        used = self.active_resource_slots.get(resource_id, 0)
-        if used + weight > limit:
+        used_indexes = self.active_resource_slot_indexes.setdefault(resource_id, set())
+        available = [index for index in range(limit) if index not in used_indexes]
+        if len(available) < weight:
             return False
-        self.active_resource_slots[resource_id] = used + weight
+        assigned_indexes = available[:weight]
+        used_indexes.update(assigned_indexes)
+        self.active_resource_slots[resource_id] = len(used_indexes)
         job.resource_id = resource_id
-        job.resource_slot = used
+        job.resource_slot = assigned_indexes[0]
+        job.resource_slot_indexes = assigned_indexes
         job.resource_slots_reserved = weight
         job.status = "準備中"
         self.active_jobs[job.job_id] = job
@@ -2001,10 +2026,15 @@ class EncoderApp:
         resource_id = job.resource_id or CPU_RESOURCE_ID
         reserved = max(1, int(job.resource_slots_reserved))
         with self.lock:
-            used = max(0, self.active_resource_slots.get(resource_id, 0) - reserved)
-            if used:
-                self.active_resource_slots[resource_id] = used
+            used_indexes = self.active_resource_slot_indexes.get(resource_id, set())
+            release_indexes = job.resource_slot_indexes or list(range(job.resource_slot, job.resource_slot + reserved))
+            for index in release_indexes:
+                used_indexes.discard(index)
+            if used_indexes:
+                self.active_resource_slot_indexes[resource_id] = used_indexes
+                self.active_resource_slots[resource_id] = len(used_indexes)
             else:
+                self.active_resource_slot_indexes.pop(resource_id, None)
                 self.active_resource_slots.pop(resource_id, None)
             self.active_jobs.pop(job.job_id, None)
 
@@ -2087,7 +2117,8 @@ class EncoderApp:
         segment_root = segment_dir_for(self.paths, src, job.profile, job.variant)
         joined_video = joined_video_path_for(self.paths, src, job.profile, job.variant)
         audio_out = temp_audio_path_for(self.paths, src, job.profile, job.variant)
-        self.log(f"Start {job.variant.name}: {src.name} / {job.resource_id or 'default'} slot {job.resource_slot + 1}")
+        resource_detail = self.resource_detail_label(job) or "default"
+        self.log(f"Start {job.variant.name}: {src.name} / {resource_detail}")
         self.log(f"Log file: {job.log_file}")
 
         segment_root.mkdir(parents=True, exist_ok=True)

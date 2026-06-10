@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -23,6 +24,7 @@ RESOLUTION_PRESETS: Dict[str, Optional[int]] = {
 }
 SAFE_CONTAINER_RE = re.compile(r"^[a-z0-9]{1,8}$")
 FASTSTART_CONTAINERS = {"mp4", "m4v", "mov", "ismv"}
+SEGMENT_SOURCE_STEM_LIMIT = 40
 
 
 def dataclass_values(cls: Any, data: object) -> Dict[str, Any]:
@@ -58,6 +60,32 @@ class OutputVariant:
     height: Optional[int] = None
     container: str = "mp4"
     enabled: bool = True
+    filename_template: str = "{source}"
+    use_gpu: Optional[bool] = None
+    gpu_index: Optional[int] = None
+    gpu_name: str = ""
+    codec: str = ""
+    cpu_codec: str = ""
+    preset: str = ""
+    cpu_preset: str = ""
+    cpu_tune: str = ""
+    tune: str = ""
+    rate_mode: str = ""
+    cq_value: Optional[int] = None
+    bitrate: str = ""
+    maxrate: str = ""
+    bufsize: str = ""
+    pix_fmt: str = ""
+    scale_flags: str = ""
+    audio_codec: str = ""
+    audio_bitrate: str = ""
+    audio_container: str = ""
+    extra_input_args: str = ""
+    extra_video_args: str = ""
+    extra_audio_args: str = ""
+    extra_output_args: str = ""
+    extra_concat_args: str = ""
+    extra_mux_args: str = ""
 
     def __post_init__(self) -> None:
         self.id = str(self.id or "").strip()
@@ -80,6 +108,32 @@ class OutputVariant:
             self.enabled = bool(self.enabled)
         self.folder_name = safe_folder_name(self.folder_name or self.name or self.id)
         self.container = normalize_container_extension(self.container)
+        self.filename_template = str(self.filename_template or "{source}").strip() or "{source}"
+        self.use_gpu = normalize_optional_bool(self.use_gpu)
+        self.gpu_index = normalize_optional_int(self.gpu_index, minimum=0)
+        self.gpu_name = str(self.gpu_name or "").strip()
+        self.codec = str(self.codec or "").strip()
+        self.cpu_codec = str(self.cpu_codec or "").strip()
+        self.preset = str(self.preset or "").strip()
+        self.cpu_preset = str(self.cpu_preset or "").strip()
+        self.cpu_tune = str(self.cpu_tune or "").strip()
+        self.tune = str(self.tune or "").strip()
+        self.rate_mode = str(self.rate_mode or "").strip().upper()
+        self.cq_value = normalize_optional_int(self.cq_value)
+        self.bitrate = str(self.bitrate or "").strip()
+        self.maxrate = str(self.maxrate or "").strip()
+        self.bufsize = str(self.bufsize or "").strip()
+        self.pix_fmt = str(self.pix_fmt or "").strip()
+        self.scale_flags = str(self.scale_flags or "").strip()
+        self.audio_codec = str(self.audio_codec or "").strip()
+        self.audio_bitrate = str(self.audio_bitrate or "").strip()
+        self.audio_container = normalize_container_extension(self.audio_container, default="") or ""
+        self.extra_input_args = str(self.extra_input_args or "").strip()
+        self.extra_video_args = str(self.extra_video_args or "").strip()
+        self.extra_audio_args = str(self.extra_audio_args or "").strip()
+        self.extra_output_args = str(self.extra_output_args or "").strip()
+        self.extra_concat_args = str(self.extra_concat_args or "").strip()
+        self.extra_mux_args = str(self.extra_mux_args or "").strip()
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "OutputVariant":
@@ -233,6 +287,29 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 
+def normalize_optional_bool(value: object) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text:
+            return None
+        return text not in {"0", "false", "no", "off", "none", "auto"}
+    return bool(value)
+
+
+def normalize_optional_int(value: object, minimum: Optional[int] = None) -> Optional[int]:
+    if value in ("", None):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if minimum is not None:
+        number = max(minimum, number)
+    return number
+
+
 def get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -297,6 +374,13 @@ def safe_folder_name(text: str) -> str:
     return value or "output"
 
 
+def safe_file_stem(text: str, default: str = "video") -> str:
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", str(text or "").strip())
+    value = re.sub(r"\s+", " ", value)
+    value = value.strip(".- ")
+    return value or default
+
+
 def normalize_container_extension(value: object, default: str = "mp4") -> str:
     candidate = str(value or "").strip().lower().lstrip(".")
     if SAFE_CONTAINER_RE.fullmatch(candidate):
@@ -304,11 +388,35 @@ def normalize_container_extension(value: object, default: str = "mp4") -> str:
     return default
 
 
+def parse_ffmpeg_args(value: object) -> List[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        lexer = shlex.shlex(text.replace("\r", " ").replace("\n", " "), posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        lexer.escape = ""
+        return list(lexer)
+    except ValueError as exc:
+        raise ValueError(f"Invalid FFmpeg options: {exc}") from exc
+
+
+def has_ffmpeg_option(args: Iterable[str], option: str) -> bool:
+    return any(arg == option or arg.startswith(f"{option}=") for arg in args)
+
+
 def faststart_args_for_container(value: object) -> List[str]:
     container = normalize_container_extension(value)
     if container in FASTSTART_CONTAINERS:
         return ["-movflags", "+faststart"]
     return []
+
+
+def faststart_args_unless_overridden(value: object, extra_args: Iterable[str]) -> List[str]:
+    if has_ffmpeg_option(extra_args, "-movflags"):
+        return []
+    return faststart_args_for_container(value)
 
 
 def default_outputs() -> List[OutputVariant]:
@@ -364,17 +472,27 @@ def detect_nvidia_gpus(timeout: int = 5) -> List[GpuInfo]:
 
 
 def normalize_profile_gpu(profile: EncodeProfile, gpus: Optional[List[GpuInfo]]) -> EncodeProfile:
-    if not profile.use_gpu:
-        return profile
-
-    for gpu in gpus or []:
-        if gpu.index == profile.gpu_index:
+    gpu_by_index = {gpu.index: gpu for gpu in gpus or []}
+    if profile.use_gpu:
+        gpu = gpu_by_index.get(profile.gpu_index)
+        if gpu is not None:
             profile.gpu_name = gpu.name
-            return profile
+        else:
+            profile.use_gpu = False
+            profile.gpu_index = 0
+            profile.gpu_name = ""
 
-    profile.use_gpu = False
-    profile.gpu_index = 0
-    profile.gpu_name = ""
+    for variant in profile.outputs:
+        if variant.use_gpu is not True:
+            continue
+        gpu = gpu_by_index.get(variant.gpu_index if variant.gpu_index is not None else profile.gpu_index)
+        if gpu is None:
+            variant.use_gpu = False
+            variant.gpu_index = 0
+            variant.gpu_name = ""
+        else:
+            variant.gpu_index = gpu.index
+            variant.gpu_name = gpu.name
     return profile
 
 
@@ -459,9 +577,25 @@ def profile_archive_dir(profile: EncodeProfile) -> Path:
     return Path(profile.archive_dir).expanduser().resolve()
 
 
+def output_file_stem_for(profile: EncodeProfile, src: Path, variant: OutputVariant) -> str:
+    height = "" if variant.height is None else str(variant.height)
+    replacements = {
+        "{source}": src.stem,
+        "{profile}": variant.name,
+        "{profile_id}": variant.id,
+        "{folder}": variant.folder_name,
+        "{height}": height,
+    }
+    template = variant.filename_template.strip() or "{source}"
+    value = template
+    for token, replacement in replacements.items():
+        value = value.replace(token, replacement)
+    return safe_file_stem(value, default=safe_file_stem(src.stem))
+
+
 def output_path_for(profile: EncodeProfile, src: Path, variant: OutputVariant) -> Path:
     container = normalize_container_extension(variant.container)
-    return profile_output_dir(profile) / variant.folder_name / f"{src.stem}.{container}"
+    return profile_output_dir(profile) / variant.folder_name / f"{output_file_stem_for(profile, src, variant)}.{container}"
 
 
 def scan_profile_files(profile: EncodeProfile) -> List[FileStatus]:
@@ -497,14 +631,18 @@ def build_job_specs(profile: EncodeProfile, files: Iterable[Path]) -> List[JobSp
 
 
 def duplicate_output_targets_for_outputs(outputs: Iterable[OutputVariant]) -> List[str]:
-    seen: set[Tuple[str, str]] = set()
+    seen: set[Tuple[str, str, str]] = set()
     duplicates: List[str] = []
     for variant in outputs:
         if not variant.enabled:
             continue
-        key = (variant.folder_name.lower(), normalize_container_extension(variant.container))
+        key = (
+            variant.folder_name.lower(),
+            normalize_container_extension(variant.container),
+            (variant.filename_template or "{source}").strip().lower(),
+        )
         if key in seen:
-            duplicates.append(f"{variant.folder_name}.{key[1]}")
+            duplicates.append(f"{variant.folder_name}/{key[2]}.{key[1]}")
         else:
             seen.add(key)
     return duplicates
@@ -514,105 +652,170 @@ def duplicate_output_targets(profile: EncodeProfile) -> List[str]:
     return duplicate_output_targets_for_outputs(profile.outputs)
 
 
+def variant_setting(profile: EncodeProfile, variant: OutputVariant, name: str, default: object = "") -> object:
+    value = getattr(variant, name, None)
+    if value not in (None, ""):
+        return value
+    return getattr(profile, name, default)
+
+
+def variant_use_gpu(profile: EncodeProfile, variant: OutputVariant) -> bool:
+    if variant.use_gpu is not None:
+        return variant.use_gpu
+    return profile.use_gpu
+
+
+def variant_gpu_index(profile: EncodeProfile, variant: OutputVariant) -> int:
+    if variant.gpu_index is not None:
+        return max(0, variant.gpu_index)
+    return max(0, profile.gpu_index)
+
+
+def variant_audio_codec(profile: EncodeProfile, variant: OutputVariant) -> str:
+    value = str(variant_setting(profile, variant, "audio_codec", "copy") or "").strip()
+    return value or "copy"
+
+
+def variant_audio_container(profile: EncodeProfile, variant: OutputVariant) -> str:
+    configured = str(variant.audio_container or "").strip()
+    if configured:
+        return normalize_container_extension(configured, default="mka")
+    codec = variant_audio_codec(profile, variant).lower()
+    if codec in {"aac", "alac"}:
+        return "m4a"
+    if codec in {"mp3", "libmp3lame"}:
+        return "mp3"
+    return "mka"
+
+
 def is_nvenc_codec(codec: str) -> bool:
     return codec.lower().endswith("_nvenc")
 
 
-def encoder_codec(profile: EncodeProfile) -> str:
+def encoder_codec(profile: EncodeProfile, variant: Optional[OutputVariant] = None) -> str:
+    if variant is not None:
+        if variant_use_gpu(profile, variant):
+            return str(variant_setting(profile, variant, "codec", profile.codec) or "hevc_nvenc")
+        return str(variant_setting(profile, variant, "cpu_codec", profile.cpu_codec) or "libx264")
     if profile.use_gpu:
         return profile.codec
     return profile.cpu_codec
 
 
-def output_pix_fmt(profile: EncodeProfile) -> str:
-    if is_nvenc_codec(encoder_codec(profile)):
+def output_pix_fmt(profile: EncodeProfile, variant: Optional[OutputVariant] = None) -> str:
+    if is_nvenc_codec(encoder_codec(profile, variant)):
+        if variant is not None:
+            return str(variant_setting(profile, variant, "pix_fmt", profile.pix_fmt) or "nv12")
         return profile.pix_fmt
     return "yuv420p"
 
 
-def missing_rate_fields(profile: EncodeProfile) -> List[str]:
-    mode_name = profile.rate_mode.upper()
+def missing_rate_fields(profile: EncodeProfile, variant: Optional[OutputVariant] = None) -> List[str]:
+    if variant is None:
+        mode_name = profile.rate_mode.upper()
+        bitrate = profile.bitrate
+        maxrate = profile.maxrate
+        bufsize = profile.bufsize
+    else:
+        mode_name = str(variant_setting(profile, variant, "rate_mode", profile.rate_mode) or "CQ").upper()
+        bitrate = str(variant_setting(profile, variant, "bitrate", profile.bitrate) or "")
+        maxrate = str(variant_setting(profile, variant, "maxrate", profile.maxrate) or "")
+        bufsize = str(variant_setting(profile, variant, "bufsize", profile.bufsize) or "")
     required: List[Tuple[str, str]] = []
     if mode_name == "VBR":
-        required = [("bitrate", profile.bitrate), ("maxrate", profile.maxrate), ("bufsize", profile.bufsize)]
+        required = [("bitrate", bitrate), ("maxrate", maxrate), ("bufsize", bufsize)]
     elif mode_name == "ABR":
-        required = [("bitrate", profile.bitrate)]
+        required = [("bitrate", bitrate)]
     elif mode_name == "CBR":
-        required = [("bitrate", profile.bitrate), ("bufsize", profile.bufsize)]
+        required = [("bitrate", bitrate), ("bufsize", bufsize)]
     return [name for name, value in required if not str(value or "").strip()]
 
 
-def validate_rate_settings(profile: EncodeProfile) -> None:
-    missing = missing_rate_fields(profile)
+def validate_rate_settings(profile: EncodeProfile, variant: Optional[OutputVariant] = None) -> None:
+    missing = missing_rate_fields(profile, variant)
     if missing:
-        raise ValueError(f"{profile.rate_mode} requires: {', '.join(missing)}")
+        mode = profile.rate_mode if variant is None else str(variant_setting(profile, variant, "rate_mode", profile.rate_mode))
+        raise ValueError(f"{mode} requires: {', '.join(missing)}")
 
 
-def build_video_encoder_args(profile: EncodeProfile) -> List[str]:
-    validate_rate_settings(profile)
-    codec = encoder_codec(profile)
+def build_video_encoder_args(profile: EncodeProfile, variant: Optional[OutputVariant] = None) -> List[str]:
+    validate_rate_settings(profile, variant)
+    codec = encoder_codec(profile, variant)
     cmd: List[str] = ["-c:v", codec]
 
     if is_nvenc_codec(codec):
-        cmd += ["-gpu", str(max(profile.gpu_index, 0))]
-        cmd += ["-preset:v", profile.preset]
-        if profile.tune != "none":
-            cmd += ["-tune:v", profile.tune]
+        gpu_index = variant_gpu_index(profile, variant) if variant is not None else max(profile.gpu_index, 0)
+        preset = str(variant_setting(profile, variant, "preset", profile.preset) if variant is not None else profile.preset)
+        tune = str(variant_setting(profile, variant, "tune", profile.tune) if variant is not None else profile.tune)
+        cmd += ["-gpu", str(gpu_index)]
+        cmd += ["-preset:v", preset]
+        if tune != "none":
+            cmd += ["-tune:v", tune]
     else:
-        cmd += ["-preset:v", profile.cpu_preset]
-        if profile.cpu_tune != "none":
-            cmd += ["-tune:v", profile.cpu_tune]
+        cpu_preset = str(
+            variant_setting(profile, variant, "cpu_preset", profile.cpu_preset) if variant is not None else profile.cpu_preset
+        )
+        cpu_tune = str(
+            variant_setting(profile, variant, "cpu_tune", profile.cpu_tune) if variant is not None else profile.cpu_tune
+        )
+        cmd += ["-preset:v", cpu_preset]
+        if cpu_tune != "none":
+            cmd += ["-tune:v", cpu_tune]
 
-    mode_name = profile.rate_mode.upper()
+    mode_name = str(variant_setting(profile, variant, "rate_mode", profile.rate_mode) if variant is not None else profile.rate_mode).upper()
+    cq_value = int(variant_setting(profile, variant, "cq_value", profile.cq_value) if variant is not None else profile.cq_value)
+    bitrate = str(variant_setting(profile, variant, "bitrate", profile.bitrate) if variant is not None else profile.bitrate)
+    maxrate = str(variant_setting(profile, variant, "maxrate", profile.maxrate) if variant is not None else profile.maxrate)
+    bufsize = str(variant_setting(profile, variant, "bufsize", profile.bufsize) if variant is not None else profile.bufsize)
     if is_nvenc_codec(codec):
         if mode_name == "CQ":
-            cmd += ["-b:v", "0", "-cq:v", str(profile.cq_value)]
+            cmd += ["-b:v", "0", "-cq:v", str(cq_value)]
         elif mode_name == "VBR":
             cmd += [
                 "-rc:v",
                 "vbr",
                 "-b:v",
-                profile.bitrate,
+                bitrate,
                 "-maxrate:v",
-                profile.maxrate,
+                maxrate,
                 "-bufsize:v",
-                profile.bufsize,
+                bufsize,
                 "-cq:v",
-                str(profile.cq_value),
+                str(cq_value),
             ]
         elif mode_name == "ABR":
-            cmd += ["-b:v", profile.bitrate]
+            cmd += ["-b:v", bitrate]
         elif mode_name == "CBR":
             cmd += [
                 "-rc:v",
                 "cbr",
                 "-b:v",
-                profile.bitrate,
+                bitrate,
                 "-maxrate:v",
-                profile.bitrate,
+                bitrate,
                 "-bufsize:v",
-                profile.bufsize,
+                bufsize,
             ]
         else:
-            raise ValueError(f"Unknown rate mode: {profile.rate_mode}")
+            raise ValueError(f"Unknown rate mode: {mode_name}")
     else:
         if mode_name == "CQ":
-            cmd += ["-crf", str(profile.cq_value)]
+            cmd += ["-crf", str(cq_value)]
         elif mode_name in {"VBR", "ABR"}:
-            cmd += ["-b:v", profile.bitrate]
+            cmd += ["-b:v", bitrate]
             if mode_name == "VBR":
-                cmd += ["-maxrate:v", profile.maxrate, "-bufsize:v", profile.bufsize]
+                cmd += ["-maxrate:v", maxrate, "-bufsize:v", bufsize]
         elif mode_name == "CBR":
             cmd += [
                 "-b:v",
-                profile.bitrate,
+                bitrate,
                 "-maxrate:v",
-                profile.bitrate,
+                bitrate,
                 "-bufsize:v",
-                profile.bufsize,
+                bufsize,
             ]
         else:
-            raise ValueError(f"Unknown rate mode: {profile.rate_mode}")
+            raise ValueError(f"Unknown rate mode: {mode_name}")
 
     return cmd
 
@@ -632,34 +835,48 @@ def build_ffmpeg_command(
         "-stats_period",
         "1",
     ]
+    extra_input_args = parse_ffmpeg_args(variant_setting(profile, variant, "extra_input_args", ""))
+    extra_video_args = parse_ffmpeg_args(variant_setting(profile, variant, "extra_video_args", ""))
+    extra_output_args = parse_ffmpeg_args(variant_setting(profile, variant, "extra_output_args", ""))
 
     # Segment resume prioritizes fast input seeking; exact boundaries are handled at segment granularity.
     if start_seconds is not None and start_seconds > 0:
         cmd += ["-ss", format_seconds(start_seconds)]
     if duration_seconds is not None and duration_seconds > 0:
         cmd += ["-t", format_seconds(duration_seconds)]
+    cmd += extra_input_args
     cmd += [
         "-i",
         str(src),
         "-y",
         "-map",
-        "0",
+        "0:v:0",
+        "-an",
         "-pix_fmt",
-        output_pix_fmt(profile),
+        output_pix_fmt(profile, variant),
     ]
-    cmd += build_video_encoder_args(profile)
+    cmd += build_video_encoder_args(profile, variant)
 
     if variant.height is not None and variant.height > 0:
-        scale = f"scale=-2:{variant.height}:flags={profile.scale_flags}"
+        scale_flags = str(variant_setting(profile, variant, "scale_flags", profile.scale_flags) or "lanczos+accurate_rnd")
+        scale = f"scale=-2:{variant.height}:flags={scale_flags}"
         cmd += ["-vf", scale]
 
-    cmd += ["-c:a", "copy", "-c:s", "copy"]
-    cmd += faststart_args_for_container(variant.container)
+    cmd += extra_video_args
+    cmd += faststart_args_unless_overridden(variant.container, extra_output_args)
+    cmd += extra_output_args
     cmd += [str(tmp_out)]
     return cmd
 
 
-def build_concat_command(ffmpeg_path: Path, list_file: Path, tmp_out: Path) -> List[str]:
+def build_concat_command(
+    ffmpeg_path: Path,
+    list_file: Path,
+    tmp_out: Path,
+    profile: Optional[EncodeProfile] = None,
+    variant: Optional[OutputVariant] = None,
+) -> List[str]:
+    extra_args = parse_ffmpeg_args(variant_setting(profile, variant, "extra_concat_args", "") if profile and variant else "")
     cmd = [
         str(ffmpeg_path),
         "-hide_banner",
@@ -673,7 +890,74 @@ def build_concat_command(ffmpeg_path: Path, list_file: Path, tmp_out: Path) -> L
         "-c",
         "copy",
     ]
-    cmd += faststart_args_for_container(tmp_out.suffix)
+    cmd += faststart_args_unless_overridden(tmp_out.suffix, extra_args)
+    cmd += extra_args
+    cmd += [str(tmp_out)]
+    return cmd
+
+
+def build_audio_command(
+    ffmpeg_path: Path,
+    src: Path,
+    tmp_audio: Path,
+    profile: EncodeProfile,
+    variant: OutputVariant,
+) -> List[str]:
+    extra_input_args = parse_ffmpeg_args(variant_setting(profile, variant, "extra_input_args", ""))
+    extra_audio_args = parse_ffmpeg_args(variant_setting(profile, variant, "extra_audio_args", ""))
+    audio_codec = variant_audio_codec(profile, variant)
+    audio_bitrate = str(variant_setting(profile, variant, "audio_bitrate", "") or "").strip()
+    cmd = [
+        str(ffmpeg_path),
+        "-hide_banner",
+        "-stats_period",
+        "1",
+    ]
+    cmd += extra_input_args
+    cmd += [
+        "-i",
+        str(src),
+        "-y",
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-c:a",
+        audio_codec,
+    ]
+    if audio_codec.lower() != "copy" and audio_bitrate:
+        cmd += ["-b:a", audio_bitrate]
+    cmd += extra_audio_args
+    cmd += [str(tmp_audio)]
+    return cmd
+
+
+def build_mux_command(
+    ffmpeg_path: Path,
+    video_in: Path,
+    audio_in: Path,
+    tmp_out: Path,
+    profile: EncodeProfile,
+    variant: OutputVariant,
+) -> List[str]:
+    extra_args = parse_ffmpeg_args(variant_setting(profile, variant, "extra_mux_args", ""))
+    cmd = [
+        str(ffmpeg_path),
+        "-hide_banner",
+        "-i",
+        str(video_in),
+        "-i",
+        str(audio_in),
+        "-y",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c",
+        "copy",
+        "-shortest",
+    ]
+    cmd += faststart_args_unless_overridden(tmp_out.suffix, extra_args)
+    cmd += extra_args
     cmd += [str(tmp_out)]
     return cmd
 
@@ -747,6 +1031,40 @@ def probe_duration(ffprobe_path: Path, src: Path) -> Optional[float]:
     return duration
 
 
+def probe_has_audio(ffprobe_path: Path, src: Path) -> bool:
+    if not ffprobe_path.exists():
+        return False
+    try:
+        result = subprocess.run(
+            [
+                str(ffprobe_path),
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv=p=0",
+                str(src),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"ffprobe audio probe failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"ffprobe audio probe failed: exit {result.returncode}{suffix}")
+    return bool(result.stdout.strip())
+
+
 def segment_ranges(duration: Optional[float], segment_seconds: int) -> List[Tuple[float, Optional[float]]]:
     if duration is None or segment_seconds <= 0:
         return [(0.0, None)]
@@ -769,22 +1087,32 @@ def job_fingerprint(profile: EncodeProfile, variant: OutputVariant) -> str:
         "variant_folder": variant.folder_name,
         "variant_height": variant.height,
         "variant_container": variant.container,
+        "variant_filename_template": variant.filename_template,
         "segment_minutes": profile.segment_minutes,
-        "use_gpu": profile.use_gpu,
-        "gpu_index": profile.gpu_index,
-        "codec": profile.codec,
-        "cpu_codec": profile.cpu_codec,
-        "preset": profile.preset,
-        "cpu_preset": profile.cpu_preset,
-        "tune": profile.tune,
-        "cpu_tune": profile.cpu_tune,
-        "rate_mode": profile.rate_mode,
-        "cq_value": profile.cq_value,
-        "bitrate": profile.bitrate,
-        "maxrate": profile.maxrate,
-        "bufsize": profile.bufsize,
-        "pix_fmt": profile.pix_fmt,
-        "scale_flags": profile.scale_flags,
+        "use_gpu": variant_use_gpu(profile, variant),
+        "gpu_index": variant_gpu_index(profile, variant),
+        "codec": encoder_codec(profile, variant),
+        "cpu_codec": variant_setting(profile, variant, "cpu_codec", profile.cpu_codec),
+        "preset": variant_setting(profile, variant, "preset", profile.preset),
+        "cpu_preset": variant_setting(profile, variant, "cpu_preset", profile.cpu_preset),
+        "cpu_tune": variant_setting(profile, variant, "cpu_tune", profile.cpu_tune),
+        "tune": variant_setting(profile, variant, "tune", profile.tune),
+        "rate_mode": variant_setting(profile, variant, "rate_mode", profile.rate_mode),
+        "cq_value": variant_setting(profile, variant, "cq_value", profile.cq_value),
+        "bitrate": variant_setting(profile, variant, "bitrate", profile.bitrate),
+        "maxrate": variant_setting(profile, variant, "maxrate", profile.maxrate),
+        "bufsize": variant_setting(profile, variant, "bufsize", profile.bufsize),
+        "pix_fmt": output_pix_fmt(profile, variant),
+        "scale_flags": variant_setting(profile, variant, "scale_flags", profile.scale_flags),
+        "audio_codec": variant_audio_codec(profile, variant),
+        "audio_bitrate": variant_setting(profile, variant, "audio_bitrate", ""),
+        "audio_container": variant_audio_container(profile, variant),
+        "extra_input_args": variant_setting(profile, variant, "extra_input_args", ""),
+        "extra_video_args": variant_setting(profile, variant, "extra_video_args", ""),
+        "extra_audio_args": variant_setting(profile, variant, "extra_audio_args", ""),
+        "extra_output_args": variant_setting(profile, variant, "extra_output_args", ""),
+        "extra_concat_args": variant_setting(profile, variant, "extra_concat_args", ""),
+        "extra_mux_args": variant_setting(profile, variant, "extra_mux_args", ""),
     }
     encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:10]
@@ -822,10 +1150,30 @@ def segment_dir_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant:
     return paths.tmp_dir / "segments" / job_key(src, profile, variant)
 
 
-def segment_file_name(variant: OutputVariant, index: int, partial: bool = False) -> str:
+def segment_file_name(
+    variant: OutputVariant,
+    index: int,
+    partial: bool = False,
+    src: Optional[Path] = None,
+) -> str:
     container = normalize_container_extension(variant.container)
     marker = ".partial" if partial else ""
+    if src is not None:
+        stem = safe_file_stem(src.stem)
+        if len(stem) > SEGMENT_SOURCE_STEM_LIMIT:
+            stem = stem[:SEGMENT_SOURCE_STEM_LIMIT].rstrip(".- ") or "video"
+        return f"{stem}-{index + 1:03d}{marker}.{container}"
     return f"segment-{index:05d}{marker}.{container}"
+
+
+def joined_video_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant) -> Path:
+    container = normalize_container_extension(variant.container)
+    return paths.tmp_dir / f"{job_key(src, profile, variant)}.video.{container}"
+
+
+def temp_audio_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant) -> Path:
+    container = variant_audio_container(profile, variant)
+    return paths.tmp_dir / f"{job_key(src, profile, variant)}.audio.{container}"
 
 
 def temp_output_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant) -> Path:

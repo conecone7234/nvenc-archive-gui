@@ -1,24 +1,27 @@
 # NvencArchiveGui
 
-Windows native GUI encoder for profile-based FFmpeg/NVENC archive jobs.
+Windows native GUI encoder for FFmpeg/NVENC archive jobs.
 
 ## Features
 
 - Home screen focused on Start / Pause / Stop, logs, and file-by-file progress
-- Profile-based input, output, and source archive folders
-- Multiple output variants per source file, such as `Master 2160p` and `Reference 1080p`
+- Settings-based input, output, and source archive folders
+- Multiple output profiles per source file, such as `Master 2160p` and `Reference 1080p`
+- Per-output-profile file name templates, resolution, container, codec, rate control, GPU, audio, and advanced FFmpeg arguments
 - Resolution presets plus custom output height
-- CQ/CRF, VBR, ABR, and CBR modes, with irrelevant bitrate fields disabled in the UI
+- CQ/CRF, VBR, ABR, and CBR modes
 - Manual GPU selection with CPU-only fallback when no NVIDIA GPU is detected
-- Parallel job count per profile
+- Parallel segment count per setting
+- One-source-at-a-time processing order, with each source's output profiles completed before the next source starts
+- Video-only segment encoding, video concat, source audio processing once, then final video/audio mux
 - Automatic FFmpeg and FFprobe install when the bundled executables are missing
 - Segment-based fault tolerance: completed time slices are kept and unfinished work can be resumed
-- Source files move to the profile archive folder only after all requested outputs are complete
+- Source files move to the archive folder only after all requested outputs are complete
 
 ## Folder Layout
 
 The app no longer depends on fixed folders named `OBSData`, `SourceData(MP4)`, or `SourceData(4K)`.
-Profiles define their own folders. A fresh profile defaults to:
+Settings define their own folders. A fresh setting defaults to:
 
 ```text
 work-folder
@@ -38,13 +41,16 @@ work-folder
     `-- segments
 ```
 
-Profile folders are created when the profile is executed, not at app startup.
+Folders are created when the setting is executed, not at app startup.
 
 ## Resume Behavior
 
 The app does not pause an active video encoder process in the middle of a write.
-Instead, each output is encoded as fixed-duration segments. Pause waits until the
-current segment finishes, and Stop leaves completed segments in `tmp/segments`.
+Instead, each output profile is encoded as fixed-duration video-only segments.
+Segments for one output profile can run in parallel. After the video segments are
+concatenated, audio is processed once from the original source and muxed with the
+joined video. Pause waits before launching more segments, and Stop leaves
+completed segments in `tmp/segments`.
 Use `保存状態から再開` to continue after an app crash, forced shutdown, or manual stop.
 
 ## Run From Source

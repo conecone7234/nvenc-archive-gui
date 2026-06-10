@@ -10,9 +10,11 @@ from ffmpeg_nvenc_gui.core import (
     GpuInfo,
     JobSpec,
     OutputVariant,
+    build_audio_command,
     build_concat_command,
     build_ffmpeg_command,
     build_job_specs,
+    build_mux_command,
     build_paths,
     clear_state,
     duplicate_output_targets,
@@ -24,6 +26,8 @@ from ffmpeg_nvenc_gui.core import (
     missing_rate_fields,
     normalize_container_extension,
     output_path_for,
+    parse_ffmpeg_args,
+    probe_has_audio,
     profile_archive_dir,
     profile_from_state,
     profile_input_dir,
@@ -135,6 +139,142 @@ def test_build_cpu_cq_uses_crf_and_hides_bitrate(tmp_path: Path):
     assert "-b:v" not in cmd
 
 
+def test_output_profile_overrides_video_segment_command_and_extra_args(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[1]
+    variant.use_gpu = False
+    variant.cpu_codec = "libx265"
+    variant.cpu_preset = "slow"
+    variant.cpu_tune = "grain"
+    variant.rate_mode = "VBR"
+    variant.bitrate = "8000k"
+    variant.maxrate = "12000k"
+    variant.bufsize = "24000k"
+    variant.extra_input_args = "-noautorotate"
+    variant.extra_video_args = "-g 120"
+    variant.extra_output_args = "-movflags +frag_keyframe+empty_moov -map_metadata 0"
+
+    cmd = build_ffmpeg_command(
+        tmp_path / "ffmpeg.exe",
+        tmp_path / "input.mkv",
+        tmp_path / "chunk.mp4",
+        profile,
+        variant,
+    )
+
+    assert "libx265" in cmd
+    assert cmd[cmd.index("-preset:v") + 1] == "slow"
+    assert cmd[cmd.index("-tune:v") + 1] == "grain"
+    assert ["-map", "0:v:0"] == cmd[cmd.index("-map") : cmd.index("-map") + 2]
+    assert "-an" in cmd
+    assert "-c:a" not in cmd
+    assert "-noautorotate" in cmd
+    assert "-g" in cmd
+    assert "120" in cmd
+    assert cmd.count("-movflags") == 1
+    assert "+frag_keyframe+empty_moov" in cmd
+    assert "+faststart" not in cmd
+
+
+def test_parse_ffmpeg_args_preserves_windows_paths_and_removes_quotes():
+    args = parse_ffmpeg_args(r'-metadata title="My Clip" -passlogfile "C:\temp\ffmpeg pass.log"')
+
+    assert args == ["-metadata", "title=My Clip", "-passlogfile", r"C:\temp\ffmpeg pass.log"]
+
+
+def test_audio_and_mux_commands_are_separate_from_video_segments(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    variant.audio_codec = "aac"
+    variant.audio_bitrate = "192k"
+    variant.extra_audio_args = "-ar 48000"
+    variant.extra_mux_args = "-map_metadata 0"
+
+    audio_cmd = build_audio_command(
+        tmp_path / "ffmpeg.exe",
+        tmp_path / "input.mkv",
+        tmp_path / "audio.m4a",
+        profile,
+        variant,
+    )
+    mux_cmd = build_mux_command(
+        tmp_path / "ffmpeg.exe",
+        tmp_path / "video.mp4",
+        tmp_path / "audio.m4a",
+        tmp_path / "output.mp4",
+        profile,
+        variant,
+    )
+
+    assert ["-map", "0:a:0"] == audio_cmd[audio_cmd.index("-map") : audio_cmd.index("-map") + 2]
+    assert "-vn" in audio_cmd
+    assert ["-c:a", "aac"] == audio_cmd[audio_cmd.index("-c:a") : audio_cmd.index("-c:a") + 2]
+    assert ["-b:a", "192k"] == audio_cmd[audio_cmd.index("-b:a") : audio_cmd.index("-b:a") + 2]
+    assert "-ar" in audio_cmd
+    assert "48000" in audio_cmd
+    assert ["-map", "0:v:0"] == mux_cmd[mux_cmd.index("-map") : mux_cmd.index("-map") + 2]
+    second_map = mux_cmd.index("-map", mux_cmd.index("-map") + 1)
+    assert ["-map", "1:a:0"] == mux_cmd[second_map : second_map + 2]
+    assert ["-c", "copy"] == mux_cmd[mux_cmd.index("-c") : mux_cmd.index("-c") + 2]
+    assert "-shortest" in mux_cmd
+    assert "-map_metadata" in mux_cmd
+
+
+def test_probe_has_audio_handles_missing_and_stream_results(tmp_path: Path, monkeypatch):
+    src = tmp_path / "video.mp4"
+    ffprobe = tmp_path / "ffprobe.exe"
+    ffprobe.write_text("", encoding="utf-8")
+
+    assert probe_has_audio(tmp_path / "missing-ffprobe.exe", src) is False
+
+    class Result:
+        def __init__(self, stdout: str):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    monkeypatch.setattr("ffmpeg_nvenc_gui.core.subprocess.run", lambda *_args, **_kwargs: Result(""))
+
+    assert probe_has_audio(ffprobe, src) is False
+
+    monkeypatch.setattr("ffmpeg_nvenc_gui.core.subprocess.run", lambda *_args, **_kwargs: Result("0\n"))
+
+    assert probe_has_audio(ffprobe, src) is True
+
+
+def test_probe_has_audio_fails_fast_on_probe_errors(tmp_path: Path, monkeypatch):
+    src = tmp_path / "video.mp4"
+    ffprobe = tmp_path / "ffprobe.exe"
+    ffprobe.write_text("", encoding="utf-8")
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "invalid input"
+
+    monkeypatch.setattr("ffmpeg_nvenc_gui.core.subprocess.run", lambda *_args, **_kwargs: Result())
+
+    try:
+        probe_has_audio(ffprobe, src)
+    except RuntimeError as exc:
+        assert "exit 1" in str(exc)
+        assert "invalid input" in str(exc)
+    else:
+        raise AssertionError("expected ffprobe return code failure to raise")
+
+    def raise_probe_error(*_args, **_kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("ffmpeg_nvenc_gui.core.subprocess.run", raise_probe_error)
+
+    try:
+        probe_has_audio(ffprobe, src)
+    except RuntimeError as exc:
+        assert "permission denied" in str(exc)
+    else:
+        raise AssertionError("expected ffprobe invocation failure to raise")
+
+
 def test_faststart_is_only_used_for_mov_mp4_family(tmp_path: Path):
     profile = make_profile(tmp_path)
     mp4_variant = profile.outputs[0]
@@ -215,7 +355,10 @@ def test_duplicate_output_targets_are_detected(tmp_path: Path):
         OutputVariant(id="c", name="C", folder_name="review", height=720, container="mkv"),
     ]
 
-    assert duplicate_output_targets(profile) == ["review.mp4"]
+    assert duplicate_output_targets(profile) == ["review/{source}.mp4"]
+
+    profile.outputs[1].filename_template = "{source}-mobile"
+    assert duplicate_output_targets(profile) == []
 
 
 def test_scan_and_job_specs_skip_existing_outputs(tmp_path: Path):
@@ -260,6 +403,16 @@ def test_output_variant_normalizes_safe_container_extensions(tmp_path: Path):
     assert variant.container == "mov"
     assert unsafe.container == "mp4"
     assert output_path_for(profile, Path(profile.input_dir) / "video.mkv", unsafe).name == "video.mp4"
+
+
+def test_output_filename_template_uses_source_and_output_profile_tokens(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    variant.filename_template = "{source}-{profile}-{height}"
+
+    output = output_path_for(profile, Path(profile.input_dir) / "Clip 01.mkv", variant)
+
+    assert output.name == "Clip 01-Master 2160p-2160.mp4"
 
 
 def test_profile_and_variant_loading_ignore_unknown_keys_and_normalize_types(tmp_path: Path):
@@ -474,6 +627,10 @@ def test_segment_file_name_normalizes_container_and_partial_marker():
 
     assert segment_file_name(variant, 3) == "segment-00003.mkv"
     assert segment_file_name(variant, 3, partial=True) == "segment-00003.partial.mkv"
+    assert segment_file_name(variant, 0, src=Path("A.mp4")) == "A-001.mkv"
+    assert segment_file_name(variant, 1, partial=True, src=Path("A.mp4")) == "A-002.partial.mkv"
+    long_name = "A" * 120
+    assert segment_file_name(variant, 0, src=Path(f"{long_name}.mp4")) == f"{'A' * 40}-001.mkv"
 
 
 def test_encoder_app_profile_helpers_use_ids_for_duplicates(tmp_path: Path):
@@ -532,6 +689,77 @@ def test_encoder_app_validate_profile_requires_enabled_output(tmp_path: Path):
     assert any("有効" in message for _, message in messages)
 
 
+def test_encoder_app_output_cq_validation_depends_on_rate_mode():
+    assert EncoderApp._cq_value_for_rate_mode("ABR", "", 18) == 18
+    assert EncoderApp._cq_value_for_rate_mode("CBR", "not-number", 22) == 22
+    assert EncoderApp._cq_value_for_rate_mode("CQ", "19", 18) == 19
+    assert EncoderApp._cq_value_for_rate_mode("VBR", "20", 18) == 20
+    assert EncoderApp._cq_value_for_rate_mode("CQ", "not-number", 18) is None
+
+
+def test_encoder_app_output_cq_fallback_prefers_existing_then_form_value(tmp_path: Path):
+    class Value:
+        def __init__(self, value: str):
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    app.current_profile = lambda: profile
+    app.cq_var = Value("21")
+    app.selected_output_id = None
+    app.editing_outputs = [OutputVariant(id="existing", name="Existing", folder_name="existing", cq_value=25)]
+
+    assert app._output_cq_fallback() == 21
+
+    app.selected_output_id = "existing"
+    assert app._output_cq_fallback() == 25
+
+    app.selected_output_id = None
+    app.cq_var = Value("not-number")
+    assert app._output_cq_fallback() == profile.cq_value
+
+
+def test_encoder_app_output_rate_controls_match_selected_mode():
+    class Value:
+        def __init__(self, value: str):
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+    class Widget:
+        def __init__(self):
+            self.state = None
+
+        def configure(self, **kwargs):
+            self.state = kwargs["state"]
+
+    app = EncoderApp.__new__(EncoderApp)
+    app.output_rate_mode_var = Value("ABR")
+    app.output_cq_entry = Widget()
+    app.output_bitrate_entry = Widget()
+    app.output_maxrate_entry = Widget()
+    app.output_bufsize_entry = Widget()
+
+    app.update_output_rate_controls()
+
+    assert app.output_cq_entry.state == app_module.tk.DISABLED
+    assert app.output_bitrate_entry.state == app_module.tk.NORMAL
+    assert app.output_maxrate_entry.state == app_module.tk.DISABLED
+    assert app.output_bufsize_entry.state == app_module.tk.DISABLED
+
+    app.output_rate_mode_var = Value("VBR")
+    app.update_output_rate_controls()
+
+    assert app.output_cq_entry.state == app_module.tk.NORMAL
+    assert app.output_bitrate_entry.state == app_module.tk.NORMAL
+    assert app.output_maxrate_entry.state == app_module.tk.NORMAL
+    assert app.output_bufsize_entry.state == app_module.tk.NORMAL
+
+
 def test_run_process_publishes_process_under_lock_and_honors_stop(tmp_path: Path):
     app = EncoderApp.__new__(EncoderApp)
     app.lock = threading.Lock()
@@ -553,6 +781,35 @@ def test_run_process_publishes_process_under_lock_and_honors_stop(tmp_path: Path
 
     assert ret != 0
     assert job.process is None
+
+
+def test_skip_audio_output_logs_reason_and_moves_joined_video(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    log_messages = []
+    app.log = log_messages.append
+    profile = make_profile(tmp_path)
+    job = RuntimeJob(
+        job_id=1,
+        spec=JobSpec(src=str(tmp_path / "input.mkv"), profile_id=profile.id, variant_id=profile.outputs[0].id),
+        profile=profile,
+        variant=profile.outputs[0],
+        tmp_out=tmp_path / "tmp.mp4",
+        out_file=tmp_path / "out.mp4",
+        log_file=tmp_path / "job.log",
+    )
+    joined_video = tmp_path / "joined.mp4"
+    joined_video.write_bytes(b"video")
+
+    with open(job.log_file, "w", encoding="utf-8") as log_fp:
+        app.skip_audio_output(job, Path(job.spec.src), joined_video, log_fp, "No audio stream detected")
+
+    assert job.tmp_out.read_bytes() == b"video"
+    assert not joined_video.exists()
+    assert job.status == "映像のみ"
+    assert job.message == "video-only"
+    assert any("No audio stream detected" in message for message in log_messages)
+    assert "Audio skipped: No audio stream detected" in job.log_file.read_text(encoding="utf-8")
 
 
 def test_state_resume_filters_completed_jobs(tmp_path: Path):

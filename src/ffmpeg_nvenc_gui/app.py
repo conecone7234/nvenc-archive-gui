@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -23,9 +23,11 @@ try:
         JobSpec,
         OutputVariant,
         RESOLUTION_PRESETS,
+        build_audio_command,
         build_concat_command,
         build_ffmpeg_command,
         build_job_specs,
+        build_mux_command,
         build_paths,
         clear_state,
         command_to_text,
@@ -44,6 +46,7 @@ try:
         normalize_container_extension,
         output_path_for,
         parse_ffmpeg_time,
+        probe_has_audio,
         probe_duration,
         profile_archive_dir,
         profile_from_state,
@@ -53,9 +56,11 @@ try:
         save_profiles,
         save_state,
         scan_profile_files,
+        joined_video_path_for,
         segment_dir_for,
         segment_file_name,
         segment_ranges,
+        temp_audio_path_for,
         temp_output_path_for,
         variant_by_id,
         write_concat_file,
@@ -70,9 +75,11 @@ except ModuleNotFoundError:
         JobSpec,
         OutputVariant,
         RESOLUTION_PRESETS,
+        build_audio_command,
         build_concat_command,
         build_ffmpeg_command,
         build_job_specs,
+        build_mux_command,
         build_paths,
         clear_state,
         command_to_text,
@@ -91,6 +98,7 @@ except ModuleNotFoundError:
         normalize_container_extension,
         output_path_for,
         parse_ffmpeg_time,
+        probe_has_audio,
         probe_duration,
         profile_archive_dir,
         profile_from_state,
@@ -100,9 +108,11 @@ except ModuleNotFoundError:
         save_profiles,
         save_state,
         scan_profile_files,
+        joined_video_path_for,
         segment_dir_for,
         segment_file_name,
         segment_ranges,
+        temp_audio_path_for,
         temp_output_path_for,
         variant_by_id,
         write_concat_file,
@@ -162,20 +172,23 @@ class RuntimeJob:
     out_file: Path
     log_file: Path
     process: Optional[subprocess.Popen] = None
+    processes: Dict[int, subprocess.Popen] = field(default_factory=dict)
     status: str = "waiting"
     message: str = ""
     total_segments: int = 1
     completed_segments: int = 0
     current_segment: int = 0
     progress: float = 0.0
+    segment_progress: Dict[int, float] = field(default_factory=dict)
+    completed_segment_indexes: set[int] = field(default_factory=set)
 
 
 class EncoderApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("NVEnc Archive Studio")
-        self.root.geometry("1180x780")
-        self.root.minsize(760, 520)
+        self.root.geometry("1180x720")
+        self.root.minsize(980, 620)
 
         self.paths: AppPaths = build_paths()
         ensure_dirs(self.paths)
@@ -279,13 +292,13 @@ class EncoderApp:
         ttk.Label(title_block, text="NVEnc Archive Studio", style="Title.TLabel").pack(anchor=tk.W)
         ttk.Label(
             title_block,
-            text="プロファイル単位で入力先、出力先、処理デバイス、出力バリアントを管理します。",
+            text="設定で入力先と出力先を定義し、出力プロファイルごとにエンコード内容を切り替えます。",
             style="Subtitle.TLabel",
         ).pack(anchor=tk.W, pady=(2, 0))
 
         selector = ttk.Frame(header, style="App.TFrame")
         selector.pack(side=tk.RIGHT, padx=(12, 0))
-        ttk.Label(selector, text="実行プロファイル").pack(anchor=tk.W)
+        ttk.Label(selector, text="実行設定").pack(anchor=tk.W)
         self.profile_combo = ttk.Combobox(
             selector,
             textvariable=self.active_profile_var,
@@ -301,7 +314,7 @@ class EncoderApp:
         self.run_tab = ttk.Frame(self.notebook, style="App.TFrame")
         self.profile_tab = ttk.Frame(self.notebook, style="App.TFrame")
         self.notebook.add(self.run_tab, text="実行")
-        self.notebook.add(self.profile_tab, text="プロファイル")
+        self.notebook.add(self.profile_tab, text="設定")
         self.run_tab_body = self._scrollable_tab(self.run_tab)
         self.profile_tab_body = self._scrollable_tab(self.profile_tab)
 
@@ -479,7 +492,7 @@ class EncoderApp:
 
         toolbar = ttk.Frame(form, style="Surface.TFrame")
         toolbar.pack(fill=tk.X, pady=(0, 12))
-        ttk.Label(toolbar, text="プロファイル設定", style="Section.TLabel").pack(side=tk.LEFT)
+        ttk.Label(toolbar, text="設定", style="Section.TLabel").pack(side=tk.LEFT)
         ttk.Button(toolbar, text="新規", command=self.new_profile).pack(side=tk.RIGHT, padx=(8, 0))
         ttk.Button(toolbar, text="削除", command=self.delete_current_profile).pack(side=tk.RIGHT, padx=(8, 0))
         ttk.Button(toolbar, text="保存", style="Accent.TButton", command=self.save_current_profile).pack(side=tk.RIGHT)
@@ -504,7 +517,7 @@ class EncoderApp:
         self.bufsize_var = tk.StringVar(value="80000k")
 
         general = self._section(form, "基本設定")
-        self._entry_row(general, "プロファイル名", self.profile_name_var)
+        self._entry_row(general, "設定名", self.profile_name_var)
         self._path_row(general, "入力先", self.input_dir_var)
         self._path_row(general, "出力先", self.output_dir_var)
         self._path_row(general, "処理済みソース退避先", self.archive_dir_var)
@@ -512,10 +525,10 @@ class EncoderApp:
         runtime = self._section(form, "実行設定")
         self.gpu_combo = self._combo_row(runtime, "処理デバイス", self.gpu_choice_var, self._gpu_choices())
         self.gpu_combo.bind("<<ComboboxSelected>>", self.on_device_changed)
-        self._spin_row(runtime, "同時実行数", self.max_jobs_var, 1, 8)
+        self._spin_row(runtime, "並列セグメント数", self.max_jobs_var, 1, 8)
         self._spin_row(runtime, "分割間隔(分)", self.segment_minutes_var, 1, 120)
 
-        encoder = self._section(form, "エンコード設定")
+        encoder = self._section(form, "エンコード既定値")
         self.gpu_settings_frame = ttk.Frame(encoder, style="Surface.TFrame")
         self.cpu_settings_frame = ttk.Frame(encoder, style="Surface.TFrame")
         self.gpu_codec_combo = self._combo_row(self.gpu_settings_frame, "GPU Codec", self.codec_var, GPU_CODECS, width=18)
@@ -539,8 +552,8 @@ class EncoderApp:
         outputs.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
         output_head = ttk.Frame(outputs, style="Surface.TFrame")
         output_head.pack(fill=tk.X)
-        ttk.Label(output_head, text="このプロファイルの出力バリアント", style="Section.TLabel").pack(side=tk.LEFT)
-        ttk.Button(output_head, text="選択解除", command=self.clear_output_selection).pack(side=tk.RIGHT)
+        ttk.Label(output_head, text="出力プロファイル", style="Section.TLabel").pack(side=tk.LEFT)
+        ttk.Button(output_head, text="選択を解除", command=self.clear_output_selection).pack(side=tk.RIGHT)
 
         output_body = ttk.Frame(outputs, style="Surface.TFrame")
         output_body.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -573,36 +586,69 @@ class EncoderApp:
         self.output_custom_height_var = tk.StringVar(value="")
         self.output_container_var = tk.StringVar(value="mp4")
         self.output_enabled_var = tk.BooleanVar(value=True)
+        self.output_filename_template_var = tk.StringVar(value="{source}")
+        self.output_gpu_choice_var = tk.StringVar(value=CPU_DEVICE_LABEL)
+        self.output_codec_var = tk.StringVar(value="hevc_nvenc")
+        self.output_cpu_codec_var = tk.StringVar(value="libx264")
+        self.output_preset_var = tk.StringVar(value="p7")
+        self.output_cpu_preset_var = tk.StringVar(value="medium")
+        self.output_cpu_tune_var = tk.StringVar(value="none")
+        self.output_tune_var = tk.StringVar(value="hq")
+        self.output_rate_mode_var = tk.StringVar(value="CQ")
+        self.output_cq_var = tk.StringVar(value="18")
+        self.output_bitrate_var = tk.StringVar(value="25000k")
+        self.output_maxrate_var = tk.StringVar(value="40000k")
+        self.output_bufsize_var = tk.StringVar(value="80000k")
+        self.output_pix_fmt_var = tk.StringVar(value="nv12")
+        self.output_scale_flags_var = tk.StringVar(value="lanczos+accurate_rnd")
+        self.output_audio_codec_var = tk.StringVar(value="copy")
+        self.output_audio_bitrate_var = tk.StringVar(value="")
+        self.output_audio_container_var = tk.StringVar(value="")
+        self.output_extra_input_args_var = tk.StringVar(value="")
+        self.output_extra_video_args_var = tk.StringVar(value="")
+        self.output_extra_audio_args_var = tk.StringVar(value="")
+        self.output_extra_output_args_var = tk.StringVar(value="")
+        self.output_extra_concat_args_var = tk.StringVar(value="")
+        self.output_extra_mux_args_var = tk.StringVar(value="")
 
-        ttk.Label(edit, text="名前", style="Surface.TLabel").grid(row=0, column=0, sticky=tk.W, pady=4, padx=(0, 8))
-        ttk.Entry(edit, textvariable=self.output_name_var).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Label(edit, text="フォルダ名", style="Surface.TLabel").grid(row=0, column=2, sticky=tk.W, pady=4, padx=(16, 8))
-        ttk.Entry(edit, textvariable=self.output_folder_var).grid(row=0, column=3, sticky="ew", pady=4)
+        def grid_entry(label: str, variable: tk.Variable, row: int, pair: int = 0) -> ttk.Entry:
+            label_column = pair * 2
+            ttk.Label(edit, text=label, style="Surface.TLabel").grid(
+                row=row,
+                column=label_column,
+                sticky=tk.W,
+                pady=4,
+                padx=(0 if pair == 0 else 16, 8),
+            )
+            entry = ttk.Entry(edit, textvariable=variable)
+            entry.grid(row=row, column=label_column + 1, sticky="ew", pady=4)
+            return entry
 
-        ttk.Label(edit, text="解像度", style="Surface.TLabel").grid(row=1, column=0, sticky=tk.W, pady=4, padx=(0, 8))
-        resolution_combo = ttk.Combobox(
-            edit,
-            textvariable=self.output_resolution_var,
-            values=list(RESOLUTION_PRESETS.keys()),
-            state="readonly",
-        )
-        resolution_combo.grid(row=1, column=1, sticky="ew", pady=4)
-        resolution_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_resolution_controls())
-        self.custom_height_label = ttk.Label(edit, text="カスタム高さ", style="Surface.TLabel")
-        self.custom_height_entry = ttk.Entry(edit, textvariable=self.output_custom_height_var)
-        self.custom_height_label.grid(row=1, column=2, sticky=tk.W, pady=4, padx=(16, 8))
-        self.custom_height_entry.grid(row=1, column=3, sticky="ew", pady=4)
+        def grid_combo(
+            label: str,
+            variable: tk.Variable,
+            values: List[str],
+            row: int,
+            pair: int = 0,
+            width: int = 18,
+        ) -> ttk.Combobox:
+            label_column = pair * 2
+            ttk.Label(edit, text=label, style="Surface.TLabel").grid(
+                row=row,
+                column=label_column,
+                sticky=tk.W,
+                pady=4,
+                padx=(0 if pair == 0 else 16, 8),
+            )
+            combo = ttk.Combobox(edit, textvariable=variable, values=values, width=width, state="readonly")
+            combo.grid(row=row, column=label_column + 1, sticky="ew", pady=4)
+            return combo
 
-        ttk.Label(edit, text="コンテナ", style="Surface.TLabel").grid(row=2, column=0, sticky=tk.W, pady=4, padx=(0, 8))
-        self.output_container_combo = SearchableCombobox(
-            edit,
-            textvariable=self.output_container_var,
-            values=CONTAINER_CHOICES,
-            state="normal",
-        )
-        self.output_container_combo.grid(row=2, column=1, sticky="ew", pady=4)
-        ttk.Checkbutton(edit, text="このバリアントを有効にする", variable=self.output_enabled_var).grid(
-            row=2,
+        grid_entry("名前", self.output_name_var, 0, 0)
+        grid_entry("フォルダ名", self.output_folder_var, 0, 1)
+        grid_entry("ファイル名テンプレート", self.output_filename_template_var, 1, 0)
+        ttk.Checkbutton(edit, text="このプロファイルを有効にする", variable=self.output_enabled_var).grid(
+            row=1,
             column=2,
             columnspan=2,
             sticky=tk.W,
@@ -610,8 +656,56 @@ class EncoderApp:
             padx=(16, 0),
         )
 
+        ttk.Label(edit, text="解像度", style="Surface.TLabel").grid(row=2, column=0, sticky=tk.W, pady=4, padx=(0, 8))
+        resolution_combo = ttk.Combobox(
+            edit,
+            textvariable=self.output_resolution_var,
+            values=list(RESOLUTION_PRESETS.keys()),
+            state="readonly",
+        )
+        resolution_combo.grid(row=2, column=1, sticky="ew", pady=4)
+        resolution_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_resolution_controls())
+        self.custom_height_label = ttk.Label(edit, text="カスタム高さ", style="Surface.TLabel")
+        self.custom_height_entry = ttk.Entry(edit, textvariable=self.output_custom_height_var)
+        self.custom_height_label.grid(row=2, column=2, sticky=tk.W, pady=4, padx=(16, 8))
+        self.custom_height_entry.grid(row=2, column=3, sticky="ew", pady=4)
+
+        ttk.Label(edit, text="コンテナ", style="Surface.TLabel").grid(row=3, column=0, sticky=tk.W, pady=4, padx=(0, 8))
+        self.output_container_combo = SearchableCombobox(
+            edit,
+            textvariable=self.output_container_var,
+            values=CONTAINER_CHOICES,
+            state="normal",
+        )
+        self.output_container_combo.grid(row=3, column=1, sticky="ew", pady=4)
+        self.output_gpu_combo = grid_combo("処理デバイス", self.output_gpu_choice_var, self._gpu_choices(), 3, 1, width=26)
+        grid_combo("NVENC Codec", self.output_codec_var, GPU_CODECS, 4, 0)
+        grid_combo("NVENC Preset", self.output_preset_var, GPU_PRESETS, 4, 1)
+        grid_combo("NVENC Tune", self.output_tune_var, GPU_TUNES, 5, 0)
+        self.output_rate_combo = grid_combo("Rate", self.output_rate_mode_var, RATE_MODES, 5, 1)
+        self.output_rate_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_rate_controls())
+        self.output_cpu_codec_combo = grid_combo("CPU Codec", self.output_cpu_codec_var, CPU_CODECS, 6, 0)
+        self.output_cpu_codec_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_cpu_tune_choices())
+        grid_combo("CPU Preset", self.output_cpu_preset_var, CPU_PRESETS, 6, 1)
+        self.output_cpu_tune_combo = grid_combo("CPU Tune", self.output_cpu_tune_var, CPU_TUNES_BY_CODEC["libx264"], 7, 0)
+        self.output_cq_entry = grid_entry("CQ/CRF", self.output_cq_var, 7, 1)
+        self.output_bitrate_entry = grid_entry("Bitrate", self.output_bitrate_var, 8, 0)
+        self.output_maxrate_entry = grid_entry("Maxrate", self.output_maxrate_var, 8, 1)
+        self.output_bufsize_entry = grid_entry("Bufsize", self.output_bufsize_var, 9, 0)
+        grid_entry("Pix fmt", self.output_pix_fmt_var, 9, 1)
+        grid_entry("Scale flags", self.output_scale_flags_var, 10, 0)
+        grid_entry("Audio codec", self.output_audio_codec_var, 10, 1)
+        grid_entry("Audio bitrate", self.output_audio_bitrate_var, 11, 0)
+        grid_entry("Audio container", self.output_audio_container_var, 11, 1)
+        grid_entry("FFmpeg input args", self.output_extra_input_args_var, 12, 0)
+        grid_entry("FFmpeg video args", self.output_extra_video_args_var, 12, 1)
+        grid_entry("FFmpeg audio args", self.output_extra_audio_args_var, 13, 0)
+        grid_entry("FFmpeg output args", self.output_extra_output_args_var, 13, 1)
+        grid_entry("FFmpeg concat args", self.output_extra_concat_args_var, 14, 0)
+        grid_entry("FFmpeg mux args", self.output_extra_mux_args_var, 14, 1)
+
         buttons = ttk.Frame(edit, style="Surface.TFrame")
-        buttons.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        buttons.grid(row=15, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         ttk.Button(buttons, text="追加/更新", style="Accent.TButton", command=self.add_or_update_output).pack(side=tk.RIGHT, padx=(8, 0))
         ttk.Button(buttons, text="削除", command=self.remove_output).pack(side=tk.RIGHT)
 
@@ -620,8 +714,10 @@ class EncoderApp:
         ttk.Button(footer, text="FFmpegを確認/導入", command=self.download_ffmpeg_button).pack(side=tk.RIGHT)
 
         self.update_cpu_tune_choices()
+        self.update_output_cpu_tune_choices()
         self.update_encoder_controls(apply_defaults=False)
         self.update_rate_controls()
+        self.update_output_rate_controls()
         self.update_resolution_controls()
 
     def _labeled_rate_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar) -> tuple[ttk.Label, ttk.Entry]:
@@ -656,7 +752,10 @@ class EncoderApp:
     def refresh_profile_choices(self) -> None:
         values = self._profile_labels()
         self.profile_combo.configure(values=values)
-        self.gpu_combo.configure(values=self._gpu_choices())
+        gpu_choices = self._gpu_choices()
+        self.gpu_combo.configure(values=gpu_choices)
+        if hasattr(self, "output_gpu_combo"):
+            self.output_gpu_combo.configure(values=gpu_choices)
 
         profile_ids = [profile.id for profile in self.profiles]
         if self.active_profile_id not in profile_ids:
@@ -741,8 +840,10 @@ class EncoderApp:
         self.bufsize_var.set(profile.bufsize)
         self.editing_outputs = [OutputVariant.from_dict(asdict(item)) for item in profile.outputs]
         self.selected_output_id = None
+        self.set_output_edit_defaults(profile)
         self.refresh_outputs_tree()
         self.update_cpu_tune_choices()
+        self.update_output_cpu_tune_choices()
         self.update_encoder_controls(apply_defaults=False)
         self.update_rate_controls()
         self.update_resolution_controls()
@@ -756,7 +857,12 @@ class EncoderApp:
         return CPU_DEVICE_LABEL
 
     def _parse_gpu_choice(self) -> tuple[bool, int, str]:
-        choice = self.gpu_choice_var.get()
+        return self._parse_gpu_choice_value(self.gpu_choice_var.get())
+
+    def _parse_output_gpu_choice(self) -> tuple[bool, int, str]:
+        return self._parse_gpu_choice_value(self.output_gpu_choice_var.get())
+
+    def _parse_gpu_choice_value(self, choice: str) -> tuple[bool, int, str]:
         if not choice.startswith(GPU_DEVICE_PREFIX):
             return False, 0, ""
         prefix, _, name = choice.partition(":")
@@ -764,6 +870,51 @@ class EncoderApp:
         if not index_text.isdigit():
             return False, 0, ""
         return True, int(index_text), name.strip()
+
+    def _choice_for_variant_gpu(self, profile: EncodeProfile, variant: OutputVariant) -> str:
+        use_gpu = profile.use_gpu if variant.use_gpu is None else variant.use_gpu
+        if not use_gpu:
+            return CPU_DEVICE_LABEL
+        gpu_index = profile.gpu_index if variant.gpu_index is None else variant.gpu_index
+        for gpu in self.gpus:
+            if gpu.index == gpu_index:
+                return f"{GPU_DEVICE_PREFIX}{gpu.index}: {gpu.name}"
+        return CPU_DEVICE_LABEL
+
+    def set_output_edit_defaults(self, profile: EncodeProfile) -> None:
+        self.output_name_var.set("")
+        self.output_folder_var.set("")
+        self.output_resolution_var.set("1080p")
+        self.output_custom_height_var.set("")
+        self.output_container_var.set("mp4")
+        self.output_enabled_var.set(True)
+        self.output_filename_template_var.set("{source}")
+        self.output_gpu_choice_var.set(self._choice_for_profile_gpu(profile))
+        self.output_codec_var.set(profile.codec)
+        self.output_cpu_codec_var.set(profile.cpu_codec)
+        self.output_preset_var.set(profile.preset)
+        self.output_cpu_preset_var.set(profile.cpu_preset)
+        self.output_cpu_tune_var.set(getattr(profile, "cpu_tune", "none"))
+        self.output_tune_var.set(profile.tune)
+        self.output_rate_mode_var.set(profile.rate_mode)
+        self.output_cq_var.set(str(profile.cq_value))
+        self.output_bitrate_var.set(profile.bitrate)
+        self.output_maxrate_var.set(profile.maxrate)
+        self.output_bufsize_var.set(profile.bufsize)
+        self.output_pix_fmt_var.set(profile.pix_fmt)
+        self.output_scale_flags_var.set(profile.scale_flags)
+        self.output_audio_codec_var.set("copy")
+        self.output_audio_bitrate_var.set("")
+        self.output_audio_container_var.set("")
+        self.output_extra_input_args_var.set("")
+        self.output_extra_video_args_var.set("")
+        self.output_extra_audio_args_var.set("")
+        self.output_extra_output_args_var.set("")
+        self.output_extra_concat_args_var.set("")
+        self.output_extra_mux_args_var.set("")
+        self.update_output_cpu_tune_choices()
+        self.update_output_rate_controls()
+        self.update_resolution_controls()
 
     def on_device_changed(self, _event: object = None) -> None:
         use_gpu, _gpu_index, _gpu_name = self._parse_gpu_choice()
@@ -799,6 +950,14 @@ class EncoderApp:
         if self.cpu_tune_var.get() not in values:
             self.cpu_tune_var.set("none")
 
+    def update_output_cpu_tune_choices(self) -> None:
+        if not hasattr(self, "output_cpu_tune_combo"):
+            return
+        values = CPU_TUNES_BY_CODEC.get(self.output_cpu_codec_var.get(), CPU_TUNES_BY_CODEC["libx264"])
+        self.output_cpu_tune_combo.configure(values=values)
+        if self.output_cpu_tune_var.get() not in values:
+            self.output_cpu_tune_var.set("none")
+
     def update_encoder_controls(self, apply_defaults: bool = False) -> None:
         if not hasattr(self, "gpu_settings_frame"):
             return
@@ -815,6 +974,25 @@ class EncoderApp:
         if hasattr(self, "cq_label"):
             self.cq_label.configure(text="CQ" if use_gpu else "CRF")
 
+    @staticmethod
+    def _cq_value_for_rate_mode(rate_mode: str, raw_value: str, fallback: int) -> Optional[int]:
+        if rate_mode.upper() not in {"CQ", "VBR"}:
+            return fallback
+        try:
+            return int(raw_value)
+        except ValueError:
+            return None
+
+    def _output_cq_fallback(self) -> int:
+        for variant in self.editing_outputs:
+            if variant.id == self.selected_output_id and variant.cq_value is not None:
+                return variant.cq_value
+        try:
+            return int(self.cq_var.get())
+        except ValueError:
+            pass
+        return self.current_profile().cq_value
+
     def update_rate_controls(self) -> None:
         mode = self.rate_mode_var.get().upper()
         controls = {
@@ -822,6 +1000,19 @@ class EncoderApp:
             self.bitrate_entry: mode in {"VBR", "ABR", "CBR"},
             self.maxrate_entry: mode == "VBR",
             self.bufsize_entry: mode in {"VBR", "CBR"},
+        }
+        for widget, enabled in controls.items():
+            widget.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def update_output_rate_controls(self) -> None:
+        if not hasattr(self, "output_cq_entry"):
+            return
+        mode = self.output_rate_mode_var.get().upper()
+        controls = {
+            self.output_cq_entry: mode in {"CQ", "VBR"},
+            self.output_bitrate_entry: mode in {"VBR", "ABR", "CBR"},
+            self.output_maxrate_entry: mode == "VBR",
+            self.output_bufsize_entry: mode in {"VBR", "CBR"},
         }
         for widget, enabled in controls.items():
             widget.configure(state=tk.NORMAL if enabled else tk.DISABLED)
@@ -846,7 +1037,7 @@ class EncoderApp:
             max_jobs = int(self.max_jobs_var.get())
             segment_minutes = int(self.segment_minutes_var.get())
         except ValueError:
-            messagebox.showerror("入力エラー", "同時実行数と分割間隔は数値で入力してください。")
+            messagebox.showerror("入力エラー", "並列セグメント数と分割間隔は数値で入力してください。")
             return None
 
         if mode in {"CQ", "VBR"}:
@@ -859,13 +1050,13 @@ class EncoderApp:
             cq_value = current.cq_value
 
         if max_jobs < 1:
-            messagebox.showerror("入力エラー", "同時実行数は1以上にしてください。")
+            messagebox.showerror("入力エラー", "並列セグメント数は1以上にしてください。")
             return None
         if segment_minutes < 1:
             messagebox.showerror("入力エラー", "分割間隔は1分以上にしてください。")
             return None
         if not any(item.enabled for item in self.editing_outputs):
-            messagebox.showerror("入力エラー", "出力バリアントを1つ以上有効にしてください。")
+            messagebox.showerror("入力エラー", "出力プロファイルを1つ以上有効にしてください。")
             return None
 
         input_dir = self.input_dir_var.get().strip()
@@ -900,11 +1091,14 @@ class EncoderApp:
             bufsize=self.bufsize_var.get().strip(),
             outputs=[OutputVariant.from_dict(asdict(item)) for item in self.editing_outputs],
         )
-        missing = missing_rate_fields(profile)
-        if missing:
-            labels = ", ".join(missing)
-            messagebox.showerror("入力エラー", f"{profile.rate_mode} では {labels} を入力してください。")
-            return None
+        for variant in profile.outputs:
+            if not variant.enabled:
+                continue
+            missing = missing_rate_fields(profile, variant)
+            if missing:
+                labels = ", ".join(missing)
+                messagebox.showerror("入力エラー", f"{variant.name}: {labels} を入力してください。")
+                return None
         duplicates = duplicate_output_targets(profile)
         if duplicates:
             messagebox.showerror("入力エラー", f"同じ出力先が重複しています: {', '.join(duplicates)}")
@@ -974,6 +1168,7 @@ class EncoderApp:
         if not selection:
             return
         self.selected_output_id = selection[0]
+        profile = self.current_profile()
         for variant in self.editing_outputs:
             if variant.id == self.selected_output_id:
                 self.output_name_var.set(variant.name)
@@ -990,20 +1185,39 @@ class EncoderApp:
                     self.output_resolution_var.set("Custom")
                     self.output_custom_height_var.set(str(variant.height))
                 self.output_container_var.set(variant.container)
+                self.output_filename_template_var.set(variant.filename_template or "{source}")
+                self.output_gpu_choice_var.set(self._choice_for_variant_gpu(profile, variant))
+                self.output_codec_var.set(variant.codec or profile.codec)
+                self.output_cpu_codec_var.set(variant.cpu_codec or profile.cpu_codec)
+                self.output_preset_var.set(variant.preset or profile.preset)
+                self.output_cpu_preset_var.set(variant.cpu_preset or profile.cpu_preset)
+                self.output_cpu_tune_var.set(variant.cpu_tune or getattr(profile, "cpu_tune", "none"))
+                self.output_tune_var.set(variant.tune or profile.tune)
+                self.output_rate_mode_var.set(variant.rate_mode or profile.rate_mode)
+                self.output_cq_var.set(str(variant.cq_value if variant.cq_value is not None else profile.cq_value))
+                self.output_bitrate_var.set(variant.bitrate or profile.bitrate)
+                self.output_maxrate_var.set(variant.maxrate or profile.maxrate)
+                self.output_bufsize_var.set(variant.bufsize or profile.bufsize)
+                self.output_pix_fmt_var.set(variant.pix_fmt or profile.pix_fmt)
+                self.output_scale_flags_var.set(variant.scale_flags or profile.scale_flags)
+                self.output_audio_codec_var.set(variant.audio_codec or "copy")
+                self.output_audio_bitrate_var.set(variant.audio_bitrate)
+                self.output_audio_container_var.set(variant.audio_container)
+                self.output_extra_input_args_var.set(variant.extra_input_args)
+                self.output_extra_video_args_var.set(variant.extra_video_args)
+                self.output_extra_audio_args_var.set(variant.extra_audio_args)
+                self.output_extra_output_args_var.set(variant.extra_output_args)
+                self.output_extra_concat_args_var.set(variant.extra_concat_args)
+                self.output_extra_mux_args_var.set(variant.extra_mux_args)
+                self.update_output_cpu_tune_choices()
+                self.update_output_rate_controls()
                 self.update_resolution_controls()
                 return
 
     def clear_output_selection(self) -> None:
         self.outputs_tree.selection_remove(self.outputs_tree.selection())
         self.selected_output_id = None
-        self.output_name_var.set("")
-        self.output_folder_var.set("")
-        self.output_resolution_var.set("1080p")
-        self.output_custom_height_var.set("")
-        self.output_container_var.set("mp4")
-        if hasattr(self, "output_enabled_var"):
-            self.output_enabled_var.set(True)
-        self.update_resolution_controls()
+        self.set_output_edit_defaults(self.current_profile())
 
     def add_or_update_output(self) -> None:
         name = self.output_name_var.get().strip()
@@ -1030,6 +1244,12 @@ class EncoderApp:
         else:
             height = RESOLUTION_PRESETS.get(preset)
 
+        rate_mode = self.output_rate_mode_var.get().upper()
+        cq_value = self._cq_value_for_rate_mode(rate_mode, self.output_cq_var.get(), self._output_cq_fallback())
+        if cq_value is None:
+            messagebox.showerror("入力エラー", "CQ/CRF は数値で入力してください。")
+            return
+        use_gpu, gpu_index, gpu_name = self._parse_output_gpu_choice()
         variant = OutputVariant(
             id=self.selected_output_id or new_id("variant"),
             name=name,
@@ -1037,7 +1257,37 @@ class EncoderApp:
             height=height,
             container=container,
             enabled=self.output_enabled_var.get() if hasattr(self, "output_enabled_var") else True,
+            filename_template=self.output_filename_template_var.get().strip() or "{source}",
+            use_gpu=use_gpu,
+            gpu_index=gpu_index,
+            gpu_name=gpu_name,
+            codec=self.output_codec_var.get(),
+            cpu_codec=self.output_cpu_codec_var.get(),
+            preset=self.output_preset_var.get(),
+            cpu_preset=self.output_cpu_preset_var.get(),
+            cpu_tune=self.output_cpu_tune_var.get(),
+            tune=self.output_tune_var.get(),
+            rate_mode=rate_mode,
+            cq_value=cq_value,
+            bitrate=self.output_bitrate_var.get().strip(),
+            maxrate=self.output_maxrate_var.get().strip(),
+            bufsize=self.output_bufsize_var.get().strip(),
+            pix_fmt=self.output_pix_fmt_var.get().strip(),
+            scale_flags=self.output_scale_flags_var.get().strip(),
+            audio_codec=self.output_audio_codec_var.get().strip(),
+            audio_bitrate=self.output_audio_bitrate_var.get().strip(),
+            audio_container=self.output_audio_container_var.get().strip(),
+            extra_input_args=self.output_extra_input_args_var.get().strip(),
+            extra_video_args=self.output_extra_video_args_var.get().strip(),
+            extra_audio_args=self.output_extra_audio_args_var.get().strip(),
+            extra_output_args=self.output_extra_output_args_var.get().strip(),
+            extra_concat_args=self.output_extra_concat_args_var.get().strip(),
+            extra_mux_args=self.output_extra_mux_args_var.get().strip(),
         )
+        missing = missing_rate_fields(self.current_profile(), variant)
+        if missing:
+            messagebox.showerror("入力エラー", f"{variant.name}: {', '.join(missing)} を入力してください。")
+            return
 
         next_outputs: List[OutputVariant] = []
         replaced = False
@@ -1211,13 +1461,16 @@ class EncoderApp:
             messagebox.showerror("入力エラー", f"{profile_dir_label_text(missing_dirs)} を入力してください。")
             return False
         if not any(variant.enabled for variant in profile.outputs):
-            messagebox.showerror("入力エラー", "出力バリアントを1つ以上有効にしてください。")
+            messagebox.showerror("入力エラー", "出力プロファイルを1つ以上有効にしてください。")
             return False
-        missing = missing_rate_fields(profile)
-        if missing:
-            labels = ", ".join(missing)
-            messagebox.showerror("入力エラー", f"{profile.rate_mode} では {labels} を入力してください。")
-            return False
+        for variant in profile.outputs:
+            if not variant.enabled:
+                continue
+            missing = missing_rate_fields(profile, variant)
+            if missing:
+                labels = ", ".join(missing)
+                messagebox.showerror("入力エラー", f"{variant.name}: {labels} を入力してください。")
+                return False
         duplicates = duplicate_output_targets(profile)
         if duplicates:
             messagebox.showerror("入力エラー", f"同じ出力先が重複しています: {', '.join(duplicates)}")
@@ -1358,7 +1611,7 @@ class EncoderApp:
                 break
 
             if not is_paused:
-                while active_count < profile.max_parallel_jobs:
+                while active_count < 1:
                     try:
                         job = self.pending_jobs.get_nowait()
                     except queue.Empty:
@@ -1408,6 +1661,8 @@ class EncoderApp:
         segment_seconds = max(60, int(job.profile.segment_minutes) * 60)
         # job_key includes source size/mtime, so keep one segment root for this run.
         segment_root = segment_dir_for(self.paths, src, job.profile, job.variant)
+        joined_video = joined_video_path_for(self.paths, src, job.profile, job.variant)
+        audio_out = temp_audio_path_for(self.paths, src, job.profile, job.variant)
         self.log(f"Start {job.variant.name}: {src.name}")
         self.log(f"Log file: {job.log_file}")
 
@@ -1421,64 +1676,31 @@ class EncoderApp:
                 with self.lock:
                     job.total_segments = len(ranges)
                     job.message = f"0/{len(ranges)} segments"
+                    job.segment_progress = {}
+                    job.completed_segment_indexes = set()
                     job.status = "実行中"
 
-                segment_files: List[Path] = []
-                for index, (start, duration_seconds) in enumerate(ranges):
-                    final_segment = segment_root / segment_file_name(job.variant, index)
-                    partial_segment = segment_root / segment_file_name(job.variant, index, partial=True)
-                    segment_files.append(final_segment)
-
-                    if final_segment.exists():
-                        self._mark_segment_done(job, index + 1)
-                        continue
-
-                    if not self.wait_until_unpaused(job):
-                        self._mark_job_cancelled(job)
-                        return
-
-                    if partial_segment.exists():
-                        partial_segment.unlink(missing_ok=True)
-
-                    command = build_ffmpeg_command(
-                        self.paths.ffmpeg_path,
-                        src,
-                        partial_segment,
-                        job.profile,
-                        job.variant,
-                        start_seconds=start,
-                        duration_seconds=duration_seconds,
-                    )
-                    log_fp.write(f"\nSegment {index + 1}/{len(ranges)} command:\n")
-                    log_fp.write(command_to_text(command) + "\n\n")
-                    log_fp.flush()
-
-                    with self.lock:
-                        job.current_segment = index + 1
-                        job.status = "実行中"
-                        job.message = f"segment {index + 1}/{len(ranges)}"
-
-                    ret = self.run_process(job, command, log_fp, duration_seconds)
-                    if self.was_stopped() or ret != 0 or not partial_segment.exists():
-                        partial_segment.unlink(missing_ok=True)
-                        if self.was_stopped():
-                            self._mark_job_cancelled(job)
-                        else:
-                            self._mark_job_failed(job, f"segment {index + 1} failed: exit {ret}")
-                        return
-
-                    partial_segment.replace(final_segment)
-                    self._mark_segment_done(job, index + 1)
-
+                segment_files: List[Path] = [
+                    segment_root / segment_file_name(job.variant, index, src=src)
+                    for index, _range in enumerate(ranges)
+                ]
+                if not self.encode_segments_parallel(job, src, ranges, segment_files, segment_root, log_fp):
+                    return
                 if not self.wait_until_unpaused(job):
                     self._mark_job_cancelled(job)
                     return
 
                 concat_file = segment_root / "concat.txt"
                 write_concat_file(concat_file, segment_files)
-                if job.tmp_out.exists():
-                    job.tmp_out.unlink(missing_ok=True)
-                concat_command = build_concat_command(self.paths.ffmpeg_path, concat_file, job.tmp_out)
+                if joined_video.exists():
+                    joined_video.unlink(missing_ok=True)
+                concat_command = build_concat_command(
+                    self.paths.ffmpeg_path,
+                    concat_file,
+                    joined_video,
+                    job.profile,
+                    job.variant,
+                )
                 log_fp.write("\nConcat command:\n")
                 log_fp.write(command_to_text(concat_command) + "\n\n")
                 log_fp.flush()
@@ -1488,18 +1710,75 @@ class EncoderApp:
                     job.message = "finalizing"
 
                 ret = self.run_process(job, concat_command, log_fp, None)
-                if self.was_stopped() or ret != 0 or not job.tmp_out.exists():
-                    job.tmp_out.unlink(missing_ok=True)
+                if self.was_stopped() or ret != 0 or not joined_video.exists():
+                    joined_video.unlink(missing_ok=True)
                     if self.was_stopped():
                         self._mark_job_cancelled(job)
                     else:
                         self._mark_job_failed(job, f"concat failed: exit {ret}")
                     return
 
+                ffprobe_available = self.paths.ffprobe_path.exists()
+                has_audio = probe_has_audio(self.paths.ffprobe_path, src)
+                if has_audio:
+                    if not self.wait_until_unpaused(job):
+                        self._mark_job_cancelled(job)
+                        return
+                    if not audio_out.exists():
+                        audio_command = build_audio_command(self.paths.ffmpeg_path, src, audio_out, job.profile, job.variant)
+                        log_fp.write("\nAudio command:\n")
+                        log_fp.write(command_to_text(audio_command) + "\n\n")
+                        log_fp.flush()
+
+                        with self.lock:
+                            job.status = "音声処理中"
+                            job.message = "processing audio"
+
+                        ret = self.run_process(job, audio_command, log_fp, None)
+                        if self.was_stopped() or ret != 0 or not audio_out.exists():
+                            audio_out.unlink(missing_ok=True)
+                            if self.was_stopped():
+                                self._mark_job_cancelled(job)
+                            else:
+                                self._mark_job_failed(job, f"audio failed: exit {ret}")
+                            return
+
+                    if job.tmp_out.exists():
+                        job.tmp_out.unlink(missing_ok=True)
+                    mux_command = build_mux_command(
+                        self.paths.ffmpeg_path,
+                        joined_video,
+                        audio_out,
+                        job.tmp_out,
+                        job.profile,
+                        job.variant,
+                    )
+                    log_fp.write("\nMux command:\n")
+                    log_fp.write(command_to_text(mux_command) + "\n\n")
+                    log_fp.flush()
+
+                    with self.lock:
+                        job.status = "Mux中"
+                        job.message = "muxing"
+
+                    ret = self.run_process(job, mux_command, log_fp, None)
+                    if self.was_stopped() or ret != 0 or not job.tmp_out.exists():
+                        job.tmp_out.unlink(missing_ok=True)
+                        if self.was_stopped():
+                            self._mark_job_cancelled(job)
+                        else:
+                            self._mark_job_failed(job, f"mux failed: exit {ret}")
+                        return
+                else:
+                    reason = "No audio stream detected" if ffprobe_available else "FFprobe unavailable"
+                    self.skip_audio_output(job, src, joined_video, log_fp, reason)
+
                 job.out_file.parent.mkdir(parents=True, exist_ok=True)
                 if job.out_file.exists():
                     job.out_file.unlink()
                 shutil.move(str(job.tmp_out), str(job.out_file))
+                joined_video.unlink(missing_ok=True)
+                audio_out.unlink(missing_ok=True)
                 shutil.rmtree(segment_root, ignore_errors=True)
                 with self.lock:
                     job.status = "完了"
@@ -1513,12 +1792,128 @@ class EncoderApp:
             with self.lock:
                 self.active_jobs.pop(job.job_id, None)
 
+    def encode_segments_parallel(
+        self,
+        job: RuntimeJob,
+        src: Path,
+        ranges: List[tuple[float, Optional[float]]],
+        segment_files: List[Path],
+        segment_root: Path,
+        log_fp,
+    ) -> bool:
+        pending: queue.Queue[int] = queue.Queue()
+        for index, final_segment in enumerate(segment_files):
+            if final_segment.exists():
+                self._mark_segment_done(job, index)
+                continue
+            pending.put(index)
+
+        if pending.empty():
+            return True
+
+        failed = threading.Event()
+        failure_message = {"text": ""}
+        log_lock = threading.Lock()
+        worker_count = min(max(1, int(job.profile.max_parallel_jobs)), pending.qsize())
+
+        def fail(message: str) -> None:
+            if not failed.is_set():
+                failure_message["text"] = message
+                failed.set()
+                with self.lock:
+                    self.paused = False
+                self.kill_job_processes(job)
+
+        def worker() -> None:
+            while not failed.is_set() and not self.was_stopped():
+                try:
+                    index = pending.get_nowait()
+                except queue.Empty:
+                    return
+                start, duration_seconds = ranges[index]
+                final_segment = segment_files[index]
+                partial_segment = segment_root / segment_file_name(job.variant, index, partial=True, src=src)
+                try:
+                    if not self.wait_until_unpaused(job):
+                        fail("cancelled")
+                        return
+                    if partial_segment.exists():
+                        partial_segment.unlink(missing_ok=True)
+
+                    command = build_ffmpeg_command(
+                        self.paths.ffmpeg_path,
+                        src,
+                        partial_segment,
+                        job.profile,
+                        job.variant,
+                        start_seconds=start,
+                        duration_seconds=duration_seconds,
+                    )
+                    with log_lock:
+                        log_fp.write(f"\nSegment {index + 1}/{len(ranges)} command:\n")
+                        log_fp.write(command_to_text(command) + "\n\n")
+                        log_fp.flush()
+
+                    with self.lock:
+                        job.current_segment = index + 1
+                        job.status = "実行中"
+                        job.message = f"segment {index + 1}/{len(ranges)}"
+
+                    ret = self.run_process(
+                        job,
+                        command,
+                        log_fp,
+                        duration_seconds,
+                        segment_index=index,
+                        log_lock=log_lock,
+                    )
+                    if self.was_stopped():
+                        fail("cancelled")
+                        return
+                    if ret != 0 or not partial_segment.exists():
+                        partial_segment.unlink(missing_ok=True)
+                        fail(f"segment {index + 1} failed: exit {ret}")
+                        return
+
+                    partial_segment.replace(final_segment)
+                    self._mark_segment_done(job, index)
+                finally:
+                    pending.task_done()
+
+        threads = [threading.Thread(target=worker, daemon=True) for _item in range(worker_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        if self.was_stopped() or failure_message["text"] == "cancelled":
+            self._mark_job_cancelled(job)
+            return False
+        if failed.is_set():
+            self._mark_job_failed(job, failure_message["text"] or "segment failed")
+            return False
+        return True
+
+    def skip_audio_output(self, job: RuntimeJob, src: Path, joined_video: Path, log_fp, reason: str) -> None:
+        message = f"{reason}; keeping video-only output."
+        log_fp.write(f"\nAudio skipped: {message}\n\n")
+        log_fp.flush()
+        self.log(f"{src.name}: {message}")
+        with self.lock:
+            job.status = "映像のみ"
+            job.message = "video-only"
+        if job.tmp_out.exists():
+            job.tmp_out.unlink(missing_ok=True)
+        shutil.move(str(joined_video), str(job.tmp_out))
+
     def run_process(
         self,
         job: RuntimeJob,
         command: List[str],
         log_fp,
         segment_duration: Optional[float],
+        segment_index: Optional[int] = None,
+        log_lock: Optional[threading.Lock] = None,
     ) -> int:
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         process = subprocess.Popen(
@@ -1531,8 +1926,10 @@ class EncoderApp:
             bufsize=1,
             creationflags=creationflags,
         )
+        process_slot = segment_index if segment_index is not None else -1
         with self.lock:
             job.process = process
+            job.processes[process_slot] = process
             stop_requested = self.stop_requested
         if stop_requested and process.poll() is None:
             process.kill()
@@ -1542,36 +1939,50 @@ class EncoderApp:
                 for raw_line in process.stdout:
                     line = raw_line.rstrip("\r\n")
                     if line:
-                        log_fp.write(line + "\n")
-                        log_fp.flush()
+                        if log_lock is None:
+                            log_fp.write(line + "\n")
+                            log_fp.flush()
+                        else:
+                            with log_lock:
+                                log_fp.write(line + "\n")
+                                log_fp.flush()
                         self.log(f"job {job.job_id}: {line}")
-                        self._update_job_progress_from_line(job, line, segment_duration)
+                        self._update_job_progress_from_line(job, line, segment_duration, segment_index)
 
             return process.wait()
         finally:
             with self.lock:
                 if job.process is process:
                     job.process = None
+                if job.processes.get(process_slot) is process:
+                    job.processes.pop(process_slot, None)
 
     def _update_job_progress_from_line(
         self,
         job: RuntimeJob,
         line: str,
         segment_duration: Optional[float],
+        segment_index: Optional[int],
     ) -> None:
-        if not segment_duration:
+        if not segment_duration or segment_index is None:
             return
         current = parse_ffmpeg_time(line)
         if current is None:
             return
         current_ratio = min(max(current / segment_duration, 0.0), 1.0)
         with self.lock:
-            job.progress = ((job.completed_segments + current_ratio) / max(job.total_segments, 1)) * 100.0
+            if segment_index not in job.completed_segment_indexes:
+                job.segment_progress[segment_index] = current_ratio
+            total_progress = sum(max(0.0, min(1.0, value)) for value in job.segment_progress.values())
+            job.progress = (total_progress / max(job.total_segments, 1)) * 100.0
 
-    def _mark_segment_done(self, job: RuntimeJob, completed: int) -> None:
+    def _mark_segment_done(self, job: RuntimeJob, segment_index: int) -> None:
         with self.lock:
-            job.completed_segments = max(job.completed_segments, completed)
-            job.progress = (job.completed_segments / max(job.total_segments, 1)) * 100.0
+            job.completed_segment_indexes.add(segment_index)
+            job.segment_progress[segment_index] = 1.0
+            job.completed_segments = len(job.completed_segment_indexes)
+            total_progress = sum(max(0.0, min(1.0, value)) for value in job.segment_progress.values())
+            job.progress = (total_progress / max(job.total_segments, 1)) * 100.0
             job.message = f"{job.completed_segments}/{job.total_segments} segments"
 
     def _mark_job_failed(self, job: RuntimeJob, message: str) -> None:
@@ -1589,6 +2000,18 @@ class EncoderApp:
     def was_stopped(self) -> bool:
         with self.lock:
             return self.stop_requested
+
+    def kill_job_processes(self, job: RuntimeJob) -> None:
+        with self.lock:
+            processes = list(job.processes.values())
+            if job.process is not None:
+                processes.append(job.process)
+        for process in processes:
+            if process is not None and process.poll() is None:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
 
     def wait_until_unpaused(self, job: RuntimeJob) -> bool:
         while True:
@@ -1633,13 +2056,7 @@ class EncoderApp:
                     break
 
         for job in jobs:
-            with self.lock:
-                process = job.process
-            if process is not None and process.poll() is None:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+            self.kill_job_processes(job)
         self.log("中断を送信しました。完了済みセグメントは保持します。")
 
     def move_finished_sources(self, profile: EncodeProfile) -> None:

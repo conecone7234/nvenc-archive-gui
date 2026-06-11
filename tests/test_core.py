@@ -1,3 +1,4 @@
+import inspect
 import json
 import sys
 import threading
@@ -1099,6 +1100,44 @@ def test_encoder_app_has_no_unused_ffmpeg_download_button_handler():
     assert not hasattr(EncoderApp, "_download_ffmpeg_worker")
 
 
+def test_encoder_app_has_no_unused_backend_combo_widget():
+    assert "output_backend_combo" not in inspect.getsource(EncoderApp._build_profile_tab)
+
+
+def test_encoder_app_has_no_unused_output_resource_change_handler():
+    assert not hasattr(EncoderApp, "on_output_resource_changed")
+
+
+def test_update_output_encoder_controls_has_no_unused_cpu_codec_combo():
+    assert "output_cpu_codec_combo" not in inspect.getsource(EncoderApp.update_output_encoder_controls)
+
+
+def test_output_resource_dialog_has_single_instance_guard():
+    source = inspect.getsource(EncoderApp.open_output_resource_dialog)
+
+    assert "output_resource_window" in source
+    assert "self._widget_exists(existing)" in source
+    assert "dialog.protocol" in source
+
+
+def test_surface_frame_style_keeps_inner_frames_flat():
+    source = inspect.getsource(EncoderApp._configure_style)
+    surface_block = source.split('"Surface.TFrame"', 1)[1].split('style.configure("Inset.TFrame"', 1)[0]
+
+    assert 'relief="flat"' in surface_block
+    assert "borderwidth=0" in surface_block
+    assert 'relief="raised"' not in surface_block
+    assert "borderwidth=1" not in surface_block
+
+
+def test_neumorphic_palette_only_defines_used_color_tokens():
+    source = inspect.getsource(EncoderApp._configure_style)
+    palette_block = source.split("self.colors = {", 1)[1].split("}", 1)[0]
+
+    assert '"sunken"' not in palette_block
+    assert '"shadow"' not in palette_block
+
+
 def test_set_output_edit_defaults_uses_qsv_backend_and_encoder(tmp_path: Path):
     class Value:
         def __init__(self, value=None):
@@ -1178,8 +1217,8 @@ def test_refresh_outputs_tree_inserts_full_output_tuple_once():
         def delete(self, *items):
             self.deleted = items
 
-        def insert(self, parent, index, iid=None, values=()):
-            self.insert_calls.append((parent, index, iid, values))
+        def insert(self, parent, index, iid=None, values=(), tags=()):
+            self.insert_calls.append((parent, index, iid, values, tags))
 
         def item(self, *_args, **_kwargs):
             raise AssertionError("refresh_outputs_tree should not rewrite inserted values")
@@ -1202,10 +1241,23 @@ def test_refresh_outputs_tree_inserts_full_output_tuple_once():
 
     assert app.outputs_tree.deleted == ("old",)
     assert len(app.outputs_tree.insert_calls) == 1
-    _parent, _index, iid, values = app.outputs_tree.insert_calls[0]
+    _parent, _index, iid, values, tags = app.outputs_tree.insert_calls[0]
     assert iid == "qsv"
+    assert tags == (BACKEND_QSV,)
     assert values[1:] == ("QSV", BACKEND_QSV, "hevc_qsv", "1080p", "qsv", "mp4")
     assert len(values) == 7
+
+
+def test_selected_resource_labels_only_reports_selected_resources(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(id=CPU_RESOURCE_ID, label="CPU", kind="cpu", backend=BACKEND_CPU),
+        HardwareResource(id="nvidia:0", label="GPU 0: RTX Test", kind="gpu", backend=BACKEND_NVENC),
+    ]
+
+    assert app.selected_resource_labels(profile, [CPU_RESOURCE_ID]) == ["CPU"]
+    assert app.selected_resource_labels(profile, ["nvidia:0"]) == ["GPU 0: RTX Test"]
 
 
 def test_add_or_update_output_rejects_cq_for_qsv(tmp_path: Path, monkeypatch):

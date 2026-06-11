@@ -1108,6 +1108,24 @@ def test_encoder_app_has_no_unused_output_resource_change_handler():
     assert not hasattr(EncoderApp, "on_output_resource_changed")
 
 
+def test_output_resource_dialog_has_single_instance_guard():
+    source = inspect.getsource(EncoderApp.open_output_resource_dialog)
+
+    assert "output_resource_window" in source
+    assert "self._widget_exists(existing)" in source
+    assert "dialog.protocol" in source
+
+
+def test_surface_frame_style_keeps_inner_frames_flat():
+    source = inspect.getsource(EncoderApp._configure_style)
+    surface_block = source.split('"Surface.TFrame"', 1)[1].split('style.configure("Inset.TFrame"', 1)[0]
+
+    assert 'relief="flat"' in surface_block
+    assert "borderwidth=0" in surface_block
+    assert 'relief="raised"' not in surface_block
+    assert "borderwidth=1" not in surface_block
+
+
 def test_set_output_edit_defaults_uses_qsv_backend_and_encoder(tmp_path: Path):
     class Value:
         def __init__(self, value=None):

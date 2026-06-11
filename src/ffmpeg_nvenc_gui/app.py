@@ -1192,17 +1192,6 @@ class EncoderApp:
             style="Inset.TLabel",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-    def on_output_resource_changed(self, changed_resource_id: str) -> None:
-        if changed_resource_id not in self.output_resource_vars:
-            return
-        if self.output_resource_vars[changed_resource_id].get():
-            backend = resource_backend(changed_resource_id)
-            for resource_id, var in self.output_resource_vars.items():
-                if resource_id != changed_resource_id and resource_backend(resource_id) != backend:
-                    var.set(False)
-            self.output_backend_var.set(backend)
-        self.update_output_encoder_controls()
-
     def open_output_resource_dialog(self) -> None:
         profile = self.current_profile()
         resources = list(profile.hardware_resources)

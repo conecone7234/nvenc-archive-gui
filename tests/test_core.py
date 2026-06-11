@@ -1104,6 +1104,10 @@ def test_encoder_app_has_no_unused_backend_combo_widget():
     assert "output_backend_combo" not in inspect.getsource(EncoderApp._build_profile_tab)
 
 
+def test_encoder_app_has_no_unused_output_resource_change_handler():
+    assert not hasattr(EncoderApp, "on_output_resource_changed")
+
+
 def test_set_output_edit_defaults_uses_qsv_backend_and_encoder(tmp_path: Path):
     class Value:
         def __init__(self, value=None):

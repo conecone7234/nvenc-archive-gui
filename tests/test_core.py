@@ -1126,6 +1126,14 @@ def test_surface_frame_style_keeps_inner_frames_flat():
     assert "borderwidth=1" not in surface_block
 
 
+def test_neumorphic_palette_only_defines_used_color_tokens():
+    source = inspect.getsource(EncoderApp._configure_style)
+    palette_block = source.split("self.colors = {", 1)[1].split("}", 1)[0]
+
+    assert '"sunken"' not in palette_block
+    assert '"shadow"' not in palette_block
+
+
 def test_set_output_edit_defaults_uses_qsv_backend_and_encoder(tmp_path: Path):
     class Value:
         def __init__(self, value=None):

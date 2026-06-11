@@ -346,8 +346,8 @@ class EncoderApp:
         style.configure(
             "Surface.TFrame",
             background=self.colors["surface"],
-            relief="raised",
-            borderwidth=1,
+            relief="flat",
+            borderwidth=0,
         )
         style.configure("Inset.TFrame", background=self.colors["surface_alt"], relief="sunken", borderwidth=1)
         style.configure("TFrame", background=self.colors["bg"])
@@ -1193,6 +1193,11 @@ class EncoderApp:
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def open_output_resource_dialog(self) -> None:
+        existing = getattr(self, "output_resource_window", None)
+        if self._widget_exists(existing):
+            existing.lift()
+            return
+
         profile = self.current_profile()
         resources = list(profile.hardware_resources)
         if not resources:
@@ -1200,10 +1205,17 @@ class EncoderApp:
             return
 
         dialog = tk.Toplevel(self.root)
+        self.output_resource_window = dialog
         dialog.title("エンコード先")
         dialog.transient(self.root)
         dialog.configure(bg=self.colors["bg"])
         dialog.resizable(False, False)
+
+        def on_close() -> None:
+            self.output_resource_window = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
 
         body = ttk.Frame(dialog, padding=16, style="App.TFrame")
         body.pack(fill=tk.BOTH, expand=True)
@@ -1252,7 +1264,7 @@ class EncoderApp:
         buttons.pack(fill=tk.X, pady=(4, 0))
 
         def add_manual_and_close() -> None:
-            dialog.destroy()
+            on_close()
             self.add_manual_resource()
 
         def apply_selection() -> None:
@@ -1269,11 +1281,11 @@ class EncoderApp:
             }
             self.output_backend_var.set(backend)
             self.update_output_encoder_controls()
-            dialog.destroy()
+            on_close()
 
         ttk.Button(buttons, text="手動追加", command=add_manual_and_close).pack(side=tk.LEFT)
         ttk.Button(buttons, text="適用", style="Accent.TButton", command=apply_selection).pack(side=tk.RIGHT)
-        ttk.Button(buttons, text="閉じる", command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(buttons, text="閉じる", command=on_close).pack(side=tk.RIGHT, padx=(0, 8))
 
     def _dialog_entry(
         self,

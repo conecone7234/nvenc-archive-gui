@@ -4,9 +4,14 @@ This repository is a Windows Tkinter app for FFmpeg archive encoding. Review
 changes with the behavior of `ffmpeg_nvenc_gui.app` and
 `ffmpeg_nvenc_gui.core` in mind, not as a generic web or CLI project.
 
-Write pull request reviews, review comments, and requested-change summaries in
-Japanese. Keep technical identifiers, commands, option names, and error strings
-unchanged when quoting code or logs.
+## Response Language
+
+- Pull request review overviews, inline review comments, requested-change
+  summaries, and PR conversation comments must be written in Japanese.
+- Do not write explanatory review prose in English. Translate headings,
+  summaries, severity explanations, and action requests into Japanese.
+- Keep technical identifiers, commands, option names, and error strings
+  unchanged when quoting code or logs.
 
 ## Project Priorities
 

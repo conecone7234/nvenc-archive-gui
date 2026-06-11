@@ -1108,6 +1108,10 @@ def test_encoder_app_has_no_unused_output_resource_change_handler():
     assert not hasattr(EncoderApp, "on_output_resource_changed")
 
 
+def test_update_output_encoder_controls_has_no_unused_cpu_codec_combo():
+    assert "output_cpu_codec_combo" not in inspect.getsource(EncoderApp.update_output_encoder_controls)
+
+
 def test_output_resource_dialog_has_single_instance_guard():
     source = inspect.getsource(EncoderApp.open_output_resource_dialog)
 

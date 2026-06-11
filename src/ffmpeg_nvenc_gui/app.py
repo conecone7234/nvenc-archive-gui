@@ -1543,7 +1543,6 @@ class EncoderApp:
             if self._widget_exists(widget):
                 widget.configure(state=nvenc_state)
         for widget in (
-            getattr(self, "output_cpu_codec_combo", None),
             getattr(self, "output_cpu_preset_combo", None),
             getattr(self, "output_cpu_tune_combo", None),
         ):

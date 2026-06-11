@@ -1,3 +1,4 @@
+import inspect
 import json
 import sys
 import threading
@@ -1097,6 +1098,10 @@ def test_update_output_encoder_controls_removes_cq_for_qsv():
 def test_encoder_app_has_no_unused_ffmpeg_download_button_handler():
     assert not hasattr(EncoderApp, "download_ffmpeg_button")
     assert not hasattr(EncoderApp, "_download_ffmpeg_worker")
+
+
+def test_encoder_app_has_no_unused_backend_combo_widget():
+    assert "output_backend_combo" not in inspect.getsource(EncoderApp._build_profile_tab)
 
 
 def test_set_output_edit_defaults_uses_qsv_backend_and_encoder(tmp_path: Path):

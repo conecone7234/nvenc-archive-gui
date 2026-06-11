@@ -915,13 +915,6 @@ class EncoderApp:
             state="normal",
         )
         self.output_container_combo.grid(row=5, column=1, sticky="ew", pady=4)
-        self.output_backend_combo = ttk.Combobox(
-            edit,
-            textvariable=self.output_backend_var,
-            values=[BACKEND_CPU, BACKEND_NVENC, BACKEND_QSV, BACKEND_AMF],
-            state="disabled",
-        )
-        self.output_backend_combo.configure(state=tk.DISABLED)
         self.output_encoder_combo = grid_combo(
             "Encoder",
             self.output_encoder_var,

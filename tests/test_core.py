@@ -26,6 +26,7 @@ from ffmpeg_nvenc_gui.core import (
     HardwareResource,
     JobSpec,
     OutputVariant,
+    audio_containers_for_codec,
     build_audio_command,
     build_concat_command,
     build_ffmpeg_command,
@@ -33,6 +34,7 @@ from ffmpeg_nvenc_gui.core import (
     build_mux_command,
     build_paths,
     clear_state,
+    cpu_resources_from_wmi_data,
     duplicate_output_targets,
     ensure_profile_dirs,
     format_seconds,
@@ -41,6 +43,8 @@ from ffmpeg_nvenc_gui.core import (
     load_state,
     missing_profile_dirs,
     missing_rate_fields,
+    normalize_audio_codec,
+    normalize_audio_container_for_codec,
     normalize_container_extension,
     normalize_profile_gpu,
     output_path_for,
@@ -77,7 +81,6 @@ from ffmpeg_nvenc_gui.ffmpeg_downloader import (
 def make_profile(tmp_path: Path) -> EncodeProfile:
     return EncodeProfile(
         id="profile",
-        name="Archive",
         input_dir=str(tmp_path / "Incoming"),
         output_dir=str(tmp_path / "Encoded"),
         archive_dir=str(tmp_path / "SourceArchive"),
@@ -459,6 +462,7 @@ def test_profile_to_dict_omits_deprecated_profile_defaults(tmp_path: Path):
     data = profile_to_dict(profile)
 
     assert "max_parallel_jobs" not in data
+    assert "name" not in data
     assert "codec" not in data
     assert "rate_mode" not in data
     assert data["hardware_resources"][1]["concurrency_slots"] == 2
@@ -517,6 +521,40 @@ def test_output_filename_template_uses_source_and_output_profile_tokens(tmp_path
     assert output.name == "Clip 01-Master 2160p-2160.mp4"
 
 
+def test_output_and_archive_paths_expand_filename_token_with_safe_folder_names(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.output_dir = str(tmp_path / "Encoded" / "${filename}")
+    profile.archive_dir = str(tmp_path / "Archive" / "${filename}")
+    variant = profile.outputs[0]
+    variant.folder_name = "${filename}-outputs"
+    variant.filename_template = "${filename}-{height}"
+    src = Path(profile.input_dir) / "Clip 01.mkv"
+
+    output = output_path_for(profile, src, variant)
+
+    assert output == (tmp_path / "Encoded" / "Clip-01" / "Clip-01-outputs" / "Clip 01-2160.mp4").resolve()
+    assert profile_archive_dir(profile, src) == (tmp_path / "Archive" / "Clip-01").resolve()
+
+
+def test_audio_codec_and_container_choices_are_normalized():
+    assert audio_containers_for_codec("aac") == ["m4a", "mp4", "mov"]
+    assert normalize_audio_codec("unknown") == "copy"
+    assert normalize_audio_container_for_codec("aac", "mp4") == "mp4"
+    assert normalize_audio_container_for_codec("aac", "mp3") == "m4a"
+    assert normalize_audio_container_for_codec("opus", "webm") == "webm"
+
+    variant = OutputVariant(
+        id="audio",
+        name="Audio",
+        folder_name="audio",
+        audio_codec="unknown",
+        audio_container="mp3",
+    )
+
+    assert variant.audio_codec == "copy"
+    assert variant.audio_container == "mka"
+
+
 def test_profile_and_variant_loading_ignore_unknown_keys_and_normalize_types(tmp_path: Path):
     paths = build_paths(tmp_path)
     profile = EncodeProfile.from_dict(
@@ -547,6 +585,7 @@ def test_profile_and_variant_loading_ignore_unknown_keys_and_normalize_types(tmp
     )
 
     assert profile.id == "loaded"
+    assert not hasattr(profile, "name")
     assert profile.max_parallel_jobs == 3
     assert profile.segment_minutes == 12
     assert profile.use_gpu is False
@@ -561,9 +600,7 @@ def test_profile_and_variant_loading_ignore_unknown_keys_and_normalize_types(tmp
     fallback = EncodeProfile.from_dict({"outputs": None}, paths, [])
     assert fallback.outputs
 
-    direct = EncodeProfile(
-        id="direct", name="Direct", input_dir="in", output_dir="out", archive_dir="arch", outputs=None
-    )
+    direct = EncodeProfile(id="direct", input_dir="in", output_dir="out", archive_dir="arch", outputs=None)
     assert direct.outputs == []
 
     duplicate_ids = EncodeProfile.from_dict(
@@ -635,7 +672,21 @@ def test_encode_profile_from_dict_uses_supplied_paths_and_gpus(tmp_path: Path):
 def test_hardware_resources_only_include_detected_devices_by_default():
     resources = hardware_resources_from_gpus([])
 
-    assert [resource.id for resource in resources] == [CPU_RESOURCE_ID]
+    assert CPU_RESOURCE_ID in [resource.id for resource in resources]
+    assert all(resource.backend == BACKEND_CPU for resource in resources)
+
+
+def test_cpu_resources_from_wmi_data_include_model_and_socket():
+    resources = cpu_resources_from_wmi_data(
+        [
+            {"DeviceID": "CPU0", "Name": "Intel Xeon A", "SocketDesignation": "Socket 0"},
+            {"DeviceID": "CPU1", "Name": "AMD EPYC B", "SocketDesignation": "Socket 1"},
+        ]
+    )
+
+    assert [resource.id for resource in resources] == ["cpu:0", "cpu:1"]
+    assert "Intel Xeon A" in resources[0].label
+    assert "Socket 1" in resources[1].label
 
 
 def test_normalize_hardware_resources_keeps_explicit_manual_resource(tmp_path: Path):
@@ -678,7 +729,8 @@ def test_normalize_hardware_resources_drops_stale_detected_nvidia(tmp_path: Path
         [],
     )
 
-    assert [resource.id for resource in profile.hardware_resources] == [CPU_RESOURCE_ID]
+    assert CPU_RESOURCE_ID in [resource.id for resource in profile.hardware_resources]
+    assert "nvidia:0" not in [resource.id for resource in profile.hardware_resources]
     assert profile.resource_ids == [CPU_RESOURCE_ID]
 
 
@@ -843,26 +895,23 @@ def test_segment_file_name_normalizes_container_and_partial_marker():
     assert segment_file_name(variant, 0, src=Path(f"{long_name}.mp4")) == f"{'A' * 40}-001.mkv"
 
 
-def test_encoder_app_profile_helpers_use_ids_for_duplicates(tmp_path: Path):
+def test_encoder_app_profile_labels_are_derived_from_paths_and_ids(tmp_path: Path):
     app = EncoderApp.__new__(EncoderApp)
     app.profiles = [
         EncodeProfile(
             id="profile_alpha",
-            name="Archive",
             input_dir=str(tmp_path / "in-a"),
             output_dir=str(tmp_path / "out-a"),
             archive_dir=str(tmp_path / "archive-a"),
         ),
         EncodeProfile(
             id="profile_beta",
-            name="Archive",
             input_dir=str(tmp_path / "in-b"),
             output_dir=str(tmp_path / "out-b"),
             archive_dir=str(tmp_path / "archive-b"),
         ),
         EncodeProfile(
             id="profile_gamma",
-            name="Profile 4",
             input_dir=str(tmp_path / "in-c"),
             output_dir=str(tmp_path / "out-c"),
             archive_dir=str(tmp_path / "archive-c"),
@@ -871,11 +920,8 @@ def test_encoder_app_profile_helpers_use_ids_for_duplicates(tmp_path: Path):
 
     labels = EncoderApp._profile_labels(app)
 
-    assert labels == ["Archive (alpha)", "Archive (beta)", "Profile 4"]
+    assert labels == ["in-a -> out-a (alpha)", "in-b -> out-b (beta)", "in-c -> out-c (gamma)"]
     assert EncoderApp.profile_index_by_id(app, "profile_beta") == 1
-    assert EncoderApp.has_duplicate_profile_name(app, "profile_alpha", "Archive") is True
-    assert EncoderApp.has_duplicate_profile_name(app, "profile_alpha", "Unique") is False
-    assert EncoderApp.unique_profile_name(app, "Profile") == "Profile 5"
 
 
 def test_encoder_app_validate_profile_requires_enabled_output(tmp_path: Path):
@@ -942,10 +988,16 @@ def test_encoder_app_output_rate_controls_match_selected_mode():
 
     class Widget:
         def __init__(self):
-            self.state = None
+            self.visible = True
 
         def configure(self, **kwargs):
-            self.state = kwargs["state"]
+            self.kwargs = kwargs
+
+        def grid(self):
+            self.visible = True
+
+        def grid_remove(self):
+            self.visible = False
 
     app = EncoderApp.__new__(EncoderApp)
     app.output_rate_mode_var = Value("ABR")
@@ -956,18 +1008,18 @@ def test_encoder_app_output_rate_controls_match_selected_mode():
 
     app.update_output_rate_controls()
 
-    assert app.output_cq_entry.state == app_module.tk.DISABLED
-    assert app.output_bitrate_entry.state == app_module.tk.NORMAL
-    assert app.output_maxrate_entry.state == app_module.tk.DISABLED
-    assert app.output_bufsize_entry.state == app_module.tk.DISABLED
+    assert app.output_cq_entry.visible is False
+    assert app.output_bitrate_entry.visible is True
+    assert app.output_maxrate_entry.visible is False
+    assert app.output_bufsize_entry.visible is False
 
     app.output_rate_mode_var = Value("VBR")
     app.update_output_rate_controls()
 
-    assert app.output_cq_entry.state == app_module.tk.NORMAL
-    assert app.output_bitrate_entry.state == app_module.tk.NORMAL
-    assert app.output_maxrate_entry.state == app_module.tk.NORMAL
-    assert app.output_bufsize_entry.state == app_module.tk.NORMAL
+    assert app.output_cq_entry.visible is True
+    assert app.output_bitrate_entry.visible is True
+    assert app.output_maxrate_entry.visible is True
+    assert app.output_bufsize_entry.visible is True
 
 
 def test_select_compatible_resource_ids_falls_back_to_allowed_resource():
@@ -1061,9 +1113,16 @@ def test_update_output_encoder_controls_removes_cq_for_qsv():
     class Widget:
         def __init__(self):
             self.config = {}
+            self.visible = True
 
         def configure(self, **kwargs):
             self.config.update(kwargs)
+
+        def grid(self):
+            self.visible = True
+
+        def grid_remove(self):
+            self.visible = False
 
     app = EncoderApp.__new__(EncoderApp)
     app.output_encoder_combo = Widget()
@@ -1089,10 +1148,10 @@ def test_update_output_encoder_controls_removes_cq_for_qsv():
 
     assert app.output_rate_combo.config["values"] == ["VBR", "ABR", "CBR"]
     assert app.output_rate_mode_var.get() == "VBR"
-    assert app.output_cq_entry.config["state"] == app_module.tk.DISABLED
-    assert app.output_bitrate_entry.config["state"] == app_module.tk.NORMAL
-    assert app.output_maxrate_entry.config["state"] == app_module.tk.NORMAL
-    assert app.output_bufsize_entry.config["state"] == app_module.tk.NORMAL
+    assert app.output_cq_entry.visible is False
+    assert app.output_bitrate_entry.visible is True
+    assert app.output_maxrate_entry.visible is True
+    assert app.output_bufsize_entry.visible is True
 
 
 def test_encoder_app_has_no_unused_ffmpeg_download_button_handler():
@@ -1246,6 +1305,47 @@ def test_refresh_outputs_tree_inserts_full_output_tuple_once():
     assert tags == (BACKEND_QSV,)
     assert values[1:] == ("QSV", BACKEND_QSV, "hevc_qsv", "1080p", "qsv", "mp4")
     assert len(values) == 7
+
+
+def test_output_bulk_enable_disable_duplicate_and_remove(tmp_path: Path):
+    class FakeTree:
+        def __init__(self, selected):
+            self.selected = tuple(selected)
+            self.selection_updates = []
+
+        def selection(self):
+            return self.selected
+
+        def selection_set(self, *items):
+            self.selection_updates.append(tuple(items))
+            self.selected = tuple(items)
+
+    app = EncoderApp.__new__(EncoderApp)
+    first = OutputVariant(id="first", name="First", folder_name="first", enabled=True)
+    second = OutputVariant(id="second", name="Second", folder_name="second", enabled=True)
+    app.editing_outputs = [first, second]
+    app.outputs_tree = FakeTree(["first", "second"])
+    app.selected_output_id = None
+    app.refresh_outputs_tree = lambda: None
+    app.on_output_select = lambda: None
+
+    app.set_selected_outputs_enabled(False)
+
+    assert first.enabled is False
+    assert second.enabled is False
+
+    app.duplicate_selected_outputs()
+
+    assert len(app.editing_outputs) == 4
+    copied = app.editing_outputs[2:]
+    assert [item.name for item in copied] == ["First copy", "Second copy"]
+    assert copied[0].folder_name != first.folder_name
+    assert copied[1].folder_name != second.folder_name
+
+    app.outputs_tree.selected = ("first", copied[0].id)
+    app.remove_output()
+
+    assert [item.id for item in app.editing_outputs] == ["second", copied[1].id]
 
 
 def test_selected_resource_labels_only_reports_selected_resources(tmp_path: Path):

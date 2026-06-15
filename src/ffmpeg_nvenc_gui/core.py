@@ -39,6 +39,18 @@ DEFAULT_ENCODER_BY_BACKEND = {
     BACKEND_QSV: "hevc_qsv",
     BACKEND_AMF: "hevc_amf",
 }
+AUDIO_CODEC_CHOICES = ["copy", "aac", "alac", "libmp3lame", "mp3", "opus", "vorbis", "flac"]
+AUDIO_CONTAINERS_BY_CODEC = {
+    "copy": ["mka", "mkv"],
+    "aac": ["m4a", "mp4", "mov"],
+    "alac": ["m4a", "mp4", "mov"],
+    "libmp3lame": ["mp3"],
+    "mp3": ["mp3"],
+    "opus": ["mka", "mkv", "webm"],
+    "vorbis": ["mka", "mkv", "webm"],
+    "flac": ["mka", "mkv"],
+}
+SOURCE_TEMPLATE_TOKENS = ("${filename}", "{source}")
 STALE_AUTO_RESOURCE_ERRORS = {
     "Manual resource; availability is checked before encoding.",
 }
@@ -207,9 +219,9 @@ class OutputVariant:
         self.bufsize = str(self.bufsize or "").strip()
         self.pix_fmt = str(self.pix_fmt or "").strip()
         self.scale_flags = str(self.scale_flags or "").strip()
-        self.audio_codec = str(self.audio_codec or "").strip()
+        self.audio_codec = normalize_audio_codec(self.audio_codec)
         self.audio_bitrate = str(self.audio_bitrate or "").strip()
-        self.audio_container = normalize_container_extension(self.audio_container, default="") or ""
+        self.audio_container = normalize_audio_container_for_codec(self.audio_codec, self.audio_container)
         self.ffmpeg_encoder = str(self.ffmpeg_encoder or "").strip()
         inherit_profile_device = (
             not self.backend and not self.ffmpeg_encoder and self.use_gpu is None and not self.resource_ids
@@ -278,7 +290,6 @@ EncodeSet = OutputVariant
 @dataclass
 class EncodeProfile:
     id: str
-    name: str
     input_dir: str
     output_dir: str
     archive_dir: str
@@ -306,7 +317,6 @@ class EncodeProfile:
 
     def __post_init__(self) -> None:
         self.id = str(self.id or "").strip() or new_id("profile")
-        self.name = str(self.name or "").strip() or self.id
         self.input_dir = str(self.input_dir or "").strip()
         self.output_dir = str(self.output_dir or "").strip()
         self.archive_dir = str(self.archive_dir or "").strip()
@@ -502,7 +512,7 @@ def backend_from_encoder(encoder: object) -> str:
 def resource_id_for_backend(backend: str, index: int = 0) -> str:
     backend = normalize_backend(backend)
     if backend == BACKEND_CPU:
-        return CPU_RESOURCE_ID
+        return f"cpu:{max(0, int(index))}"
     vendor = {
         BACKEND_NVENC: "nvidia",
         BACKEND_QSV: "intel",
@@ -552,6 +562,21 @@ def normalize_resource_id_list(value: object) -> List[str]:
     return normalized
 
 
+def normalize_audio_codec(value: object) -> str:
+    codec = str(value or "copy").strip().lower()
+    return codec if codec in AUDIO_CONTAINERS_BY_CODEC else "copy"
+
+
+def audio_containers_for_codec(codec: object) -> List[str]:
+    return list(AUDIO_CONTAINERS_BY_CODEC.get(normalize_audio_codec(codec), AUDIO_CONTAINERS_BY_CODEC["copy"]))
+
+
+def normalize_audio_container_for_codec(codec: object, container: object) -> str:
+    containers = audio_containers_for_codec(codec)
+    value = normalize_container_extension(container, default="")
+    return value if value in containers else containers[0]
+
+
 def get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -598,16 +623,21 @@ def validate_profile_dirs(profile: EncodeProfile) -> None:
 def ensure_profile_dirs(profile: EncodeProfile) -> None:
     validate_profile_dirs(profile)
     input_dir = profile_input_dir(profile)
-    output_dir = profile_output_dir(profile)
-    archive_dir = profile_archive_dir(profile)
 
     input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    archive_dir.mkdir(parents=True, exist_ok=True)
+    if not has_source_template(profile.output_dir):
+        profile_output_dir(profile).mkdir(parents=True, exist_ok=True)
+    if not has_source_template(profile.archive_dir):
+        profile_archive_dir(profile).mkdir(parents=True, exist_ok=True)
     for variant in profile.outputs:
         if variant.enabled:
             variant_input_dir(profile, variant).mkdir(parents=True, exist_ok=True)
-            (variant_output_dir(profile, variant) / variant.folder_name).mkdir(parents=True, exist_ok=True)
+            output_template = variant.output_dir or profile.output_dir
+            if not has_source_template(output_template) and not has_source_template(variant.folder_name):
+                (variant_output_dir(profile, variant) / expand_folder_template(variant.folder_name, None)).mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
 
 
 def safe_folder_name(text: str) -> str:
@@ -629,6 +659,34 @@ def normalize_container_extension(value: object, default: str = "mp4") -> str:
     if SAFE_CONTAINER_RE.fullmatch(candidate):
         return candidate
     return default
+
+
+def has_source_template(value: object) -> bool:
+    text = str(value or "")
+    return any(token in text for token in SOURCE_TEMPLATE_TOKENS)
+
+
+def source_template_replacements(src: Path) -> Dict[str, str]:
+    return {
+        "${filename}": safe_folder_name(src.stem),
+        "{source}": safe_folder_name(src.stem),
+    }
+
+
+def expand_path_template(value: object, src: Optional[Path]) -> str:
+    text = str(value or "").strip()
+    if src is None:
+        return text
+    for token, replacement in source_template_replacements(src).items():
+        text = text.replace(token, replacement)
+    return text
+
+
+def expand_folder_template(value: object, src: Optional[Path]) -> str:
+    expanded = expand_path_template(value, src)
+    if has_source_template(value):
+        return safe_folder_name(expanded)
+    return safe_folder_name(expanded)
 
 
 def parse_ffmpeg_args(value: object) -> List[str]:
@@ -693,18 +751,94 @@ def detect_nvenc_engine_count(_gpu_index: int = 0) -> Tuple[Optional[int], str]:
     return None, "nvEncodeAPI64.dll loaded; encode-session caps helper unavailable, using manual slots."
 
 
-def hardware_resources_from_gpus(gpus: Optional[List[GpuInfo]]) -> List[HardwareResource]:
-    resources = [
-        HardwareResource(
-            id=CPU_RESOURCE_ID,
-            label="CPU",
-            kind="cpu",
-            backend=BACKEND_CPU,
-            vendor="cpu",
-            index=0,
-            concurrency_slots=1,
-        )
+def fallback_cpu_resource() -> HardwareResource:
+    return HardwareResource(
+        id=CPU_RESOURCE_ID,
+        label="CPU",
+        kind="cpu",
+        backend=BACKEND_CPU,
+        vendor="cpu",
+        index=0,
+        concurrency_slots=1,
+    )
+
+
+def cpu_resource_from_wmi_item(item: Dict[str, object], fallback_index: int) -> Optional[HardwareResource]:
+    name = str(item.get("Name") or "").strip()
+    device_id = str(item.get("DeviceID") or "").strip()
+    socket = str(item.get("SocketDesignation") or "").strip()
+    index = fallback_index
+    match = re.search(r"(\d+)", device_id)
+    if match:
+        index = normalize_int(match.group(1), minimum=0, default=fallback_index)
+    if not name and not socket and not device_id:
+        return None
+    model = name or "CPU"
+    socket_label = socket or device_id
+    label = f"CPU {index}: {model}"
+    if socket_label:
+        label = f"{label} / {socket_label}"
+    return HardwareResource(
+        id=resource_id_for_backend(BACKEND_CPU, index),
+        label=label,
+        kind="cpu",
+        backend=BACKEND_CPU,
+        vendor="cpu",
+        index=index,
+        concurrency_slots=1,
+    )
+
+
+def cpu_resources_from_wmi_data(data: object) -> List[HardwareResource]:
+    items = data if isinstance(data, list) else [data]
+    resources: List[HardwareResource] = []
+    seen: set[str] = set()
+    for fallback_index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        resource = cpu_resource_from_wmi_item(item, fallback_index)
+        if resource is None or resource.id in seen:
+            continue
+        resources.append(resource)
+        seen.add(resource.id)
+    return resources or [fallback_cpu_resource()]
+
+
+def detect_cpu_resources(timeout: int = 5) -> List[HardwareResource]:
+    if os.name != "nt":
+        return [fallback_cpu_resource()]
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-CimInstance Win32_Processor | "
+        "Select-Object DeviceID,Name,SocketDesignation | ConvertTo-Json -Compress",
     ]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        return [fallback_cpu_resource()]
+    if result.returncode != 0:
+        return [fallback_cpu_resource()]
+    try:
+        data = json.loads(result.stdout or "null")
+    except json.JSONDecodeError:
+        return [fallback_cpu_resource()]
+    return cpu_resources_from_wmi_data(data)
+
+
+def hardware_resources_from_gpus(gpus: Optional[List[GpuInfo]]) -> List[HardwareResource]:
+    resources = detect_cpu_resources()
     for gpu in gpus or []:
         backend = {
             "nvidia": BACKEND_NVENC,
@@ -740,6 +874,11 @@ def normalize_hardware_resources(
     for resource in resources:
         if not resource.id:
             continue
+        if resource.id in by_id:
+            detected = by_id[resource.id]
+            detected.concurrency_slots = resource.concurrency_slots
+            by_id[resource.id] = detected
+            continue
         if resource.id not in by_id and resource.detection_error in STALE_AUTO_RESOURCE_ERRORS:
             continue
         if (
@@ -750,15 +889,7 @@ def normalize_hardware_resources(
             continue
         by_id[resource.id] = resource
     if CPU_RESOURCE_ID not in by_id:
-        by_id[CPU_RESOURCE_ID] = HardwareResource(
-            id=CPU_RESOURCE_ID,
-            label="CPU",
-            kind="cpu",
-            backend=BACKEND_CPU,
-            vendor="cpu",
-            index=0,
-            concurrency_slots=1,
-        )
+        by_id[CPU_RESOURCE_ID] = fallback_cpu_resource()
     return sorted(by_id.values(), key=lambda item: (item.kind != "cpu", item.vendor, item.index, item.id))
 
 
@@ -878,7 +1009,6 @@ def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> En
     resource_ids = [resource_id_for_backend(BACKEND_NVENC, gpu.index)] if gpu else [CPU_RESOURCE_ID]
     return EncodeProfile(
         id="default",
-        name="Archive Profile",
         input_dir=str(paths.base_dir / "Incoming"),
         output_dir=str(paths.base_dir / "Encoded"),
         archive_dir=str(paths.base_dir / "SourceArchive"),
@@ -966,12 +1096,12 @@ def profile_input_dir(profile: EncodeProfile) -> Path:
     return Path(profile.input_dir).expanduser().resolve()
 
 
-def profile_output_dir(profile: EncodeProfile) -> Path:
-    return Path(profile.output_dir).expanduser().resolve()
+def profile_output_dir(profile: EncodeProfile, src: Optional[Path] = None) -> Path:
+    return Path(expand_path_template(profile.output_dir, src)).expanduser().resolve()
 
 
-def profile_archive_dir(profile: EncodeProfile) -> Path:
-    return Path(profile.archive_dir).expanduser().resolve()
+def profile_archive_dir(profile: EncodeProfile, src: Optional[Path] = None) -> Path:
+    return Path(expand_path_template(profile.archive_dir, src)).expanduser().resolve()
 
 
 def variant_input_dir(profile: EncodeProfile, variant: OutputVariant) -> Path:
@@ -979,9 +1109,9 @@ def variant_input_dir(profile: EncodeProfile, variant: OutputVariant) -> Path:
     return Path(value).expanduser().resolve() if value else profile_input_dir(profile)
 
 
-def variant_output_dir(profile: EncodeProfile, variant: OutputVariant) -> Path:
+def variant_output_dir(profile: EncodeProfile, variant: OutputVariant, src: Optional[Path] = None) -> Path:
     value = str(getattr(variant, "output_dir", "") or "").strip()
-    return Path(value).expanduser().resolve() if value else profile_output_dir(profile)
+    return Path(expand_path_template(value, src)).expanduser().resolve() if value else profile_output_dir(profile, src)
 
 
 def variant_segment_minutes(profile: EncodeProfile, variant: OutputVariant) -> int:
@@ -1004,6 +1134,7 @@ def variant_accepts_source(profile: EncodeProfile, variant: OutputVariant, src: 
 def output_file_stem_for(profile: EncodeProfile, src: Path, variant: OutputVariant) -> str:
     height = "" if variant.height is None else str(variant.height)
     replacements = {
+        "${filename}": src.stem,
         "{source}": src.stem,
         "{profile}": variant.name,
         "{profile_id}": variant.id,
@@ -1019,9 +1150,10 @@ def output_file_stem_for(profile: EncodeProfile, src: Path, variant: OutputVaria
 
 def output_path_for(profile: EncodeProfile, src: Path, variant: OutputVariant) -> Path:
     container = normalize_container_extension(variant.container)
+    folder_name = expand_folder_template(variant.folder_name, src)
     return (
-        variant_output_dir(profile, variant)
-        / variant.folder_name
+        variant_output_dir(profile, variant, src)
+        / folder_name
         / f"{output_file_stem_for(profile, src, variant)}.{container}"
     )
 
@@ -1154,19 +1286,12 @@ def variant_gpu_index(profile: EncodeProfile, variant: OutputVariant, resource_i
 
 def variant_audio_codec(profile: EncodeProfile, variant: OutputVariant) -> str:
     value = str(variant_setting(profile, variant, "audio_codec", "copy") or "").strip()
-    return value or "copy"
+    return normalize_audio_codec(value)
 
 
 def variant_audio_container(profile: EncodeProfile, variant: OutputVariant) -> str:
     configured = str(variant.audio_container or "").strip()
-    if configured:
-        return normalize_container_extension(configured, default="mka")
-    codec = variant_audio_codec(profile, variant).lower()
-    if codec in {"aac", "alac"}:
-        return "m4a"
-    if codec in {"mp3", "libmp3lame"}:
-        return "mp3"
-    return "mka"
+    return normalize_audio_container_for_codec(variant_audio_codec(profile, variant), configured)
 
 
 def is_nvenc_codec(codec: str) -> bool:

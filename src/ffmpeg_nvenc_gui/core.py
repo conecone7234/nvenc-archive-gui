@@ -812,8 +812,7 @@ def detect_cpu_resources(timeout: int = 5) -> List[HardwareResource]:
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "Get-CimInstance Win32_Processor | "
-        "Select-Object DeviceID,Name,SocketDesignation | ConvertTo-Json -Compress",
+        "Get-CimInstance Win32_Processor | Select-Object DeviceID,Name,SocketDesignation | ConvertTo-Json -Compress",
     ]
     try:
         result = subprocess.run(

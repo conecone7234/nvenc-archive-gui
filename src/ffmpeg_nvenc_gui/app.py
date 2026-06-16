@@ -2216,7 +2216,9 @@ class EncoderApp:
         )
         self.output_resource_frame = ttk.Frame(form, padding=(8, 5), style="Inset.TFrame")
         self.output_resource_frame.grid(row=4, column=1, columnspan=2, sticky="ew", pady=4)
-        ttk.Button(form, text="変更", command=self.open_output_resource_dialog).grid(row=4, column=3, sticky=tk.E, pady=4)
+        ttk.Button(form, text="変更", command=self.open_output_resource_dialog).grid(
+            row=4, column=3, sticky=tk.E, pady=4
+        )
 
         self.output_resolution_combo = self._dialog_combo(
             form,

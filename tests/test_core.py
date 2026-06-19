@@ -41,6 +41,7 @@ from ffmpeg_nvenc_gui.core import (
     detect_cpu_resources,
     duplicate_output_targets,
     ensure_profile_dirs,
+    format_eta_duration,
     format_seconds,
     hardware_resources_from_gpus,
     load_profiles,
@@ -211,6 +212,15 @@ def test_parse_ffmpeg_args_preserves_windows_paths_and_removes_quotes():
     args = parse_ffmpeg_args(r'-metadata title="My Clip" -passlogfile "C:\temp\ffmpeg pass.log"')
 
     assert args == ["-metadata", "title=My Clip", "-passlogfile", r"C:\temp\ffmpeg pass.log"]
+
+
+def test_format_eta_duration_uses_japanese_units_and_handles_edge_cases():
+    assert format_eta_duration(45) == "45秒"
+    assert format_eta_duration(330) == "5分30秒"
+    assert format_eta_duration(3700) == "1時間1分"
+    assert format_eta_duration(0) == "0秒"
+    assert format_eta_duration(-5) == ""
+    assert format_eta_duration(float("inf")) == ""
 
 
 def test_audio_and_mux_commands_are_separate_from_video_segments(tmp_path: Path):

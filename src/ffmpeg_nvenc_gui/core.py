@@ -1794,6 +1794,22 @@ def parse_ffmpeg_time(line: str) -> Optional[float]:
     return hours * 3600 + minutes * 60 + seconds
 
 
+def format_eta_duration(seconds: float) -> str:
+    """Format a remaining-time estimate (in seconds) as a Japanese label."""
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+        return ""
+    total = int(round(seconds))
+    if total <= 0:
+        return "0秒"
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}時間{minutes}分"
+    if minutes > 0:
+        return f"{minutes}分{secs}秒"
+    return f"{secs}秒"
+
+
 def probe_duration(ffprobe_path: Path, src: Path) -> Optional[float]:
     if not ffprobe_path.exists():
         return None

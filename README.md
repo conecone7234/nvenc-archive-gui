@@ -6,7 +6,7 @@ Windows native GUI encoder for FFmpeg/NVENC archive jobs.
 
 - Home screen focused on the Start/Pause/Resume cycle, Stop, logs, and file-by-file progress
 - Settings-based default input, output, and source archive folders
-- Multiple output profiles per source file, such as `Master 2160p` and `Reference 1080p`
+- Multiple output profiles per source file, such as `UP Convert 4K` and `ReEncode Original Pixel`
 - Per-output-profile input/output folder overrides, file name templates, segment length, resolution, container, codec, rate control, resources, audio, and advanced FFmpeg arguments
 - Resolution presets plus custom output height
 - CQ/CRF, VBR, ABR, and CBR modes
@@ -30,10 +30,11 @@ work-folder
 |   |-- ffmpeg.exe
 |   `-- ffprobe.exe
 |-- Incoming
-|-- Encoded
-|   |-- master-2160p
-|   `-- reference-1080p
-|-- SourceArchive
+|-- output
+|   `-- {source}
+|       |-- {source}.mp4
+|       |-- up-convert-4k
+|       `-- reencode-original-pixel
 |-- profiles.json
 `-- tmp
     |-- encoder_state.json

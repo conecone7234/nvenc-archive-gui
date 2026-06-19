@@ -46,6 +46,8 @@ try:
         encoder_codec,
         ensure_dirs,
         ensure_profile_dirs,
+        estimate_remaining_seconds,
+        format_eta_duration,
         joined_video_path_for,
         load_profiles,
         load_state,
@@ -119,6 +121,8 @@ except ModuleNotFoundError:
         encoder_codec,
         ensure_dirs,
         ensure_profile_dirs,
+        estimate_remaining_seconds,
+        format_eta_duration,
         joined_video_path_for,
         load_profiles,
         load_state,
@@ -1434,6 +1438,8 @@ class EncoderApp:
         self.stop_requested = False
         self.discard_state_on_stop = False
         self.scheduler_thread: Optional[threading.Thread] = None
+        self._eta_start_time: Optional[float] = None
+        self._eta_start_progress: float = 0.0
 
         self._build_ui()
         self.refresh_profile_choices()
@@ -1576,6 +1582,7 @@ class EncoderApp:
         self.active_profile_var = tk.StringVar()
         self.status_var = tk.StringVar(value="待機中")
         self.progress_text_var = tk.StringVar(value="0%")
+        self.eta_text_var = tk.StringVar(value="")
         self.input_summary_var = tk.StringVar(value="")
         self.output_summary_var = tk.StringVar(value="")
 
@@ -1881,6 +1888,10 @@ class EncoderApp:
         ttk.Label(progress_head, textvariable=self.progress_text_var, style="Muted.TLabel").pack(side=tk.RIGHT)
         self.overall_progress = ttk.Progressbar(progress_box, mode="determinate", maximum=100)
         self.overall_progress.pack(fill=tk.X, pady=(10, 0))
+        eta_row = ttk.Frame(progress_box, style="Surface.TFrame")
+        eta_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(eta_row, text="予想残り時間", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Label(eta_row, textvariable=self.eta_text_var, style="Muted.TLabel").pack(side=tk.RIGHT)
 
         list_box = self._surface(tab)
         list_box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
@@ -3672,10 +3683,44 @@ class EncoderApp:
         if not jobs:
             self.overall_progress["value"] = 0
             self.progress_text_var.set("0%")
+            self.eta_text_var.set("")
+            self._eta_start_time = None
             return
         value = sum(max(0.0, min(100.0, job.progress)) for job in jobs) / len(jobs)
         self.overall_progress["value"] = value
         self.progress_text_var.set(f"{value:.0f}%")
+        self._update_eta(value)
+
+    def _update_eta(self, value: float) -> None:
+        if not self.running:
+            self.eta_text_var.set("")
+            self._eta_start_time = None
+            return
+        if self.paused:
+            self.eta_text_var.set("一時停止中")
+            # Re-baseline on resume so paused time does not skew the estimate.
+            self._eta_start_time = None
+            return
+        if value >= 100.0:
+            self.eta_text_var.set("まもなく完了")
+            return
+        now = time.monotonic()
+        if self._eta_start_time is None:
+            self._eta_start_time = now
+            self._eta_start_progress = value
+            self.eta_text_var.set("計算中…")
+            return
+        elapsed = now - self._eta_start_time
+        delta = value - self._eta_start_progress
+        if delta < 0.0:
+            # Progress went backwards (e.g. a job restarted); re-baseline.
+            self._eta_start_time = now
+            self._eta_start_progress = value
+            self.eta_text_var.set("計算中…")
+            return
+        remaining = estimate_remaining_seconds(elapsed, delta, value)
+        label = format_eta_duration(remaining) if remaining is not None else ""
+        self.eta_text_var.set(f"約{label}" if label else "計算中…")
 
     def _update_runtime_rows(self, jobs: List[RuntimeJob]) -> None:
         for job in jobs:
@@ -4042,6 +4087,8 @@ class EncoderApp:
             self.paused = False
             self.stop_requested = False
             self.discard_state_on_stop = False
+            self._eta_start_time = None
+            self._eta_start_progress = 0.0
             self.active_jobs.clear()
             self.all_jobs.clear()
             self.job_rows.clear()

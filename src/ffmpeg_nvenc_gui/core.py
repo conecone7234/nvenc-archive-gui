@@ -731,16 +731,16 @@ def default_outputs() -> List[OutputVariant]:
     return [
         OutputVariant(
             id="master_2160p",
-            name="Master 2160p",
-            folder_name="master-2160p",
+            name="UP Convert 4K",
+            folder_name="up-convert-4k",
             height=2160,
             container="mp4",
         ),
         OutputVariant(
-            id="reference_1080p",
-            name="Reference 1080p",
-            folder_name="reference-1080p",
-            height=1080,
+            id="reference_original",
+            name="ReEncode Original Pixel",
+            folder_name="reencode-original-pixel",
+            height=None,
             container="mp4",
         ),
     ]
@@ -1141,8 +1141,8 @@ def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> En
     return EncodeProfile(
         id="default",
         input_dir=str(paths.base_dir / "Incoming"),
-        output_dir=str(paths.base_dir / "Encoded"),
-        archive_dir=str(paths.base_dir / "SourceArchive"),
+        output_dir=str(paths.base_dir / "output" / "{source}"),
+        archive_dir=str(paths.base_dir / "output" / "{source}"),
         max_parallel_jobs=2 if gpu else 1,
         segment_minutes=10,
         use_gpu=gpu is not None,
@@ -1152,7 +1152,7 @@ def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> En
         cpu_codec="libx264",
         cpu_preset="medium",
         cpu_tune="none",
-        cq_value=18 if gpu else 23,
+        cq_value=15 if gpu else 23,
         bitrate="25000k" if gpu else "8000k",
         maxrate="40000k" if gpu else "12000k",
         bufsize="80000k" if gpu else "24000k",
@@ -1792,6 +1792,36 @@ def parse_ffmpeg_time(line: str) -> Optional[float]:
     minutes = int(match.group(2))
     seconds = float(match.group(3))
     return hours * 3600 + minutes * 60 + seconds
+
+
+def format_eta_duration(seconds: float) -> str:
+    """Format a remaining-time estimate (in seconds) as a Japanese label."""
+    if not math.isfinite(seconds) or seconds < 0:
+        return ""
+    total = int(round(seconds))
+    if total <= 0:
+        return "0秒"
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}時間{minutes}分"
+    if minutes > 0:
+        return f"{minutes}分{secs}秒"
+    return f"{secs}秒"
+
+
+def estimate_remaining_seconds(elapsed: float, progress_delta: float, value: float) -> Optional[float]:
+    """Estimate remaining seconds from elapsed time and overall progress (0-100).
+
+    Returns None when there is not enough signal yet (too little elapsed time or
+    no forward progress), so callers can show a "calculating" placeholder.
+    """
+    if elapsed < 1.0 or progress_delta <= 0.0 or value >= 100.0:
+        return None
+    rate = progress_delta / elapsed
+    if rate <= 0.0:
+        return None
+    return (100.0 - value) / rate
 
 
 def probe_duration(ffprobe_path: Path, src: Path) -> Optional[float]:

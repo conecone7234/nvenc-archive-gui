@@ -41,6 +41,8 @@ from ffmpeg_nvenc_gui.core import (
     detect_cpu_resources,
     duplicate_output_targets,
     ensure_profile_dirs,
+    estimate_remaining_seconds,
+    format_eta_duration,
     format_seconds,
     hardware_resources_from_gpus,
     load_profiles,
@@ -211,6 +213,26 @@ def test_parse_ffmpeg_args_preserves_windows_paths_and_removes_quotes():
     args = parse_ffmpeg_args(r'-metadata title="My Clip" -passlogfile "C:\temp\ffmpeg pass.log"')
 
     assert args == ["-metadata", "title=My Clip", "-passlogfile", r"C:\temp\ffmpeg pass.log"]
+
+
+def test_format_eta_duration_uses_japanese_units_and_handles_edge_cases():
+    assert format_eta_duration(45) == "45秒"
+    assert format_eta_duration(330) == "5分30秒"
+    assert format_eta_duration(3700) == "1時間1分"
+    assert format_eta_duration(0) == "0秒"
+    assert format_eta_duration(-5) == ""
+    assert format_eta_duration(float("inf")) == ""
+
+
+def test_estimate_remaining_seconds_uses_progress_rate_and_guards_edge_cases():
+    # Gained 30% over 60s (10% -> 40%) -> 0.5%/s; 60% remaining -> 120s.
+    assert estimate_remaining_seconds(60.0, 30.0, 40.0) == 120.0
+    # Not enough elapsed time yet.
+    assert estimate_remaining_seconds(0.5, 30.0, 40.0) is None
+    # No forward progress.
+    assert estimate_remaining_seconds(60.0, 0.0, 40.0) is None
+    # Already complete.
+    assert estimate_remaining_seconds(60.0, 30.0, 100.0) is None
 
 
 def test_audio_and_mux_commands_are_separate_from_video_segments(tmp_path: Path):
@@ -681,6 +703,22 @@ def test_hardware_resources_only_include_detected_devices_by_default():
     assert all(resource.backend == BACKEND_CPU for resource in resources)
 
 
+def test_default_outputs_match_archive_profile(tmp_path: Path):
+    profile = core_module.default_profile(
+        build_paths(tmp_path),
+        [GpuInfo(index=0, name="NVIDIA GeForce RTX 5080")],
+    )
+
+    assert profile.cq_value == 15
+    assert Path(profile.output_dir) == tmp_path / "output" / "{source}"
+    assert Path(profile.archive_dir) == tmp_path / "output" / "{source}"
+    names = [(output.id, output.name, output.folder_name, output.height) for output in profile.outputs]
+    assert names == [
+        ("master_2160p", "UP Convert 4K", "up-convert-4k", 2160),
+        ("reference_original", "ReEncode Original Pixel", "reencode-original-pixel", None),
+    ]
+
+
 def test_default_profile_outputs_follow_detected_non_nvenc_backend(tmp_path: Path):
     profile = core_module.default_profile(
         build_paths(tmp_path),
@@ -833,7 +871,7 @@ def test_load_profiles_defaults_missing_fields_from_supplied_paths(tmp_path: Pat
 
     assert len(profiles) == 1
     assert Path(profiles[0].input_dir) == paths.base_dir / "Incoming"
-    assert Path(profiles[0].output_dir) == paths.base_dir / "Encoded"
+    assert Path(profiles[0].output_dir) == paths.base_dir / "output" / "{source}"
     assert profiles[0].use_gpu is False
 
 

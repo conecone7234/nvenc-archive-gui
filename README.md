@@ -10,7 +10,7 @@ Windows native GUI encoder for FFmpeg/NVENC archive jobs.
 - Per-output-profile input/output folder overrides, file name templates, segment length, resolution, container, codec, rate control, resources, audio, and advanced FFmpeg arguments
 - Resolution presets plus custom output height
 - CQ/CRF, VBR, ABR, and CBR modes
-- Detected hardware resources only by default, with an advanced manual fallback for GPU resources
+- Detected hardware resources by default, with advanced manual GPU resource registration when needed
 - Segment parallelism follows the selected resource's slot count
 - One-source-at-a-time processing order, with each source's output profiles completed before the next source starts
 - Video-only segment encoding, video concat, source audio processing once, then final video/audio mux

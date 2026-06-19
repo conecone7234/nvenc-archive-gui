@@ -40,6 +40,14 @@ DEFAULT_ENCODER_BY_BACKEND = {
     BACKEND_QSV: "hevc_qsv",
     BACKEND_AMF: "hevc_amf",
 }
+NVIDIA_NVENC_ENGINE_HINTS = [
+    (re.compile(r"\brtx\s+5090\b", re.IGNORECASE), 3),
+    (re.compile(r"\brtx\s+5080\b", re.IGNORECASE), 2),
+    (re.compile(r"\brtx\s+5070\s*ti\b", re.IGNORECASE), 2),
+    (re.compile(r"\brtx\s+4090\b", re.IGNORECASE), 2),
+    (re.compile(r"\brtx\s+4080\b", re.IGNORECASE), 2),
+    (re.compile(r"\brtx\s+4070\s*ti\b", re.IGNORECASE), 2),
+]
 AUDIO_CODEC_CHOICES = ["copy", "aac", "alac", "libmp3lame", "mp3", "opus", "vorbis", "flac"]
 AUDIO_CONTAINERS_BY_CODEC = {
     "copy": ["mka", "mkv"],
@@ -750,6 +758,14 @@ def detect_nvenc_engine_count(_gpu_index: int = 0) -> Tuple[Optional[int], str]:
     return None, "nvEncodeAPI64.dll loaded; encode-session caps helper unavailable, using manual slots."
 
 
+def nvenc_engine_hint_from_name(name: str) -> Optional[int]:
+    normalized = re.sub(r"[\s_-]+", " ", str(name or "")).strip()
+    for pattern, engines in NVIDIA_NVENC_ENGINE_HINTS:
+        if pattern.search(normalized):
+            return engines
+    return None
+
+
 def fallback_cpu_resource() -> HardwareResource:
     return HardwareResource(
         id=CPU_RESOURCE_ID,
@@ -856,6 +872,14 @@ def hardware_resources_from_gpus(gpus: Optional[List[GpuInfo]]) -> List[Hardware
         detection_error = gpu.detection_error
         if backend == BACKEND_NVENC and engine_count is None:
             engine_count, detection_error = detect_nvenc_engine_count(gpu.index)
+            if engine_count is None:
+                hinted_count = nvenc_engine_hint_from_name(gpu.name)
+                if hinted_count is not None:
+                    engine_count = hinted_count
+                    detection_error = (
+                        f"{detection_error} Model hint selected {hinted_count} NVENC engine(s); "
+                        "encoder availability is still checked before encoding."
+                    ).strip()
         slots = engine_count or 1
         resources.append(
             HardwareResource(
@@ -931,6 +955,81 @@ def detect_nvidia_gpus(timeout: int = 5) -> List[GpuInfo]:
             continue
         gpus.append(GpuInfo(index=int(index_text), name=name))
     return gpus
+
+
+def gpu_vendor_from_wmi_item(item: Dict[str, object]) -> str:
+    haystack = " ".join(str(item.get(key) or "") for key in ("Name", "PNPDeviceID", "AdapterCompatibility")).lower()
+    if "10de" in haystack or "nvidia" in haystack:
+        return "nvidia"
+    if "8086" in haystack or "intel" in haystack:
+        return "intel"
+    if "1002" in haystack or "amd" in haystack or "advanced micro" in haystack or "radeon" in haystack:
+        return "amd"
+    return ""
+
+
+def gpus_from_wmi_data(data: object, existing: Optional[Iterable[GpuInfo]] = None) -> List[GpuInfo]:
+    items = data if isinstance(data, list) else [data]
+    counts: Dict[str, int] = {"nvidia": 0, "intel": 0, "amd": 0}
+    existing_keys = {
+        (gpu.vendor, re.sub(r"\s+", " ", gpu.name).strip().lower()) for gpu in (existing or []) if gpu.name
+    }
+    gpus: List[GpuInfo] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("Name") or "").strip()
+        vendor = gpu_vendor_from_wmi_item(item)
+        if not name or vendor not in counts:
+            continue
+        key = (vendor, re.sub(r"\s+", " ", name).strip().lower())
+        if key in existing_keys:
+            counts[vendor] += 1
+            continue
+        index = counts[vendor]
+        counts[vendor] += 1
+        gpus.append(GpuInfo(index=index, name=name, vendor=vendor))
+    return gpus
+
+
+def detect_wmi_gpus(timeout: int = 5, existing: Optional[Iterable[GpuInfo]] = None) -> List[GpuInfo]:
+    if os.name != "nt":
+        return []
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        (
+            "Get-CimInstance Win32_VideoController | "
+            "Select-Object Name,PNPDeviceID,AdapterCompatibility | ConvertTo-Json -Compress"
+        ),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    try:
+        data = json.loads(result.stdout or "null")
+    except json.JSONDecodeError:
+        return []
+    return gpus_from_wmi_data(data, existing)
+
+
+def detect_gpus(timeout: int = 5) -> List[GpuInfo]:
+    nvidia = detect_nvidia_gpus(timeout)
+    return nvidia + detect_wmi_gpus(timeout, existing=nvidia)
 
 
 def normalize_profile_gpu(profile: EncodeProfile, gpus: Optional[List[GpuInfo]]) -> EncodeProfile:
@@ -1010,10 +1109,35 @@ def normalize_profile_gpu(profile: EncodeProfile, gpus: Optional[List[GpuInfo]])
 
 
 def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> EncodeProfile:
-    detected = detect_nvidia_gpus() if gpus is None else gpus
-    gpu = detected[0] if detected else None
+    detected = detect_gpus() if gpus is None else gpus
+    gpu = next((item for item in detected if item.vendor == "nvidia"), None)
     hardware_resources = hardware_resources_from_gpus(detected)
-    resource_ids = [resource_id_for_backend(BACKEND_NVENC, gpu.index)] if gpu else [CPU_RESOURCE_ID]
+    resource_ids = [
+        resource_id_for_backend(
+            {
+                "nvidia": BACKEND_NVENC,
+                "intel": BACKEND_QSV,
+                "amd": BACKEND_AMF,
+            }.get(gpu_info.vendor, BACKEND_NVENC),
+            gpu_info.index,
+        )
+        for gpu_info in detected
+    ] or [CPU_RESOURCE_ID]
+    output_backend = resource_backend(resource_ids[0])
+    output_resource_ids = [
+        resource_id for resource_id in resource_ids if resource_backend(resource_id) == output_backend
+    ]
+    outputs = default_outputs()
+    for output in outputs:
+        output.backend = output_backend
+        output.ffmpeg_encoder = DEFAULT_ENCODER_BY_BACKEND[output_backend]
+        output.resource_ids = list(output_resource_ids)
+        output.use_gpu = output_backend != BACKEND_CPU
+        if output_backend == BACKEND_NVENC:
+            output.codec = output.ffmpeg_encoder
+            output.gpu_index = resource_index(output_resource_ids[0]) if output_resource_ids else 0
+        elif output_backend == BACKEND_CPU:
+            output.cpu_codec = output.ffmpeg_encoder
     return EncodeProfile(
         id="default",
         input_dir=str(paths.base_dir / "Incoming"),
@@ -1034,7 +1158,7 @@ def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> En
         bufsize="80000k" if gpu else "24000k",
         resource_ids=resource_ids,
         hardware_resources=hardware_resources,
-        outputs=default_outputs(),
+        outputs=outputs,
     )
 
 

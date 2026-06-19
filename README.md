@@ -4,7 +4,7 @@ Windows native GUI encoder for FFmpeg/NVENC archive jobs.
 
 ## Features
 
-- Home screen focused on Start / Pause / Stop, logs, and file-by-file progress
+- Home screen focused on the Start/Pause/Resume cycle, Stop, logs, and file-by-file progress
 - Settings-based default input, output, and source archive folders
 - Multiple output profiles per source file, such as `Master 2160p` and `Reference 1080p`
 - Per-output-profile input/output folder overrides, file name templates, segment length, resolution, container, codec, rate control, resources, audio, and advanced FFmpeg arguments
@@ -51,9 +51,11 @@ The segment length is configured per output profile, with the setting default us
 when the output profile leaves it blank. Segments for one output profile can run
 in parallel according to the selected resource's slot count. After the video
 segments are concatenated, audio is processed once from the original source and
-muxed with the joined video. Pause waits before launching more segments, and Stop
-leaves completed segments in `tmp/segments`.
-Use `保存状態から再開` to continue after an app crash, forced shutdown, or manual stop.
+muxed with the joined video. Pause waits before launching more segments, and the
+primary run button changes to Resume while resumable state exists. Stop is the
+explicit restart path: it clears the saved state and removes temporary segment
+files for the current run.
+Use `再開` to continue after an app crash or forced shutdown when saved state remains.
 
 ## Run From Source
 

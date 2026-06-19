@@ -225,7 +225,7 @@ def test_format_eta_duration_uses_japanese_units_and_handles_edge_cases():
 
 
 def test_estimate_remaining_seconds_uses_progress_rate_and_guards_edge_cases():
-    # 30% gained over 60s -> 0.5%/s; 60% remaining -> 120s.
+    # Gained 30% over 60s (10% -> 40%) -> 0.5%/s; 60% remaining -> 120s.
     assert estimate_remaining_seconds(60.0, 30.0, 40.0) == 120.0
     # Not enough elapsed time yet.
     assert estimate_remaining_seconds(0.5, 30.0, 40.0) is None

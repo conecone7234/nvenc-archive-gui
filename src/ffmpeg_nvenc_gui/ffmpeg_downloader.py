@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from .core import AppPaths, ensure_dirs, is_nvenc_codec, resource_index
+from .subprocess_utils import no_window_subprocess_kwargs
 
 ProgressCallback = Optional[Callable[[str], None]]
 
@@ -136,6 +137,7 @@ def verify_binary_basic(binary_path: Path, binary_name: str) -> None:
             errors="replace",
             timeout=20,
             check=False,
+            **no_window_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise FfmpegDownloadError(f"{binary_name} exists, but it could not run: {exc}") from exc
@@ -161,6 +163,7 @@ def verify_nvenc(ffmpeg_path: Path) -> bool:
         errors="replace",
         timeout=30,
         check=False,
+        **no_window_subprocess_kwargs(),
     )
     if result.returncode != 0:
         return False
@@ -179,6 +182,7 @@ def list_ffmpeg_encoders(ffmpeg_path: Path, timeout: int = 30) -> set[str]:
             errors="replace",
             timeout=timeout,
             check=False,
+            **no_window_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return set()
@@ -207,6 +211,7 @@ def encoder_help_text(ffmpeg_path: Path, encoder: str, timeout: int = 20) -> str
             errors="replace",
             timeout=timeout,
             check=False,
+            **no_window_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -301,6 +306,7 @@ def smoke_test_encoder(
             errors="replace",
             timeout=timeout,
             check=False,
+            **no_window_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)

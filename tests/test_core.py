@@ -50,6 +50,7 @@ from ffmpeg_nvenc_gui.core import (
     normalize_audio_container_for_codec,
     normalize_container_extension,
     normalize_profile_gpu,
+    nvenc_engine_hint_from_name,
     output_path_for,
     parse_ffmpeg_args,
     probe_has_audio,
@@ -679,6 +680,61 @@ def test_hardware_resources_only_include_detected_devices_by_default():
     assert all(resource.backend == BACKEND_CPU for resource in resources)
 
 
+def test_default_profile_outputs_follow_detected_non_nvenc_backend(tmp_path: Path):
+    profile = core_module.default_profile(
+        build_paths(tmp_path),
+        [GpuInfo(index=0, name="Intel Arc B580", vendor="intel")],
+    )
+
+    assert profile.use_gpu is False
+    assert profile.resource_ids == ["intel:0"]
+    assert all(output.backend == BACKEND_QSV for output in profile.outputs)
+    assert all(output.ffmpeg_encoder == "hevc_qsv" for output in profile.outputs)
+    assert all(output.resource_ids == ["intel:0"] for output in profile.outputs)
+
+
+def test_nvenc_engine_hint_covers_rtx_5080_and_5090():
+    assert nvenc_engine_hint_from_name("NVIDIA GeForce RTX 5080") == 2
+    assert nvenc_engine_hint_from_name("NVIDIA GeForce RTX 5090 Laptop GPU") == 3
+    assert nvenc_engine_hint_from_name("NVIDIA GeForce RTX 5070") is None
+
+
+def test_hardware_resources_use_nvenc_model_hint_when_caps_helper_is_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        core_module,
+        "detect_nvenc_engine_count",
+        lambda _index: (None, "nvEncodeAPI64.dll loaded; helper unavailable."),
+    )
+
+    resources = hardware_resources_from_gpus([GpuInfo(index=0, name="NVIDIA GeForce RTX 5080")])
+    nvenc = next(resource for resource in resources if resource.id == "nvidia:0")
+
+    assert nvenc.concurrency_slots == 2
+    assert nvenc.detected_encoder_engines == 2
+    assert "Model hint" in nvenc.detection_error
+
+
+def test_wmi_gpu_data_adds_intel_and_amd_resources_without_duplicating_nvidia():
+    existing = [GpuInfo(index=0, name="NVIDIA GeForce RTX 5080")]
+    gpus = core_module.gpus_from_wmi_data(
+        [
+            {"Name": "NVIDIA GeForce RTX 5080", "PNPDeviceID": "PCI\\VEN_10DE", "AdapterCompatibility": "NVIDIA"},
+            {"Name": "Intel Arc B580", "PNPDeviceID": "PCI\\VEN_8086", "AdapterCompatibility": "Intel"},
+            {
+                "Name": "AMD Radeon RX 9070",
+                "PNPDeviceID": "PCI\\VEN_1002",
+                "AdapterCompatibility": "Advanced Micro Devices",
+            },
+        ],
+        existing=existing,
+    )
+
+    assert [(gpu.vendor, gpu.index, gpu.name) for gpu in gpus] == [
+        ("intel", 0, "Intel Arc B580"),
+        ("amd", 0, "AMD Radeon RX 9070"),
+    ]
+
+
 def test_cpu_resources_from_wmi_data_include_model_and_socket():
     resources = cpu_resources_from_wmi_data(
         [
@@ -1284,53 +1340,54 @@ def test_finish_ffmpeg_prepare_error_resets_preparing(monkeypatch):
     assert any("boom" in message for _title, message in errors)
 
 
-def test_runtime_controls_hide_pause_until_running():
+def test_runtime_controls_use_two_button_state_cycle():
     class Button:
         def __init__(self):
             self.config = {}
-            self.visible = True
 
         def configure(self, **kwargs):
             self.config.update(kwargs)
 
         def grid(self):
-            self.visible = True
+            pass
 
         def grid_remove(self):
-            self.visible = False
+            pass
 
     app = EncoderApp.__new__(EncoderApp)
     app.running = False
     app.preparing = False
     app.paused = False
+    app.has_saved_state = lambda: False
     app.start_button = Button()
-    app.pause_button = Button()
     app.stop_button = Button()
-    app.resume_button = Button()
 
     app._sync_runtime_controls()
 
-    assert app.pause_button.visible is False
-    assert app.pause_button.config["state"] == app_module.tk.DISABLED
-    assert app.stop_button.config["state"] == app_module.tk.DISABLED
+    assert app.start_button.config["text"] == "開始"
     assert app.start_button.config["state"] == app_module.tk.NORMAL
+    assert app.stop_button.config["state"] == app_module.tk.DISABLED
 
     app.running = True
     app._sync_runtime_controls()
 
-    assert app.pause_button.visible is True
-    assert app.pause_button.config["state"] == app_module.tk.NORMAL
+    assert app.start_button.config["text"] == "一時停止"
+    assert app.start_button.config["state"] == app_module.tk.NORMAL
     assert app.stop_button.config["state"] == app_module.tk.NORMAL
-    assert app.start_button.config["state"] == app_module.tk.DISABLED
+
+    app.paused = True
+    app._sync_runtime_controls()
+
+    assert app.start_button.config["text"] == "再開"
 
 
-def test_output_editor_dialog_uses_independent_sessions():
+def test_output_editor_dialog_reuses_matching_existing_session():
     source = inspect.getsource(EncoderApp.open_output_editor_dialog)
-    active_prefix = source.split("return", 1)[0]
 
-    assert "OutputEditorSession" in active_prefix
-    assert "session.show()" in active_prefix
-    assert "self._widget_exists(existing)" not in active_prefix
+    assert "OutputEditorSession" in source
+    assert "session.show()" in source
+    assert "session.focus()" in source
+    assert "variant_id" in source
 
 
 def test_output_editor_session_warns_on_unsaved_changes_and_persists_profiles():
@@ -1637,6 +1694,7 @@ def test_add_or_update_output_allows_qsv_vbr_with_blank_cq(tmp_path: Path, monke
     assert variant.backend == BACKEND_QSV
     assert variant.rate_mode == "VBR"
     assert variant.cq_value == profile.cq_value
+    assert variant.scale_flags == ""
     assert app.outputs_tree.selection == variant.id
 
 

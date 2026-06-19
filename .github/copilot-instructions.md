@@ -1,5 +1,8 @@
 # Copilot Review Instructions
 
+リポジトリ全体のエージェント向け恒久指示は `AGENTS.md` を正本とする。
+レビュー挙動は、このファイルと `AGENTS.md` の両方に沿わせること。
+
 This repository is a Windows Tkinter app for FFmpeg archive encoding. Review
 changes with the behavior of `ffmpeg_nvenc_gui.app` and
 `ffmpeg_nvenc_gui.core` in mind, not as a generic web or CLI project.

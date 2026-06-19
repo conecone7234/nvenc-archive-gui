@@ -715,7 +715,7 @@ def test_default_outputs_match_archive_profile(tmp_path: Path):
     names = [(output.id, output.name, output.folder_name, output.height) for output in profile.outputs]
     assert names == [
         ("master_2160p", "UP Convert 4K", "up-convert-4k", 2160),
-        ("reference_1080p", "ReEncode Original Pixel", "reencode-original-pixel", None),
+        ("reference_original", "ReEncode Original Pixel", "reencode-original-pixel", None),
     ]
 
 

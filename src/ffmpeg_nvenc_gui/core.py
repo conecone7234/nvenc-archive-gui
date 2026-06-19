@@ -737,7 +737,7 @@ def default_outputs() -> List[OutputVariant]:
             container="mp4",
         ),
         OutputVariant(
-            id="reference_1080p",
+            id="reference_original",
             name="ReEncode Original Pixel",
             folder_name="reencode-original-pixel",
             height=None,

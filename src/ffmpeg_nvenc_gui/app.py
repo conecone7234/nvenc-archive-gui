@@ -82,7 +82,6 @@ try:
         write_concat_file,
     )
     from ffmpeg_nvenc_gui.ffmpeg_downloader import (
-        FfmpegDownloadError,
         encoder_capabilities,
         ensure_ffmpeg_available,
         smoke_test_encoder,
@@ -156,7 +155,6 @@ except ModuleNotFoundError:
         write_concat_file,
     )
     from ffmpeg_downloader import (  # type: ignore
-        FfmpegDownloadError,
         encoder_capabilities,
         ensure_ffmpeg_available,
         smoke_test_encoder,
@@ -3478,30 +3476,6 @@ class EncoderApp:
         if hasattr(self, "root"):
             self.root.after(0, self.update_output_encoder_controls)
         return True
-
-    def ensure_ffmpeg_before_run(self) -> bool:
-        if self.paths.ffmpeg_path.exists() and self.paths.ffprobe_path.exists():
-            try:
-                ensure_ffmpeg_available(self.paths, auto_download=False, progress=self.log)
-                return self.refresh_encoder_capabilities()
-            except Exception as exc:
-                messagebox.showerror("FFmpeg error", str(exc))
-                return False
-
-        messagebox.showinfo(
-            "FFmpeg を準備します",
-            "FFmpeg / FFprobe が見つからないため、自動でダウンロードして配置します。",
-        )
-        try:
-            ensure_ffmpeg_available(self.paths, auto_download=True, progress=self.log)
-            self.log("FFmpeg / FFprobe is ready.")
-            return self.refresh_encoder_capabilities()
-        except FfmpegDownloadError as exc:
-            messagebox.showerror("FFmpeg install failed", str(exc))
-            return False
-        except Exception as exc:
-            messagebox.showerror("FFmpeg install failed", str(exc))
-            return False
 
     def prepare_ffmpeg_and_start(self, profile: EncodeProfile, specs: List[JobSpec]) -> None:
         with self.lock:

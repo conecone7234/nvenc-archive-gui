@@ -24,9 +24,10 @@ changes with the behavior of `ffmpeg_nvenc_gui.app` and
 - Preserve the profile-driven workflow. Input, output, archive, temp, and output
   variant behavior should come from `EncodeProfile` and `OutputVariant`, not
   hard-coded folder names.
-- Preserve segment-based resume behavior. Do not pause or suspend an active
-  encoder process; completed segments should remain resumable after stop,
-  failure, or restart.
+- Preserve segment-based resume behavior after failure, app restart, or forced
+  shutdown. Do not pause or suspend an active encoder process. The explicit
+  Stop action is a discard/restart path: it clears saved state and removes
+  temporary segments, so do not describe Stop as resumable.
 - Treat CPU and GPU paths as first-class. NVENC, QSV, AMF, and CPU behavior
   should keep clear user-facing labels, compatible encoders, and sensible
   fallback behavior.

@@ -374,6 +374,8 @@ class ScaleFlagsSelector(ttk.Frame):
         self.variable = variable
         self.values = values
         self._syncing = False
+        self._destroyed = False
+        self._trace_id: Optional[str] = None
         self.flag_vars = {value: tk.BooleanVar(master=self, value=False) for value in values}
         self.button = ttk.Menubutton(self, width=28)
         self.menu = tk.Menu(self.button, tearoff=False)
@@ -388,15 +390,38 @@ class ScaleFlagsSelector(ttk.Frame):
             self.button,
             f"{HELP_TEXTS['Scale flags']}\n{CHOICE_HELP_TEXTS['Scale flags']}",
         )
-        self.variable.trace_add("write", lambda *_args: self.sync_from_variable())
+        self._trace_id = self.variable.trace_add("write", self._on_variable_changed)
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self.sync_from_variable()
+
+    def _on_variable_changed(self, *_args: object) -> None:
+        self.sync_from_variable()
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is self:
+            self._destroyed = True
+            self._remove_trace()
+
+    def destroy(self) -> None:
+        self._destroyed = True
+        self._remove_trace()
+        super().destroy()
+
+    def _remove_trace(self) -> None:
+        if self._trace_id is None:
+            return
+        try:
+            self.variable.trace_remove("write", self._trace_id)
+        except tk.TclError:
+            pass
+        self._trace_id = None
 
     @staticmethod
     def _parts(value: str) -> List[str]:
         return [part.strip() for part in str(value or "").split("+") if part.strip()]
 
     def sync_from_variable(self) -> None:
-        if self._syncing:
+        if self._syncing or self._destroyed:
             return
         selected = set(self._parts(self.variable.get()))
         for value, flag_var in self.flag_vars.items():
@@ -411,8 +436,14 @@ class ScaleFlagsSelector(ttk.Frame):
         self._update_label()
 
     def _update_label(self) -> None:
+        if self._destroyed:
+            return
         value = self.variable.get().strip()
-        self.button.configure(text=value or "なし")
+        try:
+            self.button.configure(text=value or "なし")
+        except tk.TclError:
+            self._destroyed = True
+            self._remove_trace()
 
     def set_default(self) -> None:
         self.variable.set("lanczos+accurate_rnd")

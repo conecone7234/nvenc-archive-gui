@@ -22,7 +22,8 @@
 
 ## 検証
 
-- Python 実行環境が不安定な場合は、優先して `C:\Users\conecone\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe` を使う。
+- Python 実行環境が不安定な場合は、まず利用可能な `python` / `py` / `sys.executable` を確認する。
+  この Codex Desktop 環境では `C:\Users\conecone\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe` が使えることがあるが、これはローカル例として扱い、他環境で存在する前提にしない。
 - 基本の検証順序は `compileall src tests`、`pytest -q`、`ruff check .`、`ruff format --check .`、`git diff --check`。
 - UI関連の修正や指摘対応では、必ず一度GUIを実行して、スクリーンショットなどで見え方を確認する。
 

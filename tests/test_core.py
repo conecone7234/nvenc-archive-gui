@@ -10,6 +10,7 @@ import ffmpeg_nvenc_gui.ffmpeg_downloader as downloader
 from ffmpeg_nvenc_gui.app import (
     EncoderApp,
     RuntimeJob,
+    ScaleFlagsSelector,
     backend_accepts_rate_mode,
     default_output_backend_for_resource_ids,
     profile_uses_nvenc_resource,
@@ -1398,6 +1399,28 @@ def test_output_editor_session_warns_on_unsaved_changes_and_persists_profiles():
     assert "output_editor_sessions" in source
 
 
+def test_scale_flags_selector_unregisters_variable_trace_on_destroy():
+    class Variable:
+        def __init__(self):
+            self.removed = []
+
+        def trace_remove(self, mode, trace_id):
+            self.removed.append((mode, trace_id))
+
+    variable = Variable()
+    selector = ScaleFlagsSelector.__new__(ScaleFlagsSelector)
+    selector.variable = variable
+    selector._trace_id = "trace-id"
+    selector._destroyed = False
+    event = type("Event", (), {"widget": selector})()
+
+    selector._on_destroy(event)
+
+    assert selector._destroyed is True
+    assert selector._trace_id is None
+    assert variable.removed == [("write", "trace-id")]
+
+
 def test_update_output_encoder_controls_has_no_unused_cpu_codec_combo():
     assert "output_cpu_codec_combo" not in inspect.getsource(EncoderApp.update_output_encoder_controls)
 
@@ -2027,6 +2050,75 @@ def test_state_resume_filters_completed_jobs(tmp_path: Path):
 
     clear_state(paths)
     assert load_state(paths) is None
+
+
+def test_scheduler_stop_discard_clears_state_and_temporary_outputs(tmp_path: Path):
+    paths = build_paths(tmp_path)
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    src = Path(profile.input_dir) / "video.mkv"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"dummy")
+    spec = JobSpec(src=str(src), profile_id=profile.id, variant_id=variant.id)
+    save_state(paths, profile, [spec])
+
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    app.paths = paths
+    app.running = True
+    app.paused = True
+    app.stop_requested = True
+    app.discard_state_on_stop = True
+    app.active_jobs = {}
+    app.pending_jobs = app_module.queue.Queue()
+    app.log_messages = []
+    app.log = app.log_messages.append
+    app.scan_files_called = False
+    app.scan_files = lambda: setattr(app, "scan_files_called", True)
+
+    class Root:
+        def after(self, _delay, callback=None):
+            if callback is not None:
+                callback()
+
+    app.root = Root()
+    job = RuntimeJob(
+        job_id=1,
+        spec=spec,
+        profile=profile,
+        variant=variant,
+        tmp_out=tmp_path / "tmp.mp4",
+        out_file=tmp_path / "out.mp4",
+        log_file=tmp_path / "job.log",
+    )
+    app.all_jobs = {job.job_id: job}
+
+    temporary_paths = [
+        core_module.joined_video_path_for(paths, src, profile, variant),
+        core_module.temp_audio_path_for(paths, src, profile, variant),
+        core_module.temp_output_path_for(paths, src, profile, variant),
+    ]
+    for path in temporary_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"temporary")
+    segment_dir = segment_dir_for(paths, src, profile, variant)
+    segment_dir.mkdir(parents=True, exist_ok=True)
+    (segment_dir / "segment-00001.mp4").write_bytes(b"segment")
+    unrelated_segment = paths.tmp_dir / "segments" / "unrelated" / "segment-00001.mp4"
+    unrelated_segment.parent.mkdir(parents=True, exist_ok=True)
+    unrelated_segment.write_bytes(b"keep")
+
+    app.scheduler_loop(profile)
+
+    assert not paths.state_file.exists()
+    assert all(not path.exists() for path in temporary_paths)
+    assert not segment_dir.exists()
+    assert unrelated_segment.exists()
+    assert app.running is False
+    assert app.paused is False
+    assert app.discard_state_on_stop is False
+    assert app.scan_files_called is True
+    assert any("破棄" in message for message in app.log_messages)
 
 
 def test_resumable_specs_skips_legacy_state_jobs(tmp_path: Path):

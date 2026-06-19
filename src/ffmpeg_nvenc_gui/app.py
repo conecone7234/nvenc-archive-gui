@@ -82,7 +82,6 @@ try:
         write_concat_file,
     )
     from ffmpeg_nvenc_gui.ffmpeg_downloader import (
-        FfmpegDownloadError,
         encoder_capabilities,
         ensure_ffmpeg_available,
         smoke_test_encoder,
@@ -156,7 +155,6 @@ except ModuleNotFoundError:
         write_concat_file,
     )
     from ffmpeg_downloader import (  # type: ignore
-        FfmpegDownloadError,
         encoder_capabilities,
         ensure_ffmpeg_available,
         smoke_test_encoder,
@@ -205,6 +203,9 @@ BRAND_COLORS = {
     BACKEND_QSV: ("Intel", "#0071c5", "#ffffff"),
     BACKEND_AMF: ("AMD", "#ed1c24", "#ffffff"),
 }
+WORKSPACE_STACK_WIDTH = 1040
+RUN_SUMMARY_STACK_WIDTH = 720
+RUN_CONTROLS_STACK_WIDTH = 520
 
 
 def select_compatible_resource_ids(allowed_ids: List[str], selected_ids: List[str]) -> List[str]:
@@ -288,12 +289,910 @@ class RuntimeJob:
     completed_segment_indexes: set[int] = field(default_factory=set)
 
 
+class OutputEditorSession:
+    def __init__(self, app: "EncoderApp", profile: EncodeProfile, variant: Optional[OutputVariant]) -> None:
+        self.app = app
+        self.profile_id = profile.id
+        self.variant_id = variant.id if variant is not None else None
+        self.session_id = new_id("output_editor")
+        self.dialog: Optional[tk.Toplevel] = None
+        self.advanced_window: Optional[tk.Toplevel] = None
+        self.resource_window: Optional[tk.Toplevel] = None
+        self.resource_vars: Dict[str, tk.BooleanVar] = {}
+
+        self.name_var = tk.StringVar(master=app.root)
+        self.folder_var = tk.StringVar(master=app.root)
+        self.resolution_var = tk.StringVar(master=app.root)
+        self.custom_height_var = tk.StringVar(master=app.root)
+        self.container_var = tk.StringVar(master=app.root)
+        self.enabled_var = tk.BooleanVar(master=app.root)
+        self.filename_template_var = tk.StringVar(master=app.root)
+        self.input_dir_var = tk.StringVar(master=app.root)
+        self.output_dir_var = tk.StringVar(master=app.root)
+        self.segment_minutes_var = tk.StringVar(master=app.root)
+        self.backend_var = tk.StringVar(master=app.root)
+        self.encoder_var = tk.StringVar(master=app.root)
+        self.split_encode_mode_var = tk.StringVar(master=app.root)
+        self.codec_var = tk.StringVar(master=app.root)
+        self.cpu_codec_var = tk.StringVar(master=app.root)
+        self.preset_var = tk.StringVar(master=app.root)
+        self.cpu_preset_var = tk.StringVar(master=app.root)
+        self.cpu_tune_var = tk.StringVar(master=app.root)
+        self.tune_var = tk.StringVar(master=app.root)
+        self.rate_mode_var = tk.StringVar(master=app.root)
+        self.cq_var = tk.StringVar(master=app.root)
+        self.bitrate_var = tk.StringVar(master=app.root)
+        self.maxrate_var = tk.StringVar(master=app.root)
+        self.bufsize_var = tk.StringVar(master=app.root)
+        self.pix_fmt_var = tk.StringVar(master=app.root)
+        self.scale_flags_var = tk.StringVar(master=app.root)
+        self.audio_codec_var = tk.StringVar(master=app.root)
+        self.audio_bitrate_var = tk.StringVar(master=app.root)
+        self.audio_container_var = tk.StringVar(master=app.root)
+        self.extra_input_args_var = tk.StringVar(master=app.root)
+        self.extra_video_args_var = tk.StringVar(master=app.root)
+        self.extra_audio_args_var = tk.StringVar(master=app.root)
+        self.extra_output_args_var = tk.StringVar(master=app.root)
+        self.extra_concat_args_var = tk.StringVar(master=app.root)
+        self.extra_mux_args_var = tk.StringVar(master=app.root)
+
+        if variant is None:
+            self.load_defaults(profile)
+        else:
+            self.load_variant(profile, variant)
+        self.initial_snapshot = self.snapshot()
+
+    def profile(self) -> Optional[EncodeProfile]:
+        index = self.app.profile_index_by_id(self.profile_id)
+        return self.app.profiles[index] if index is not None else None
+
+    def load_defaults(self, profile: EncodeProfile) -> None:
+        default_backend = default_output_backend_for_resource_ids(profile.resource_ids)
+        default_encoder = DEFAULT_ENCODER_BY_BACKEND.get(default_backend, DEFAULT_ENCODER_BY_BACKEND[BACKEND_CPU])
+        self.name_var.set("")
+        self.folder_var.set("")
+        self.resolution_var.set("1080p")
+        self.custom_height_var.set("")
+        self.container_var.set("mp4")
+        self.enabled_var.set(True)
+        self.filename_template_var.set("{source}")
+        self.input_dir_var.set("")
+        self.output_dir_var.set("")
+        self.segment_minutes_var.set("")
+        self.backend_var.set(default_backend)
+        self.encoder_var.set(default_encoder)
+        self.split_encode_mode_var.set("auto")
+        self.codec_var.set(profile.codec)
+        self.cpu_codec_var.set(profile.cpu_codec)
+        self.preset_var.set(profile.preset)
+        self.cpu_preset_var.set(profile.cpu_preset)
+        self.cpu_tune_var.set(getattr(profile, "cpu_tune", "none"))
+        self.tune_var.set(profile.tune)
+        self.rate_mode_var.set(profile.rate_mode)
+        self.cq_var.set(str(profile.cq_value))
+        self.bitrate_var.set(profile.bitrate)
+        self.maxrate_var.set(profile.maxrate)
+        self.bufsize_var.set(profile.bufsize)
+        self.pix_fmt_var.set(profile.pix_fmt)
+        self.scale_flags_var.set(profile.scale_flags)
+        self.audio_codec_var.set("copy")
+        self.audio_bitrate_var.set("")
+        self.audio_container_var.set("mka")
+        self.extra_input_args_var.set("")
+        self.extra_video_args_var.set("")
+        self.extra_audio_args_var.set("")
+        self.extra_output_args_var.set("")
+        self.extra_concat_args_var.set("")
+        self.extra_mux_args_var.set("")
+        selected = [rid for rid in profile.resource_ids if resource_backend(rid) == default_backend]
+        self.set_resource_selection(profile, default_backend, selected)
+
+    def load_variant(self, profile: EncodeProfile, variant: OutputVariant) -> None:
+        self.name_var.set(variant.name)
+        self.folder_var.set(variant.folder_name)
+        if variant.height is None:
+            self.resolution_var.set("Original")
+            self.custom_height_var.set("")
+        elif variant.height in [2160, 1440, 1080, 720]:
+            self.resolution_var.set(f"{variant.height}p")
+            self.custom_height_var.set("")
+        else:
+            self.resolution_var.set("Custom")
+            self.custom_height_var.set(str(variant.height))
+        self.container_var.set(variant.container)
+        self.enabled_var.set(variant.enabled)
+        self.filename_template_var.set(variant.filename_template or "{source}")
+        self.input_dir_var.set(variant.input_dir)
+        self.output_dir_var.set(variant.output_dir)
+        self.segment_minutes_var.set("" if variant.segment_minutes is None else str(variant.segment_minutes))
+        backend = variant.backend or (BACKEND_NVENC if variant.use_gpu else BACKEND_CPU)
+        self.backend_var.set(backend)
+        self.encoder_var.set(variant.ffmpeg_encoder or variant.codec or variant.cpu_codec)
+        self.split_encode_mode_var.set(variant.split_encode_mode or "auto")
+        self.codec_var.set(variant.codec or profile.codec)
+        self.cpu_codec_var.set(variant.cpu_codec or profile.cpu_codec)
+        self.preset_var.set(variant.preset or profile.preset)
+        self.cpu_preset_var.set(variant.cpu_preset or profile.cpu_preset)
+        self.cpu_tune_var.set(variant.cpu_tune or getattr(profile, "cpu_tune", "none"))
+        self.tune_var.set(variant.tune or profile.tune)
+        self.rate_mode_var.set(variant.rate_mode or profile.rate_mode)
+        self.cq_var.set(str(variant.cq_value if variant.cq_value is not None else profile.cq_value))
+        self.bitrate_var.set(variant.bitrate or profile.bitrate)
+        self.maxrate_var.set(variant.maxrate or profile.maxrate)
+        self.bufsize_var.set(variant.bufsize or profile.bufsize)
+        self.pix_fmt_var.set(variant.pix_fmt or profile.pix_fmt)
+        self.scale_flags_var.set(variant.scale_flags or profile.scale_flags)
+        self.audio_codec_var.set(normalize_audio_codec(variant.audio_codec or "copy"))
+        self.audio_bitrate_var.set(variant.audio_bitrate)
+        self.audio_container_var.set(
+            normalize_audio_container_for_codec(self.audio_codec_var.get(), variant.audio_container)
+        )
+        self.extra_input_args_var.set(variant.extra_input_args)
+        self.extra_video_args_var.set(variant.extra_video_args)
+        self.extra_audio_args_var.set(variant.extra_audio_args)
+        self.extra_output_args_var.set(variant.extra_output_args)
+        self.extra_concat_args_var.set(variant.extra_concat_args)
+        self.extra_mux_args_var.set(variant.extra_mux_args)
+        self.set_resource_selection(profile, backend, list(variant.resource_ids))
+
+    def set_resource_selection(self, profile: EncodeProfile, backend: str, selected: List[str]) -> None:
+        compatible = [
+            resource.id for resource in profile.hardware_resources if resource_backend(resource.id) == backend
+        ]
+        selected_ids = select_compatible_resource_ids(compatible, selected)
+        self.resource_vars = {
+            resource.id: tk.BooleanVar(master=self.app.root, value=resource.id in selected_ids)
+            for resource in profile.hardware_resources
+        }
+
+    def selected_resource_ids(self) -> List[str]:
+        return [resource_id for resource_id, var in self.resource_vars.items() if var.get()]
+
+    def snapshot(self) -> tuple[object, ...]:
+        return (
+            self.name_var.get(),
+            self.folder_var.get(),
+            self.resolution_var.get(),
+            self.custom_height_var.get(),
+            self.container_var.get(),
+            self.enabled_var.get(),
+            self.filename_template_var.get(),
+            self.input_dir_var.get(),
+            self.output_dir_var.get(),
+            self.segment_minutes_var.get(),
+            self.backend_var.get(),
+            self.encoder_var.get(),
+            self.split_encode_mode_var.get(),
+            self.codec_var.get(),
+            self.cpu_codec_var.get(),
+            self.preset_var.get(),
+            self.cpu_preset_var.get(),
+            self.cpu_tune_var.get(),
+            self.tune_var.get(),
+            self.rate_mode_var.get(),
+            self.cq_var.get(),
+            self.bitrate_var.get(),
+            self.maxrate_var.get(),
+            self.bufsize_var.get(),
+            self.pix_fmt_var.get(),
+            self.scale_flags_var.get(),
+            self.audio_codec_var.get(),
+            self.audio_bitrate_var.get(),
+            self.audio_container_var.get(),
+            self.extra_input_args_var.get(),
+            self.extra_video_args_var.get(),
+            self.extra_audio_args_var.get(),
+            self.extra_output_args_var.get(),
+            self.extra_concat_args_var.get(),
+            self.extra_mux_args_var.get(),
+            tuple(sorted(self.selected_resource_ids())),
+        )
+
+    def has_unsaved_changes(self) -> bool:
+        return self.snapshot() != self.initial_snapshot
+
+    def show(self) -> None:
+        dialog = tk.Toplevel(self.app.root)
+        self.dialog = dialog
+        self.app.output_editor_sessions[self.session_id] = self
+        dialog.title("出力プロファイル")
+        dialog.transient(self.app.root)
+        dialog.configure(bg=self.app.colors["bg"])
+        dialog.geometry("860x560")
+        dialog.minsize(720, 500)
+        dialog.protocol("WM_DELETE_WINDOW", self.close)
+
+        body = ttk.Frame(dialog, padding=14, style="App.TFrame")
+        body.pack(fill=tk.BOTH, expand=True)
+        form = self.app._dialog_surface(body, "出力プロファイル")
+        form.pack(fill=tk.X)
+
+        def grid_path(label: str, variable: tk.StringVar, row: int, pair: int = 0) -> None:
+            label_column = pair * 2
+            ttk.Label(form, text=label, style="Surface.TLabel").grid(
+                row=row,
+                column=label_column,
+                sticky=tk.W,
+                pady=4,
+                padx=(0 if pair == 0 else 16, 8),
+            )
+            frame = ttk.Frame(form, style="Surface.TFrame")
+            frame.grid(row=row, column=label_column + 1, sticky="ew", pady=4)
+            frame.columnconfigure(0, weight=1)
+            ttk.Entry(frame, textvariable=variable).grid(row=0, column=0, sticky="ew")
+            ttk.Button(frame, text="参照", command=lambda: self.app.browse_dir(variable)).grid(
+                row=0,
+                column=1,
+                padx=(6, 0),
+            )
+
+        self.app._dialog_entry(form, "名前", self.name_var, 1, 0)
+        self.app._dialog_entry(form, "フォルダ名", self.folder_var, 1, 1)
+        grid_path("入力先(空欄=基本)", self.input_dir_var, 2, 0)
+        grid_path("出力先(空欄=基本)", self.output_dir_var, 2, 1)
+        self.app._dialog_entry(form, "ファイル名テンプレート", self.filename_template_var, 3, 0)
+        ttk.Checkbutton(form, text="このプロファイルを有効にする", variable=self.enabled_var).grid(
+            row=3,
+            column=2,
+            columnspan=2,
+            sticky=tk.W,
+            pady=4,
+            padx=(16, 0),
+        )
+
+        ttk.Label(form, text="エンコード先", style="Surface.TLabel").grid(
+            row=4,
+            column=0,
+            sticky=tk.W,
+            pady=4,
+            padx=(0, 8),
+        )
+        self.resource_frame = ttk.Frame(form, padding=(8, 5), style="Inset.TFrame")
+        self.resource_frame.grid(row=4, column=1, columnspan=2, sticky="ew", pady=4)
+        ttk.Button(form, text="変更", command=self.open_resource_dialog).grid(row=4, column=3, sticky=tk.E, pady=4)
+
+        self.resolution_combo = self.app._dialog_combo(
+            form,
+            "解像度",
+            self.resolution_var,
+            list(RESOLUTION_PRESETS.keys()),
+            5,
+            0,
+        )
+        self.resolution_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_resolution_controls())
+        self.custom_height_label = ttk.Label(form, text="カスタム高さ", style="Surface.TLabel")
+        self.custom_height_entry = ttk.Entry(form, textvariable=self.custom_height_var)
+        self.custom_height_label.grid(row=5, column=2, sticky=tk.W, pady=4, padx=(16, 8))
+        self.custom_height_entry.grid(row=5, column=3, sticky="ew", pady=4)
+
+        self.container_combo = self.app._dialog_search_combo(
+            form,
+            "コンテナ",
+            self.container_var,
+            CONTAINER_CHOICES,
+            6,
+            0,
+        )
+        self.encoder_combo = self.app._dialog_combo(
+            form,
+            "Encoder",
+            self.encoder_var,
+            self.app._encoders_for_backend(self.backend_var.get()),
+            6,
+            1,
+        )
+        self.encoder_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_encoder_controls())
+        self.rate_combo = self.app._dialog_combo(form, "Rate", self.rate_mode_var, RATE_MODES, 7, 0)
+        self.rate_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_encoder_controls())
+        self.cq_entry = self.app._dialog_entry(form, "CQ/CRF", self.cq_var, 7, 1)
+        self.bitrate_entry = self.app._dialog_entry(form, "Bitrate", self.bitrate_var, 8, 0)
+
+        bottom = ttk.Frame(body, style="App.TFrame")
+        bottom.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(bottom, text="詳細設定", command=self.open_advanced_dialog).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="保存", style="Accent.TButton", command=self.save_and_close).pack(
+            side=tk.RIGHT,
+            padx=(8, 0),
+        )
+        ttk.Button(bottom, text="閉じる", command=self.close).pack(side=tk.RIGHT)
+
+        self.render_resource_controls()
+        self.update_resolution_controls()
+        self.update_encoder_controls()
+        self.initial_snapshot = self.snapshot()
+
+    def render_resource_controls(self) -> None:
+        if not hasattr(self, "resource_frame"):
+            return
+        for child in self.resource_frame.winfo_children():
+            child.destroy()
+        profile = self.profile()
+        if profile is None:
+            ttk.Label(self.resource_frame, text="プロファイルが見つかりません", style="Inset.TLabel").pack(side=tk.LEFT)
+            return
+        resources = list(profile.hardware_resources)
+        if not resources:
+            ttk.Label(self.resource_frame, text="利用できるリソースがありません", style="Inset.TLabel").pack(
+                side=tk.LEFT
+            )
+            return
+        backend = self.backend_var.get() or BACKEND_CPU
+        selected = self.selected_resource_ids()
+        compatible = [resource.id for resource in resources if resource_backend(resource.id) == backend]
+        selected = select_compatible_resource_ids(compatible, selected)
+        for resource_id, var in self.resource_vars.items():
+            var.set(resource_id in selected)
+        if selected:
+            backend = resource_backend(selected[0])
+            self.backend_var.set(backend)
+            self.app._brand_badge(self.resource_frame, backend).pack(side=tk.LEFT, padx=(0, 8))
+        labels = self.app.selected_resource_labels(profile, selected)
+        ttk.Label(
+            self.resource_frame,
+            text=f"{self.app._backend_display_name(backend)} / {', '.join(labels)}",
+            style="Inset.TLabel",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def open_resource_dialog(self) -> None:
+        if self.app._widget_exists(self.resource_window):
+            self.resource_window.lift()
+            return
+        profile = self.profile()
+        if profile is None:
+            messagebox.showerror("入力エラー", "プロファイルが見つかりません。", parent=self.dialog)
+            return
+        resources = list(profile.hardware_resources)
+        if not resources:
+            messagebox.showerror("入力エラー", "利用できるリソースがありません。", parent=self.dialog)
+            return
+
+        dialog = tk.Toplevel(self.dialog or self.app.root)
+        self.resource_window = dialog
+        dialog.title("エンコード先")
+        dialog.transient(self.dialog or self.app.root)
+        dialog.configure(bg=self.app.colors["bg"])
+        dialog.resizable(False, False)
+
+        def on_close() -> None:
+            self.resource_window = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
+        body = ttk.Frame(dialog, padding=16, style="App.TFrame")
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="エンコード先", style="Section.TLabel").pack(anchor=tk.W, pady=(0, 10))
+        resource_vars = {
+            resource.id: tk.BooleanVar(
+                master=self.app.root,
+                value=self.resource_vars[resource.id].get() if resource.id in self.resource_vars else False,
+            )
+            for resource in resources
+        }
+
+        def on_change(changed_id: str) -> None:
+            if not resource_vars[changed_id].get():
+                return
+            backend = resource_backend(changed_id)
+            for resource_id, var in resource_vars.items():
+                if resource_id != changed_id and resource_backend(resource_id) != backend:
+                    var.set(False)
+
+        grouped: Dict[str, ttk.Frame] = {}
+        for resource in resources:
+            backend = resource_backend(resource.id)
+            if backend not in grouped:
+                group = ttk.Frame(body, padding=10, style="Surface.TFrame", relief=tk.RAISED, borderwidth=1)
+                group.pack(fill=tk.X, pady=(0, 10))
+                head = ttk.Frame(group, style="Surface.TFrame")
+                head.pack(fill=tk.X, pady=(0, 6))
+                self.app._brand_badge(head, backend).pack(side=tk.LEFT, padx=(0, 8))
+                ttk.Label(head, text=self.app._backend_display_name(backend), style="Surface.TLabel").pack(side=tk.LEFT)
+                grouped[backend] = group
+            row = ttk.Frame(grouped[backend], style="Surface.TFrame")
+            row.pack(fill=tk.X, pady=2)
+            ttk.Checkbutton(
+                row,
+                text=resource.label,
+                variable=resource_vars[resource.id],
+                command=lambda resource_id=resource.id: on_change(resource_id),
+            ).pack(side=tk.LEFT)
+            detail = f"{resource.concurrency_slots} slot(s)"
+            if resource.detected_encoder_engines:
+                detail = f"NVENC {resource.detected_encoder_engines} engine(s)"
+            elif resource.detection_error:
+                detail = "NVENCエンジン数未検出、slotsは手動調整"
+            ttk.Label(row, text=detail, style="Muted.TLabel").pack(side=tk.RIGHT)
+
+        buttons = ttk.Frame(body, style="App.TFrame")
+        buttons.pack(fill=tk.X, pady=(4, 0))
+
+        def apply_selection() -> None:
+            selected_ids = [resource_id for resource_id, var in resource_vars.items() if var.get()]
+            if not selected_ids:
+                messagebox.showerror("入力エラー", "リソースを1つ以上選択してください。", parent=dialog)
+                return
+            backend = resource_backend(selected_ids[0])
+            if any(resource_backend(resource_id) != backend for resource_id in selected_ids):
+                messagebox.showerror(
+                    "入力エラー", "1つの出力で異なるbackendのリソースは混在できません。", parent=dialog
+                )
+                return
+            self.resource_vars = {
+                resource.id: tk.BooleanVar(master=self.app.root, value=resource.id in selected_ids)
+                for resource in resources
+            }
+            self.backend_var.set(backend)
+            self.update_encoder_controls()
+            on_close()
+
+        ttk.Button(buttons, text="適用", style="Accent.TButton", command=apply_selection).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="閉じる", command=on_close).pack(side=tk.RIGHT, padx=(0, 8))
+
+    def open_advanced_dialog(self) -> None:
+        if self.app._widget_exists(self.advanced_window):
+            self.advanced_window.lift()
+            return
+        dialog = tk.Toplevel(self.dialog or self.app.root)
+        self.advanced_window = dialog
+        dialog.title("出力の詳細設定")
+        dialog.transient(self.dialog or self.app.root)
+        dialog.configure(bg=self.app.colors["bg"])
+        dialog.geometry("720x560")
+
+        def on_close() -> None:
+            self.advanced_window = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
+        body = ttk.Frame(dialog, padding=14, style="App.TFrame")
+        body.pack(fill=tk.BOTH, expand=True)
+        tabs = ttk.Notebook(body, style="Dialog.TNotebook")
+        tabs.pack(fill=tk.BOTH, expand=True)
+        video_tab = ttk.Frame(tabs, padding=10, style="App.TFrame")
+        audio_tab = ttk.Frame(tabs, padding=10, style="App.TFrame")
+        ffmpeg_tab = ttk.Frame(tabs, padding=10, style="App.TFrame")
+        tabs.add(video_tab, text="映像")
+        tabs.add(audio_tab, text="音声")
+        tabs.add(ffmpeg_tab, text="FFmpeg")
+
+        self.engine_panel_container = ttk.Frame(video_tab, style="App.TFrame")
+        self.engine_panel_container.pack(fill=tk.X)
+        self.nvenc_detail_frame = self.app._dialog_surface(self.engine_panel_container, "NVENC")
+        self.preset_combo = self.app._dialog_combo(
+            self.nvenc_detail_frame,
+            "NVENC Preset",
+            self.preset_var,
+            GPU_PRESETS,
+            1,
+            0,
+        )
+        self.tune_combo = self.app._dialog_combo(
+            self.nvenc_detail_frame,
+            "NVENC Tune",
+            self.tune_var,
+            GPU_TUNES,
+            1,
+            1,
+        )
+        self.split_combo = self.app._dialog_combo(
+            self.nvenc_detail_frame,
+            "SFE",
+            self.split_encode_mode_var,
+            ["auto"],
+            2,
+            0,
+            width=18,
+        )
+        self.cpu_detail_frame = self.app._dialog_surface(self.engine_panel_container, "CPU")
+        self.cpu_preset_combo = self.app._dialog_combo(
+            self.cpu_detail_frame,
+            "CPU Preset",
+            self.cpu_preset_var,
+            CPU_PRESETS,
+            1,
+            0,
+        )
+        self.cpu_tune_combo = self.app._dialog_combo(
+            self.cpu_detail_frame,
+            "CPU Tune",
+            self.cpu_tune_var,
+            CPU_TUNES_BY_CODEC.get(self.cpu_codec_var.get(), CPU_TUNES_BY_CODEC["libx264"]),
+            1,
+            1,
+        )
+        self.hardware_detail_frame = self.app._dialog_surface(self.engine_panel_container, "Hardware")
+        ttk.Label(
+            self.hardware_detail_frame,
+            text="QSV/AMF固有の調整はFFmpeg引数タブで指定できます。",
+            style="Surface.TLabel",
+        ).grid(row=1, column=0, columnspan=4, sticky=tk.W)
+
+        rate = self.app._dialog_surface(video_tab, "レート制御")
+        rate.pack(fill=tk.X, pady=(10, 0))
+        self.maxrate_entry = self.app._dialog_entry(rate, "Maxrate", self.maxrate_var, 1, 0)
+        self.bufsize_entry = self.app._dialog_entry(rate, "Bufsize", self.bufsize_var, 1, 1)
+
+        format_box = self.app._dialog_surface(video_tab, "フォーマット")
+        format_box.pack(fill=tk.X, pady=(10, 0))
+        self.app._dialog_entry(format_box, "分割間隔(分・空欄=基本)", self.segment_minutes_var, 1, 0)
+        self.app._dialog_entry(format_box, "Pix fmt", self.pix_fmt_var, 1, 1)
+        self.app._dialog_entry(format_box, "Scale flags", self.scale_flags_var, 2, 0)
+
+        audio = self.app._dialog_surface(audio_tab, "音声")
+        audio.pack(fill=tk.X)
+        self.audio_codec_combo = self.app._dialog_search_combo(
+            audio,
+            "Audio codec",
+            self.audio_codec_var,
+            AUDIO_CODEC_CHOICES,
+            1,
+            0,
+        )
+        self.audio_codec_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_audio_container_choices())
+        self.app._dialog_entry(audio, "Audio bitrate", self.audio_bitrate_var, 1, 1)
+        self.audio_container_combo = self.app._dialog_search_combo(
+            audio,
+            "Audio container",
+            self.audio_container_var,
+            audio_containers_for_codec(self.audio_codec_var.get()),
+            2,
+            0,
+        )
+        self.audio_container_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_audio_container_choices())
+
+        ffmpeg = self.app._dialog_surface(ffmpeg_tab, "追加引数")
+        ffmpeg.pack(fill=tk.X)
+        self.app._dialog_entry(ffmpeg, "FFmpeg input args", self.extra_input_args_var, 1, 0)
+        self.app._dialog_entry(ffmpeg, "FFmpeg video args", self.extra_video_args_var, 1, 1)
+        self.app._dialog_entry(ffmpeg, "FFmpeg audio args", self.extra_audio_args_var, 2, 0)
+        self.app._dialog_entry(ffmpeg, "FFmpeg output args", self.extra_output_args_var, 2, 1)
+        self.app._dialog_entry(ffmpeg, "FFmpeg concat args", self.extra_concat_args_var, 3, 0)
+        self.app._dialog_entry(ffmpeg, "FFmpeg mux args", self.extra_mux_args_var, 3, 1)
+
+        bottom = ttk.Frame(body, style="App.TFrame")
+        bottom.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(bottom, text="閉じる", style="Accent.TButton", command=on_close).pack(side=tk.RIGHT)
+        self.update_cpu_tune_choices()
+        self.update_audio_container_choices()
+        self.update_encoder_controls()
+
+    def _set_grid_pair_visible(self, widget: object, visible: bool) -> None:
+        self.app._set_grid_pair_visible(widget, visible)
+
+    def update_cpu_tune_choices(self) -> None:
+        combo = getattr(self, "cpu_tune_combo", None)
+        if not self.app._widget_exists(combo):
+            return
+        values = CPU_TUNES_BY_CODEC.get(self.cpu_codec_var.get(), CPU_TUNES_BY_CODEC["libx264"])
+        combo.configure(values=values)
+        if self.cpu_tune_var.get() not in values:
+            self.cpu_tune_var.set("none")
+
+    def update_audio_container_choices(self) -> None:
+        codec = normalize_audio_codec(self.audio_codec_var.get())
+        self.audio_codec_var.set(codec)
+        values = audio_containers_for_codec(codec)
+        combo = getattr(self, "audio_container_combo", None)
+        if self.app._widget_exists(combo):
+            if hasattr(combo, "set_values"):
+                combo.set_values(values)
+            else:
+                combo.configure(values=values)
+        self.audio_container_var.set(normalize_audio_container_for_codec(codec, self.audio_container_var.get()))
+
+    def update_rate_controls(self) -> None:
+        if not self.app._widget_exists(getattr(self, "cq_entry", None)):
+            return
+        mode = self.rate_mode_var.get().upper()
+        backend = self.backend_var.get() or BACKEND_CPU
+        controls = [
+            (getattr(self, "cq_entry", None), backend_allows_cq(backend) and mode in {"CQ", "VBR"}),
+            (getattr(self, "bitrate_entry", None), mode in {"VBR", "ABR", "CBR"}),
+            (getattr(self, "maxrate_entry", None), mode == "VBR"),
+            (getattr(self, "bufsize_entry", None), mode in {"VBR", "CBR"}),
+        ]
+        for widget, visible in controls:
+            self._set_grid_pair_visible(widget, visible)
+
+    def update_resolution_controls(self) -> None:
+        if not self.app._widget_exists(getattr(self, "custom_height_entry", None)):
+            return
+        if self.resolution_var.get() == "Custom":
+            self.custom_height_label.grid()
+            self.custom_height_entry.grid()
+            self.custom_height_entry.configure(state=tk.NORMAL)
+        else:
+            self.custom_height_var.set("")
+            self.custom_height_label.grid_remove()
+            self.custom_height_entry.grid_remove()
+
+    def sync_advanced_panels(self, backend: str) -> None:
+        panels = [
+            getattr(self, "nvenc_detail_frame", None),
+            getattr(self, "cpu_detail_frame", None),
+            getattr(self, "hardware_detail_frame", None),
+        ]
+        for panel in panels:
+            if self.app._widget_exists(panel):
+                panel.pack_forget()
+        if backend == BACKEND_CPU:
+            panel = getattr(self, "cpu_detail_frame", None)
+        elif backend == BACKEND_NVENC:
+            panel = getattr(self, "nvenc_detail_frame", None)
+        else:
+            panel = getattr(self, "hardware_detail_frame", None)
+        if self.app._widget_exists(panel):
+            panel.pack(fill=tk.X)
+
+    def update_encoder_controls(self) -> None:
+        if not self.app._widget_exists(getattr(self, "encoder_combo", None)):
+            return
+        profile = self.profile()
+        if profile is None:
+            return
+        backend = self.backend_var.get() or BACKEND_CPU
+        self.render_resource_controls()
+        selected = self.selected_resource_ids()
+        backend = self.backend_var.get() or backend
+        encoders = self.app._encoders_for_backend(backend, selected, verify_nvenc=False)
+        self.encoder_combo.configure(values=encoders)
+        if self.encoder_var.get() not in encoders:
+            self.encoder_var.set(encoders[0] if encoders else "")
+
+        encoder = self.encoder_var.get()
+        if backend == BACKEND_NVENC:
+            self.codec_var.set(encoder)
+        elif backend == BACKEND_CPU:
+            self.cpu_codec_var.set(encoder)
+        self.update_cpu_tune_choices()
+        rate_modes = rate_modes_for_backend(backend)
+        if self.app._widget_exists(getattr(self, "rate_combo", None)):
+            self.rate_combo.configure(values=rate_modes)
+        if self.rate_mode_var.get().upper() not in rate_modes:
+            self.rate_mode_var.set(rate_modes[0])
+        self.update_rate_controls()
+        self.sync_advanced_panels(backend)
+
+        nvenc_state = tk.NORMAL if backend == BACKEND_NVENC else tk.DISABLED
+        cpu_state = tk.NORMAL if backend == BACKEND_CPU else tk.DISABLED
+        for widget in (getattr(self, "preset_combo", None), getattr(self, "tune_combo", None)):
+            if self.app._widget_exists(widget):
+                widget.configure(state=nvenc_state)
+        for widget in (getattr(self, "cpu_preset_combo", None), getattr(self, "cpu_tune_combo", None)):
+            if self.app._widget_exists(widget):
+                widget.configure(state=cpu_state)
+
+        split_modes = self.app.split_encode_modes_for_encoder(encoder)
+        split_combo = getattr(self, "split_combo", None)
+        if backend == BACKEND_NVENC and encoder in {"hevc_nvenc", "av1_nvenc"} and split_modes:
+            if self.app._widget_exists(split_combo):
+                split_combo.configure(values=split_modes, state=tk.NORMAL)
+                self._set_grid_pair_visible(split_combo, True)
+        else:
+            split_modes = ["auto"]
+            self.split_encode_mode_var.set("auto")
+            if self.app._widget_exists(split_combo):
+                split_combo.configure(values=["auto"], state=tk.NORMAL)
+                self._set_grid_pair_visible(split_combo, False)
+        if self.split_encode_mode_var.get() not in split_modes:
+            self.split_encode_mode_var.set(split_modes[0])
+
+    def build_variant(self) -> Optional[OutputVariant]:
+        profile = self.profile()
+        if profile is None:
+            messagebox.showerror("入力エラー", "プロファイルが見つかりません。", parent=self.dialog)
+            return None
+        name = self.name_var.get().strip()
+        folder_name = safe_folder_name(self.folder_var.get().strip() or name)
+        container = normalize_container_extension(self.container_var.get(), default="")
+        if not name:
+            messagebox.showerror("入力エラー", "出力名を入力してください。", parent=self.dialog)
+            return None
+        if not container:
+            messagebox.showerror("入力エラー", "コンテナは英数字で入力してください。例: mp4, mkv", parent=self.dialog)
+            return None
+
+        preset = self.resolution_var.get()
+        if preset == "Custom":
+            try:
+                height = int(self.custom_height_var.get())
+            except ValueError:
+                messagebox.showerror("入力エラー", "カスタム解像度の高さを数値で入力してください。", parent=self.dialog)
+                return None
+            if height < 1:
+                messagebox.showerror("入力エラー", "カスタム解像度は1以上にしてください。", parent=self.dialog)
+                return None
+        else:
+            height = RESOLUTION_PRESETS.get(preset)
+
+        raw_segment_minutes = self.segment_minutes_var.get().strip()
+        segment_minutes: Optional[int] = None
+        if raw_segment_minutes:
+            try:
+                segment_minutes = int(raw_segment_minutes)
+            except ValueError:
+                messagebox.showerror("入力エラー", "分割間隔は数値で入力してください。", parent=self.dialog)
+                return None
+            if segment_minutes < 1:
+                messagebox.showerror("入力エラー", "分割間隔は1分以上にしてください。", parent=self.dialog)
+                return None
+
+        backend = self.backend_var.get() or BACKEND_CPU
+        rate_mode = self.rate_mode_var.get().upper()
+        if not backend_accepts_rate_mode(backend, rate_mode):
+            messagebox.showerror(
+                "入力エラー",
+                "CQ は CPU/NVENC のみで使用できます。QSV/AMF では VBR/ABR/CBR を選択してください。",
+                parent=self.dialog,
+            )
+            return None
+        cq_value = (
+            self.app._cq_value_for_rate_mode(rate_mode, self.cq_var.get(), profile.cq_value)
+            if backend_allows_cq(backend)
+            else profile.cq_value
+        )
+        if cq_value is None:
+            messagebox.showerror("入力エラー", "CQ/CRF は数値で入力してください。", parent=self.dialog)
+            return None
+        encoder = self.encoder_var.get().strip()
+        resource_ids = self.selected_resource_ids()
+        if not encoder:
+            messagebox.showerror("入力エラー", "Encoder を選択してください。", parent=self.dialog)
+            return None
+        if not resource_ids:
+            messagebox.showerror(
+                "入力エラー", "このエンコード設定で使うリソースを1つ以上選択してください。", parent=self.dialog
+            )
+            return None
+        if any(resource_backend(resource_id) != backend for resource_id in resource_ids):
+            messagebox.showerror(
+                "入力エラー", "1つのエンコード設定内で異なるbackendのリソースは混在できません。", parent=self.dialog
+            )
+            return None
+
+        use_gpu = backend != BACKEND_CPU
+        gpu_index = resource_index(resource_ids[0]) if use_gpu else 0
+        gpu_name = ""
+        if use_gpu:
+            for resource in profile.hardware_resources:
+                if resource.id == resource_ids[0]:
+                    gpu_name = resource.label
+                    break
+        audio_codec = normalize_audio_codec(self.audio_codec_var.get())
+        audio_container = normalize_audio_container_for_codec(audio_codec, self.audio_container_var.get())
+        variant = OutputVariant(
+            id=self.variant_id or new_id("variant"),
+            name=name,
+            folder_name=folder_name,
+            height=height,
+            container=container,
+            enabled=self.enabled_var.get(),
+            filename_template=self.filename_template_var.get().strip() or "{source}",
+            input_dir=self.input_dir_var.get().strip(),
+            output_dir=self.output_dir_var.get().strip(),
+            segment_minutes=segment_minutes,
+            use_gpu=use_gpu,
+            gpu_index=gpu_index,
+            gpu_name=gpu_name,
+            codec=encoder if backend == BACKEND_NVENC else self.codec_var.get(),
+            cpu_codec=encoder if backend == BACKEND_CPU else self.cpu_codec_var.get(),
+            backend=backend,
+            ffmpeg_encoder=encoder,
+            resource_ids=resource_ids,
+            split_encode_mode=self.split_encode_mode_var.get(),
+            preset=self.preset_var.get(),
+            cpu_preset=self.cpu_preset_var.get(),
+            cpu_tune=self.cpu_tune_var.get(),
+            tune=self.tune_var.get(),
+            rate_mode=rate_mode,
+            cq_value=cq_value,
+            bitrate=self.bitrate_var.get().strip(),
+            maxrate=self.maxrate_var.get().strip(),
+            bufsize=self.bufsize_var.get().strip(),
+            pix_fmt=self.pix_fmt_var.get().strip(),
+            scale_flags=self.scale_flags_var.get().strip(),
+            audio_codec=audio_codec,
+            audio_bitrate=self.audio_bitrate_var.get().strip(),
+            audio_container=audio_container,
+            extra_input_args=self.extra_input_args_var.get().strip(),
+            extra_video_args=self.extra_video_args_var.get().strip(),
+            extra_audio_args=self.extra_audio_args_var.get().strip(),
+            extra_output_args=self.extra_output_args_var.get().strip(),
+            extra_concat_args=self.extra_concat_args_var.get().strip(),
+            extra_mux_args=self.extra_mux_args_var.get().strip(),
+        )
+        missing = missing_rate_fields(profile, variant)
+        if missing:
+            messagebox.showerror(
+                "入力エラー", f"{variant.name}: {', '.join(missing)} を入力してください。", parent=self.dialog
+            )
+            return None
+        return variant
+
+    def target_outputs(self) -> List[OutputVariant]:
+        profile = self.profile()
+        if profile is None:
+            return []
+        source = self.app.editing_outputs if self.app.active_profile_id == self.profile_id else profile.outputs
+        return [OutputVariant.from_dict(asdict(item)) for item in source]
+
+    def save_and_close(self) -> bool:
+        variant = self.build_variant()
+        if variant is None:
+            return False
+        profile = self.profile()
+        if profile is None:
+            messagebox.showerror("入力エラー", "プロファイルが見つかりません。", parent=self.dialog)
+            return False
+
+        next_outputs: List[OutputVariant] = []
+        replaced = False
+        for existing in self.target_outputs():
+            if existing.id == variant.id:
+                next_outputs.append(variant)
+                replaced = True
+            else:
+                next_outputs.append(existing)
+        if not replaced:
+            next_outputs.append(variant)
+        duplicates = duplicate_output_targets_for_outputs(next_outputs)
+        if duplicates:
+            messagebox.showerror(
+                "入力エラー", f"同じ出力先が重複しています: {', '.join(duplicates)}", parent=self.dialog
+            )
+            return False
+
+        profile.outputs = [OutputVariant.from_dict(asdict(item)) for item in next_outputs]
+        try:
+            save_profiles(self.app.paths, self.app.profiles)
+        except OSError as exc:
+            messagebox.showerror("保存エラー", str(exc), parent=self.dialog)
+            return False
+
+        if self.app.active_profile_id == self.profile_id:
+            self.app.editing_outputs = [OutputVariant.from_dict(asdict(item)) for item in profile.outputs]
+            self.app.selected_output_id = variant.id
+            self.app.refresh_outputs_tree()
+            self.app.outputs_tree.selection_set(variant.id)
+            self.app.on_output_select()
+            self.app.scan_files()
+        self.app.log(f"出力プロファイルを保存: {variant.name}")
+        self.variant_id = variant.id
+        self.initial_snapshot = self.snapshot()
+        self.destroy()
+        return True
+
+    def close(self) -> None:
+        if self.has_unsaved_changes():
+            result = messagebox.askyesnocancel(
+                "未保存の変更",
+                "保存していない変更があります。保存して閉じますか？",
+                parent=self.dialog,
+            )
+            if result is None:
+                return
+            if result:
+                self.save_and_close()
+                return
+        self.destroy()
+
+    def destroy(self) -> None:
+        if self.app._widget_exists(self.advanced_window):
+            self.advanced_window.destroy()
+        if self.app._widget_exists(self.resource_window):
+            self.resource_window.destroy()
+        if self.app._widget_exists(self.dialog):
+            self.dialog.destroy()
+        self.app.output_editor_sessions.pop(self.session_id, None)
+
+
 class EncoderApp:
     def __init__(self, root: tk.Tk):
         self.root = root
+        self.ui_thread = threading.current_thread()
         self.root.title("NVEnc Archive Studio")
         self.root.geometry("1180x720")
-        self.root.minsize(980, 620)
+        self.root.minsize(760, 560)
 
         self.paths: AppPaths = build_paths()
         ensure_dirs(self.paths)
@@ -304,6 +1203,7 @@ class EncoderApp:
         self.files: List[FileStatus] = []
         self.editing_outputs: List[OutputVariant] = []
         self.selected_output_id: Optional[str] = None
+        self.output_editor_sessions: Dict[str, object] = {}
 
         self.job_counter = 0
         self.pending_jobs: queue.Queue[RuntimeJob] = queue.Queue()
@@ -319,6 +1219,7 @@ class EncoderApp:
         self.log_queue: queue.Queue[str] = queue.Queue()
 
         self.running = False
+        self.preparing = False
         self.paused = False
         self.stop_requested = False
         self.scheduler_thread: Optional[threading.Thread] = None
@@ -483,13 +1384,18 @@ class EncoderApp:
 
         workspace = ttk.Frame(main, style="App.TFrame")
         workspace.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
+        self.workspace = workspace
+        self.workspace_layout = "wide"
         workspace.columnconfigure(0, weight=2, minsize=440)
         workspace.columnconfigure(1, weight=3, minsize=520)
         workspace.rowconfigure(0, weight=1)
+        workspace.bind("<Configure>", self._on_workspace_configure, add="+")
 
         profile_shell = ttk.Frame(workspace, style="App.TFrame")
+        self.profile_shell = profile_shell
         profile_shell.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         run_shell = ttk.Frame(workspace, style="App.TFrame")
+        self.run_shell = run_shell
         run_shell.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
         self.profile_tab_body = self._scrollable_tab(profile_shell)
@@ -497,6 +1403,34 @@ class EncoderApp:
 
         self._build_profile_tab()
         self._build_run_tab()
+
+    def _on_workspace_configure(self, event: tk.Event) -> None:
+        self._apply_workspace_layout(int(getattr(event, "width", 0) or 0))
+
+    def _apply_workspace_layout(self, width: int) -> None:
+        if not hasattr(self, "workspace"):
+            return
+        layout = "stacked" if width and width < WORKSPACE_STACK_WIDTH else "wide"
+        if layout == getattr(self, "workspace_layout", None):
+            return
+
+        self.workspace_layout = layout
+        self.profile_shell.grid_forget()
+        self.run_shell.grid_forget()
+        if layout == "stacked":
+            self.workspace.columnconfigure(0, weight=1, minsize=0)
+            self.workspace.columnconfigure(1, weight=0, minsize=0)
+            self.workspace.rowconfigure(0, weight=1)
+            self.workspace.rowconfigure(1, weight=1)
+            self.profile_shell.grid(row=0, column=0, sticky="nsew", padx=0, pady=(0, 8))
+            self.run_shell.grid(row=1, column=0, sticky="nsew", padx=0, pady=(8, 0))
+        else:
+            self.workspace.columnconfigure(0, weight=2, minsize=440)
+            self.workspace.columnconfigure(1, weight=3, minsize=520)
+            self.workspace.rowconfigure(0, weight=1)
+            self.workspace.rowconfigure(1, weight=0)
+            self.profile_shell.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=0)
+            self.run_shell.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=0)
 
     def _scrollable_tab(self, parent: ttk.Frame) -> ttk.Frame:
         canvas = tk.Canvas(parent, highlightthickness=0, background=self.colors["bg"])
@@ -658,14 +1592,20 @@ class EncoderApp:
         tab = self.run_tab_body
         summary = self._surface(tab)
         summary.pack(fill=tk.X)
+        self.run_summary_frame = summary
+        self.run_summary_layout = "wide"
+        summary.bind("<Configure>", self._on_run_summary_configure, add="+")
 
         left = ttk.Frame(summary, style="Surface.TFrame")
+        self.run_summary_left = left
         left.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Label(left, textvariable=self.status_var, style="Section.TLabel").pack(anchor=tk.W)
         ttk.Label(left, textvariable=self.input_summary_var, style="Muted.TLabel").pack(anchor=tk.W, pady=(6, 0))
         ttk.Label(left, textvariable=self.output_summary_var, style="Muted.TLabel").pack(anchor=tk.W)
 
         controls = ttk.Frame(summary, style="Surface.TFrame")
+        self.run_controls_frame = controls
+        self.run_controls_layout = ""
         controls.pack(side=tk.RIGHT, padx=(12, 0))
         ttk.Button(controls, text="開始", style="Accent.TButton", command=self.start_current_profile).pack(
             side=tk.LEFT, padx=(0, 8)
@@ -674,6 +1614,22 @@ class EncoderApp:
         self.pause_button.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(controls, text="停止", style="Danger.TButton", command=self.stop_all).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(controls, text="再開", command=self.resume_saved).pack(side=tk.LEFT)
+
+        control_children = controls.winfo_children()
+        self.start_button = control_children[0]
+        self.pause_button = control_children[1]
+        self.stop_button = control_children[2]
+        self.resume_button = control_children[3]
+        self.run_control_buttons = [
+            self.start_button,
+            self.pause_button,
+            self.stop_button,
+            self.resume_button,
+        ]
+        for button in self.run_control_buttons:
+            button.pack_forget()
+        self._layout_run_controls(False)
+        self._sync_runtime_controls()
 
         progress_box = self._surface(tab)
         progress_box.pack(fill=tk.X, pady=(12, 0))
@@ -733,6 +1689,65 @@ class EncoderApp:
             font=("Consolas", 9),
         )
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+    def _on_run_summary_configure(self, event: tk.Event) -> None:
+        width = int(getattr(event, "width", 0) or 0)
+        self._layout_run_summary(width < RUN_SUMMARY_STACK_WIDTH)
+        self._layout_run_controls(width < RUN_CONTROLS_STACK_WIDTH)
+        self._sync_runtime_controls()
+
+    def _layout_run_summary(self, stacked: bool) -> None:
+        if not hasattr(self, "run_summary_left") or not hasattr(self, "run_controls_frame"):
+            return
+        layout = "stacked" if stacked else "wide"
+        if layout == getattr(self, "run_summary_layout", None):
+            return
+        self.run_summary_layout = layout
+        self.run_summary_left.pack_forget()
+        self.run_controls_frame.pack_forget()
+        if stacked:
+            self.run_summary_left.pack(fill=tk.X)
+            self.run_controls_frame.pack(fill=tk.X, pady=(12, 0))
+        else:
+            self.run_summary_left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self.run_controls_frame.pack(side=tk.RIGHT, padx=(12, 0))
+
+    def _layout_run_controls(self, stacked: bool) -> None:
+        if not hasattr(self, "run_control_buttons"):
+            return
+        layout = "stacked" if stacked else "wide"
+        if layout == getattr(self, "run_controls_layout", None):
+            return
+        self.run_controls_layout = layout
+        for button in self.run_control_buttons:
+            button.grid_forget()
+        if stacked:
+            positions = [(0, 0), (0, 1), (1, 0), (1, 1)]
+            for index in range(2):
+                self.run_controls_frame.columnconfigure(index, weight=1, uniform="run-controls")
+            for button, (row, column) in zip(self.run_control_buttons, positions):
+                button.grid(row=row, column=column, sticky="ew", padx=4, pady=4)
+        else:
+            for index in range(4):
+                self.run_controls_frame.columnconfigure(index, weight=0, uniform="")
+            for column, button in enumerate(self.run_control_buttons):
+                button.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 8, 0), pady=0)
+
+    def _sync_runtime_controls(self) -> None:
+        if not hasattr(self, "start_button"):
+            return
+        busy = self.running or self.preparing
+        self.start_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        self.resume_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        self.stop_button.configure(state=tk.NORMAL if self.running else tk.DISABLED)
+        self.pause_button.configure(
+            text="再開" if self.paused else "一時停止",
+            state=tk.NORMAL if self.running else tk.DISABLED,
+        )
+        if self.running:
+            self.pause_button.grid()
+        else:
+            self.pause_button.grid_remove()
 
     def _build_profile_tab(self) -> None:
         tab = self.profile_tab_body
@@ -2157,125 +3172,15 @@ class EncoderApp:
         self.open_output_editor_dialog()
 
     def open_output_editor_dialog(self) -> None:
-        existing = getattr(self, "output_editor_window", None)
-        if self._widget_exists(existing):
-            existing.lift()
-            return
-
-        dialog = tk.Toplevel(self.root)
-        self.output_editor_window = dialog
-        dialog.title("出力プロファイル")
-        dialog.transient(self.root)
-        dialog.configure(bg=self.colors["bg"])
-        dialog.geometry("860x560")
-
-        def on_close() -> None:
-            self.output_editor_window = None
-            dialog.destroy()
-
-        dialog.protocol("WM_DELETE_WINDOW", on_close)
-
-        body = ttk.Frame(dialog, padding=14, style="App.TFrame")
-        body.pack(fill=tk.BOTH, expand=True)
-
-        form = self._dialog_surface(body, "出力プロファイル")
-        form.pack(fill=tk.X)
-
-        def grid_path(label: str, variable: tk.StringVar, row: int, pair: int = 0) -> ttk.Frame:
-            label_column = pair * 2
-            ttk.Label(form, text=label, style="Surface.TLabel").grid(
-                row=row,
-                column=label_column,
-                sticky=tk.W,
-                pady=4,
-                padx=(0 if pair == 0 else 16, 8),
-            )
-            frame = ttk.Frame(form, style="Surface.TFrame")
-            frame.grid(row=row, column=label_column + 1, sticky="ew", pady=4)
-            frame.columnconfigure(0, weight=1)
-            ttk.Entry(frame, textvariable=variable).grid(row=0, column=0, sticky="ew")
-            ttk.Button(frame, text="参照", command=lambda: self.browse_dir(variable)).grid(row=0, column=1, padx=(6, 0))
-            return frame
-
-        self._dialog_entry(form, "名前", self.output_name_var, 1, 0)
-        self._dialog_entry(form, "フォルダ名", self.output_folder_var, 1, 1)
-        grid_path("入力先(空欄=基本)", self.output_input_dir_var, 2, 0)
-        grid_path("出力先(空欄=基本)", self.output_output_dir_var, 2, 1)
-        self._dialog_entry(form, "ファイル名テンプレート", self.output_filename_template_var, 3, 0)
-        ttk.Checkbutton(form, text="このプロファイルを有効にする", variable=self.output_enabled_var).grid(
-            row=3,
-            column=2,
-            columnspan=2,
-            sticky=tk.W,
-            pady=4,
-            padx=(16, 0),
-        )
-
-        ttk.Label(form, text="エンコード先", style="Surface.TLabel").grid(
-            row=4, column=0, sticky=tk.W, pady=4, padx=(0, 8)
-        )
-        self.output_resource_frame = ttk.Frame(form, padding=(8, 5), style="Inset.TFrame")
-        self.output_resource_frame.grid(row=4, column=1, columnspan=2, sticky="ew", pady=4)
-        ttk.Button(form, text="変更", command=self.open_output_resource_dialog).grid(
-            row=4, column=3, sticky=tk.E, pady=4
-        )
-
-        self.output_resolution_combo = self._dialog_combo(
-            form,
-            "解像度",
-            self.output_resolution_var,
-            list(RESOLUTION_PRESETS.keys()),
-            5,
-            0,
-        )
-        self.output_resolution_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_resolution_controls())
-        self.custom_height_label = ttk.Label(form, text="カスタム高さ", style="Surface.TLabel")
-        self.custom_height_entry = ttk.Entry(form, textvariable=self.output_custom_height_var)
-        self.custom_height_label.grid(row=5, column=2, sticky=tk.W, pady=4, padx=(16, 8))
-        self.custom_height_entry.grid(row=5, column=3, sticky="ew", pady=4)
-
-        self.output_container_combo = self._dialog_search_combo(
-            form,
-            "コンテナ",
-            self.output_container_var,
-            CONTAINER_CHOICES,
-            6,
-            0,
-        )
-        self.output_encoder_combo = self._dialog_combo(
-            form,
-            "Encoder",
-            self.output_encoder_var,
-            self._encoders_for_backend(self.output_backend_var.get()),
-            6,
-            1,
-        )
-        self.output_encoder_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_encoder_controls())
-        self.output_rate_combo = self._dialog_combo(form, "Rate", self.output_rate_mode_var, RATE_MODES, 7, 0)
-        self.output_rate_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_output_encoder_controls())
-        self.output_cq_entry = self._dialog_entry(form, "CQ/CRF", self.output_cq_var, 7, 1)
-        self.output_bitrate_entry = self._dialog_entry(form, "Bitrate", self.output_bitrate_var, 8, 0)
-
-        bottom = ttk.Frame(body, style="App.TFrame")
-        bottom.pack(fill=tk.X, pady=(12, 0))
-        ttk.Button(bottom, text="詳細設定", command=self.open_output_advanced_dialog).pack(side=tk.LEFT)
-        ttk.Button(bottom, text="保存", style="Accent.TButton", command=self.add_or_update_output).pack(
-            side=tk.RIGHT, padx=(8, 0)
-        )
-        ttk.Button(bottom, text="閉じる", command=on_close).pack(side=tk.RIGHT)
-
-        selected_resources = self.selected_output_resource_ids()
-        for variant in self.editing_outputs:
-            if variant.id == self.selected_output_id:
-                selected_resources = list(variant.resource_ids)
-                break
-        self.update_resolution_controls()
-        self.render_output_resource_controls(
-            self.current_profile(),
-            self.output_backend_var.get() or BACKEND_CPU,
-            selected_resources,
-        )
-        self.update_output_encoder_controls()
+        profile = self.current_profile()
+        variant = None
+        if self.selected_output_id:
+            for item in self.editing_outputs:
+                if item.id == self.selected_output_id:
+                    variant = item
+                    break
+        session = OutputEditorSession(self, profile, variant)
+        session.show()
 
     def add_or_update_output(self) -> None:
         name = self.output_name_var.get().strip()
@@ -2432,26 +3337,41 @@ class EncoderApp:
 
     def log(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")
-        self.log_queue.put(f"[{stamp}] {text}")
+        line = f"[{stamp}] {text}"
+        if threading.current_thread() is getattr(self, "ui_thread", None) and self._widget_exists(
+            getattr(self, "log_text", None)
+        ):
+            self._append_log_line(line)
+            self.root.update_idletasks()
+            return
+        self.log_queue.put(line)
+
+    def _append_log_line(self, line: str) -> None:
+        if not self._widget_exists(getattr(self, "log_text", None)):
+            return
+        self.log_text.insert(tk.END, line + "\n")
+        self.log_text.see(tk.END)
 
     def _poll_log_queue(self) -> None:
         try:
             while True:
                 line = self.log_queue.get_nowait()
-                self.log_text.insert(tk.END, line + "\n")
-                self.log_text.see(tk.END)
+                self._append_log_line(line)
         except queue.Empty:
             pass
 
         with self.lock:
             active = len(self.active_jobs)
             pending = self.pending_jobs.qsize()
-            state = "一時停止" if self.paused else ("実行中" if self.running else "待機中")
+            state = (
+                "準備中"
+                if self.preparing
+                else ("一時停止" if self.paused else ("実行中" if self.running else "待機中"))
+            )
             jobs = list(self.all_jobs.values())
 
         self.status_var.set(f"{state} / 実行中 {active} / 待機 {pending}")
-        if hasattr(self, "pause_button"):
-            self.pause_button.configure(text="再開" if self.paused else "一時停止")
+        self._sync_runtime_controls()
         self._update_runtime_rows(jobs)
         self._update_overall_progress(jobs)
         self.root.after(250, self._poll_log_queue)
@@ -2557,29 +3477,67 @@ class EncoderApp:
             self.root.after(0, self.update_output_encoder_controls)
         return True
 
-    def ensure_ffmpeg_before_run(self) -> bool:
-        if self.paths.ffmpeg_path.exists() and self.paths.ffprobe_path.exists():
-            try:
-                ensure_ffmpeg_available(self.paths, auto_download=False, progress=self.log)
-                return self.refresh_encoder_capabilities()
-            except Exception as exc:
-                messagebox.showerror("FFmpeg error", str(exc))
-                return False
+    def prepare_ffmpeg_and_start(self, profile: EncodeProfile, specs: List[JobSpec]) -> None:
+        with self.lock:
+            busy = self.running or self.preparing
+            if not busy:
+                self.preparing = True
+        if busy:
+            messagebox.showwarning("実行中", "すでにジョブの準備または実行が進行中です。")
+            return
+        self._sync_runtime_controls()
 
-        messagebox.showinfo(
-            "FFmpeg を準備します",
-            "FFmpeg / FFprobe が見つからないため、自動でダウンロードして配置します。",
+        auto_download = not (self.paths.ffmpeg_path.exists() and self.paths.ffprobe_path.exists())
+        if auto_download:
+            messagebox.showinfo(
+                "FFmpeg を準備します",
+                "FFmpeg / FFprobe が見つからないため、自動でダウンロードして配置します。",
+            )
+
+        thread = threading.Thread(
+            target=self._prepare_ffmpeg_worker,
+            args=(profile, specs, auto_download),
+            daemon=True,
         )
+        thread.start()
+
+    def _prepare_ffmpeg_worker(self, profile: EncodeProfile, specs: List[JobSpec], auto_download: bool) -> None:
         try:
-            ensure_ffmpeg_available(self.paths, auto_download=True, progress=self.log)
-            self.log("FFmpeg / FFprobe is ready.")
-            return self.refresh_encoder_capabilities()
-        except FfmpegDownloadError as exc:
-            messagebox.showerror("FFmpeg install failed", str(exc))
-            return False
+            ensure_ffmpeg_available(self.paths, auto_download=auto_download, progress=self.log)
+            if auto_download:
+                self.log("FFmpeg / FFprobe is ready.")
+            capabilities = encoder_capabilities(self.paths.ffmpeg_path)
         except Exception as exc:
-            messagebox.showerror("FFmpeg install failed", str(exc))
-            return False
+            self.root.after(0, lambda error=exc: self._finish_ffmpeg_prepare_error(error))
+            return
+        self.root.after(0, lambda: self._finish_ffmpeg_prepare_success(profile, specs, capabilities))
+
+    def _finish_ffmpeg_prepare_error(self, error: Exception) -> None:
+        with self.lock:
+            self.preparing = False
+        self._sync_runtime_controls()
+        messagebox.showerror("FFmpeg error", str(error))
+
+    def _finish_ffmpeg_prepare_success(
+        self,
+        profile: EncodeProfile,
+        specs: List[JobSpec],
+        capabilities: Dict[str, Dict[str, object]],
+    ) -> None:
+        with self.lock:
+            self.preparing = False
+        self.encoder_capabilities = capabilities
+        self.encoder_smoke_cache = {}
+        count = len(self.encoder_capabilities)
+        if count:
+            self.log(f"FFmpeg encoder capabilities loaded: {count} encoder(s).")
+        else:
+            self.log("FFmpeg encoder capability scan returned no encoders.")
+        self.update_output_encoder_controls()
+        self._sync_runtime_controls()
+        if not self.validate_encoder_capabilities_before_run(profile, specs):
+            return
+        self.start_specs(profile, specs, save=True)
 
     def validate_profile_before_run(self, profile: EncodeProfile) -> bool:
         missing_dirs = missing_profile_dirs(profile)
@@ -2718,12 +3676,7 @@ class EncoderApp:
             self.scan_files()
             return
 
-        if not self.ensure_ffmpeg_before_run():
-            return
-        if not self.validate_encoder_capabilities_before_run(profile, specs):
-            return
-
-        self.start_specs(profile, specs, save=True)
+        self.prepare_ffmpeg_and_start(profile, specs)
 
     def resume_saved(self) -> None:
         data = load_state(self.paths)
@@ -2743,12 +3696,7 @@ class EncoderApp:
             self.scan_files()
             return
 
-        if not self.ensure_ffmpeg_before_run():
-            return
-        if not self.validate_encoder_capabilities_before_run(profile, specs):
-            return
-
-        self.start_specs(profile, specs, save=True)
+        self.prepare_ffmpeg_and_start(profile, specs)
 
     def assign_resources_to_specs(self, profile: EncodeProfile, specs: List[JobSpec]) -> List[JobSpec]:
         for spec in specs:

@@ -274,7 +274,7 @@ def smoke_test_encoder(
         "-f",
         "lavfi",
         "-i",
-        "color=size=64x64:rate=1:duration=1",
+        "color=size=320x240:rate=30:duration=1",
         "-frames:v",
         "1",
         "-pix_fmt",

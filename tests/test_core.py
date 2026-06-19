@@ -1198,6 +1198,149 @@ def test_encoder_app_has_no_unused_output_resource_change_handler():
     assert not hasattr(EncoderApp, "on_output_resource_changed")
 
 
+def test_encoder_app_has_no_unused_ensure_ffmpeg_before_run_handler():
+    assert not hasattr(EncoderApp, "ensure_ffmpeg_before_run")
+
+
+def test_prepare_ffmpeg_and_start_rejects_when_busy(monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    app.running = True
+    app.preparing = False
+    app._sync_runtime_controls = lambda: None
+    warnings = []
+    threads = []
+
+    monkeypatch.setattr(app_module.messagebox, "showwarning", lambda title, message: warnings.append((title, message)))
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            threads.append((args, kwargs))
+
+        def start(self):
+            raise AssertionError("worker thread should not start when busy")
+
+    monkeypatch.setattr(app_module.threading, "Thread", FakeThread)
+
+    app.prepare_ffmpeg_and_start(None, [])
+
+    assert app.preparing is False
+    assert threads == []
+    assert len(warnings) == 1
+
+
+def test_finish_ffmpeg_prepare_success_starts_when_valid(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    app.preparing = True
+    app.log = lambda _text: None
+    app.update_output_encoder_controls = lambda: None
+    app._sync_runtime_controls = lambda: None
+    app.validate_encoder_capabilities_before_run = lambda profile, specs: True
+    started = []
+    app.start_specs = lambda profile, specs, save: started.append((profile, specs, save))
+
+    capabilities = {"hevc_nvenc": {"available": True}}
+    profile = make_profile(tmp_path)
+    specs = ["spec"]
+
+    app._finish_ffmpeg_prepare_success(profile, specs, capabilities)
+
+    assert app.preparing is False
+    assert app.encoder_capabilities == capabilities
+    assert app.encoder_smoke_cache == {}
+    assert started == [(profile, specs, True)]
+
+
+def test_finish_ffmpeg_prepare_success_skips_start_when_invalid(tmp_path: Path):
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    app.preparing = True
+    app.log = lambda _text: None
+    app.update_output_encoder_controls = lambda: None
+    app._sync_runtime_controls = lambda: None
+    app.validate_encoder_capabilities_before_run = lambda profile, specs: False
+    started = []
+    app.start_specs = lambda *args, **kwargs: started.append(args)
+
+    app._finish_ffmpeg_prepare_success(make_profile(tmp_path), ["spec"], {"hevc_nvenc": {}})
+
+    assert app.preparing is False
+    assert started == []
+
+
+def test_finish_ffmpeg_prepare_error_resets_preparing(monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    app.preparing = True
+    app._sync_runtime_controls = lambda: None
+    errors = []
+
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    app._finish_ffmpeg_prepare_error(RuntimeError("boom"))
+
+    assert app.preparing is False
+    assert any("boom" in message for _title, message in errors)
+
+
+def test_runtime_controls_hide_pause_until_running():
+    class Button:
+        def __init__(self):
+            self.config = {}
+            self.visible = True
+
+        def configure(self, **kwargs):
+            self.config.update(kwargs)
+
+        def grid(self):
+            self.visible = True
+
+        def grid_remove(self):
+            self.visible = False
+
+    app = EncoderApp.__new__(EncoderApp)
+    app.running = False
+    app.preparing = False
+    app.paused = False
+    app.start_button = Button()
+    app.pause_button = Button()
+    app.stop_button = Button()
+    app.resume_button = Button()
+
+    app._sync_runtime_controls()
+
+    assert app.pause_button.visible is False
+    assert app.pause_button.config["state"] == app_module.tk.DISABLED
+    assert app.stop_button.config["state"] == app_module.tk.DISABLED
+    assert app.start_button.config["state"] == app_module.tk.NORMAL
+
+    app.running = True
+    app._sync_runtime_controls()
+
+    assert app.pause_button.visible is True
+    assert app.pause_button.config["state"] == app_module.tk.NORMAL
+    assert app.stop_button.config["state"] == app_module.tk.NORMAL
+    assert app.start_button.config["state"] == app_module.tk.DISABLED
+
+
+def test_output_editor_dialog_uses_independent_sessions():
+    source = inspect.getsource(EncoderApp.open_output_editor_dialog)
+    active_prefix = source.split("return", 1)[0]
+
+    assert "OutputEditorSession" in active_prefix
+    assert "session.show()" in active_prefix
+    assert "self._widget_exists(existing)" not in active_prefix
+
+
+def test_output_editor_session_warns_on_unsaved_changes_and_persists_profiles():
+    source = inspect.getsource(app_module.OutputEditorSession)
+
+    assert "messagebox.askyesnocancel" in source
+    assert "save_profiles(self.app.paths, self.app.profiles)" in source
+    assert "output_editor_sessions" in source
+
+
 def test_update_output_encoder_controls_has_no_unused_cpu_codec_combo():
     assert "output_cpu_codec_combo" not in inspect.getsource(EncoderApp.update_output_encoder_controls)
 
@@ -1869,6 +2012,29 @@ Encoder hevc_nvenc [NVIDIA NVENC hevc encoder]:
 
     assert split_encode_modes_from_help(help_text) == ["auto", "disabled", "forced", "2", "future-mode"]
     assert split_encode_modes_from_help("h264 mentions 2 but no option") == []
+
+
+def test_smoke_test_encoder_uses_nvenc_safe_frame_size(monkeypatch, tmp_path: Path):
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = ""
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return Result()
+
+    monkeypatch.setattr(downloader.subprocess, "run", fake_run)
+
+    ok, detail = downloader.smoke_test_encoder(tmp_path / "ffmpeg.exe", "hevc_nvenc", resource_id="nvidia:0")
+
+    assert ok is True
+    assert detail == ""
+    command = calls[0]
+    assert "color=size=320x240:rate=30:duration=1" in command
+    assert "color=size=64x64:rate=1:duration=1" not in command
+    assert command[command.index("-gpu") + 1] == "0"
 
 
 def test_missing_binaries_preserves_existing_ffmpeg(tmp_path: Path):

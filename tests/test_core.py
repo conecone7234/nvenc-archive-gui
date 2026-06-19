@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 import ffmpeg_nvenc_gui.app as app_module
+import ffmpeg_nvenc_gui.core as core_module
 import ffmpeg_nvenc_gui.ffmpeg_downloader as downloader
 from ffmpeg_nvenc_gui.app import (
     EncoderApp,
@@ -33,8 +34,10 @@ from ffmpeg_nvenc_gui.core import (
     build_job_specs,
     build_mux_command,
     build_paths,
+    clear_cpu_resource_cache,
     clear_state,
     cpu_resources_from_wmi_data,
+    detect_cpu_resources,
     duplicate_output_targets,
     ensure_profile_dirs,
     format_seconds,
@@ -687,6 +690,34 @@ def test_cpu_resources_from_wmi_data_include_model_and_socket():
     assert [resource.id for resource in resources] == ["cpu:0", "cpu:1"]
     assert "Intel Xeon A" in resources[0].label
     assert "Socket 1" in resources[1].label
+
+
+def test_detect_cpu_resources_is_cached_and_returns_copies(monkeypatch):
+    clear_cpu_resource_cache()
+    monkeypatch.setattr(core_module.os, "name", "nt")
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps({"DeviceID": "CPU0", "Name": "Intel Xeon A", "SocketDesignation": "Socket 0"})
+
+    def fake_run(*_args, **_kwargs):
+        calls.append(_args)
+        return Result()
+
+    monkeypatch.setattr(core_module.subprocess, "run", fake_run)
+    try:
+        first = detect_cpu_resources()
+        injected = HardwareResource(id="cpu:99", label="Injected", kind="cpu", backend=BACKEND_CPU)
+        first.append(injected)
+        second = detect_cpu_resources()
+    finally:
+        clear_cpu_resource_cache()
+
+    assert len(calls) == 1
+    assert injected not in second
+    assert [resource.id for resource in second] == ["cpu:0"]
+    assert first is not second
 
 
 def test_normalize_hardware_resources_keeps_explicit_manual_resource(tmp_path: Path):

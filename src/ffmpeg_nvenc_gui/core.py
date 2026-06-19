@@ -12,6 +12,7 @@ import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -684,8 +685,6 @@ def expand_path_template(value: object, src: Optional[Path]) -> str:
 
 def expand_folder_template(value: object, src: Optional[Path]) -> str:
     expanded = expand_path_template(value, src)
-    if has_source_template(value):
-        return safe_folder_name(expanded)
     return safe_folder_name(expanded)
 
 
@@ -804,9 +803,10 @@ def cpu_resources_from_wmi_data(data: object) -> List[HardwareResource]:
     return resources or [fallback_cpu_resource()]
 
 
-def detect_cpu_resources(timeout: int = 5) -> List[HardwareResource]:
+@lru_cache(maxsize=1)
+def _detect_cpu_resources_cached(timeout: int = 5) -> Tuple[HardwareResource, ...]:
     if os.name != "nt":
-        return [fallback_cpu_resource()]
+        return (fallback_cpu_resource(),)
     command = [
         "powershell.exe",
         "-NoProfile",
@@ -826,14 +826,22 @@ def detect_cpu_resources(timeout: int = 5) -> List[HardwareResource]:
             check=False,
         )
     except Exception:
-        return [fallback_cpu_resource()]
+        return (fallback_cpu_resource(),)
     if result.returncode != 0:
-        return [fallback_cpu_resource()]
+        return (fallback_cpu_resource(),)
     try:
         data = json.loads(result.stdout or "null")
     except json.JSONDecodeError:
-        return [fallback_cpu_resource()]
-    return cpu_resources_from_wmi_data(data)
+        return (fallback_cpu_resource(),)
+    return tuple(cpu_resources_from_wmi_data(data))
+
+
+def detect_cpu_resources(timeout: int = 5) -> List[HardwareResource]:
+    return list(_detect_cpu_resources_cached(timeout))
+
+
+def clear_cpu_resource_cache() -> None:
+    _detect_cpu_resources_cached.cache_clear()
 
 
 def hardware_resources_from_gpus(gpus: Optional[List[GpuInfo]]) -> List[HardwareResource]:

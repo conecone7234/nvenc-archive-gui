@@ -54,6 +54,7 @@ try:
         missing_profile_dirs,
         missing_rate_fields,
         new_id,
+        no_window_subprocess_kwargs,
         normalize_audio_codec,
         normalize_audio_container_for_codec,
         normalize_container_extension,
@@ -129,6 +130,7 @@ except ModuleNotFoundError:
         missing_profile_dirs,
         missing_rate_fields,
         new_id,
+        no_window_subprocess_kwargs,
         normalize_audio_codec,
         normalize_audio_container_for_codec,
         normalize_container_extension,
@@ -1418,6 +1420,13 @@ class EncoderApp:
         self.editing_outputs: List[OutputVariant] = []
         self.selected_output_id: Optional[str] = None
         self.output_editor_sessions: Dict[str, object] = {}
+        self.progress_order_by_profile: Dict[str, List[tuple[str, str]]] = {}
+        self.custom_progress_order_profiles: set[str] = set()
+        self.progress_row_keys: Dict[str, tuple[str, str]] = {}
+        self._output_drag_id: Optional[str] = None
+        self._output_drag_moved = False
+        self._progress_drag_id: Optional[str] = None
+        self._progress_drag_moved = False
 
         self.job_counter = 0
         self.pending_jobs: queue.Queue[RuntimeJob] = queue.Queue()
@@ -1898,6 +1907,11 @@ class EncoderApp:
         list_head = ttk.Frame(list_box, style="Surface.TFrame")
         list_head.pack(fill=tk.X)
         ttk.Label(list_head, text="ファイル別進捗", style="Section.TLabel").pack(side=tk.LEFT)
+        ttk.Label(
+            list_head,
+            text="ドラッグ＆ドロップで個別優先度を変更",
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT, padx=(12, 0))
         self._menu_button(
             list_head,
             "管理",
@@ -1923,6 +1937,9 @@ class EncoderApp:
         tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.progress_tree.yview)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.progress_tree.config(yscrollcommand=tree_scroll.set)
+        self.progress_tree.bind("<ButtonPress-1>", self.on_progress_drag_start, add="+")
+        self.progress_tree.bind("<B1-Motion>", self.on_progress_drag_motion, add="+")
+        self.progress_tree.bind("<ButtonRelease-1>", self.on_progress_drag_end, add="+")
 
         log_box = self._surface(tab)
         log_box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
@@ -2030,24 +2047,32 @@ class EncoderApp:
         self._path_row(general, "入力先", self.input_dir_var)
         self._path_row(general, "出力先", self.output_dir_var)
         self._path_row(general, "処理済みソース退避先", self.archive_dir_var)
+        ttk.Label(
+            general,
+            text="出力先・退避先: {source} = 入力ファイル名（拡張子なし）",
+            style="Muted.TLabel",
+            wraplength=390,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=(18, 0), pady=(2, 0))
 
         outputs = self._surface(tab)
         outputs.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
         output_head = ttk.Frame(outputs, style="Surface.TFrame")
         output_head.pack(fill=tk.X)
         ttk.Label(output_head, text="出力プロファイル", style="Section.TLabel").pack(side=tk.LEFT)
-        self._menu_button(
-            output_head,
-            "出力操作",
-            [
-                ("新規作成", self.open_new_output_dialog),
-                ("詳細編集", self.edit_selected_output),
-                ("有効化", lambda: self.set_selected_outputs_enabled(True)),
-                ("無効化", lambda: self.set_selected_outputs_enabled(False)),
-                ("複製", self.duplicate_selected_outputs),
-                ("削除", self.remove_output),
-            ],
-        ).pack(side=tk.RIGHT)
+        output_action_button = ttk.Menubutton(output_head, text="出力操作")
+        self.output_action_menu = tk.Menu(
+            output_action_button,
+            tearoff=False,
+            postcommand=lambda: self.populate_output_menu(self.output_action_menu),
+        )
+        output_action_button.configure(menu=self.output_action_menu)
+        output_action_button.pack(side=tk.RIGHT)
+        ttk.Label(
+            outputs,
+            text="ドラッグ＆ドロップで並べ替え（上の出力ほど優先）",
+            style="Muted.TLabel",
+        ).pack(anchor=tk.W, pady=(6, 0))
 
         output_body = ttk.Frame(outputs, style="Surface.TFrame")
         output_body.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -2082,19 +2107,19 @@ class EncoderApp:
         self.outputs_tree.bind("<<TreeviewSelect>>", self.on_output_select)
         self.outputs_tree.bind("<Double-1>", lambda _event: self.edit_selected_output())
         self.outputs_tree.bind("<Button-3>", self.on_outputs_tree_context)
+        self.outputs_tree.bind("<ButtonPress-1>", self.on_output_drag_start, add="+")
+        self.outputs_tree.bind("<B1-Motion>", self.on_output_drag_motion, add="+")
+        self.outputs_tree.bind("<ButtonRelease-1>", self.on_output_drag_end, add="+")
         self.outputs_tree.tag_configure(BACKEND_CPU, background="#f1efff")
         self.outputs_tree.tag_configure(BACKEND_NVENC, background="#eef8dc")
         self.outputs_tree.tag_configure(BACKEND_QSV, background="#e6f3ff")
         self.outputs_tree.tag_configure(BACKEND_AMF, background="#ffecec")
 
-        self.output_context_menu = tk.Menu(self.outputs_tree, tearoff=False)
-        self.output_context_menu.add_command(label="詳細編集", command=self.edit_selected_output)
-        self.output_context_menu.add_separator()
-        self.output_context_menu.add_command(label="有効化", command=lambda: self.set_selected_outputs_enabled(True))
-        self.output_context_menu.add_command(label="無効化", command=lambda: self.set_selected_outputs_enabled(False))
-        self.output_context_menu.add_command(label="複製", command=self.duplicate_selected_outputs)
-        self.output_context_menu.add_separator()
-        self.output_context_menu.add_command(label="削除", command=self.remove_output)
+        self.output_context_menu = tk.Menu(
+            self.outputs_tree,
+            tearoff=False,
+            postcommand=lambda: self.populate_output_menu(self.output_context_menu),
+        )
 
         self.output_name_var = tk.StringVar()
         self.output_folder_var = tk.StringVar()
@@ -3289,6 +3314,52 @@ class EncoderApp:
             return selected
         return [self.selected_output_id] if self.selected_output_id else []
 
+    def populate_output_menu(self, menu: tk.Menu) -> None:
+        if menu.index(tk.END) is not None:
+            menu.delete(0, tk.END)
+        selected_ids = self.selected_output_ids()
+        selected_id_set = set(selected_ids)
+        selected = [variant for variant in self.editing_outputs if variant.id in selected_id_set]
+        single_state = tk.NORMAL if len(selected) == 1 else tk.DISABLED
+        selected_state = tk.NORMAL if selected else tk.DISABLED
+
+        menu.add_command(label="新規作成", command=self.open_new_output_dialog)
+        menu.add_command(label="詳細編集", command=self.edit_selected_output, state=single_state)
+        if selected:
+            menu.add_separator()
+            if any(not variant.enabled for variant in selected):
+                menu.add_command(label="有効化", command=lambda: self.set_selected_outputs_enabled(True))
+            if any(variant.enabled for variant in selected):
+                menu.add_command(label="無効化", command=lambda: self.set_selected_outputs_enabled(False))
+        menu.add_separator()
+        menu.add_command(label="複製", command=self.duplicate_selected_outputs, state=selected_state)
+        menu.add_command(label="削除", command=self.remove_output, state=selected_state)
+
+    def on_output_drag_start(self, event: tk.Event) -> None:
+        row_id = self.outputs_tree.identify_row(event.y)
+        self._output_drag_id = str(row_id) if row_id else None
+        self._output_drag_moved = False
+
+    def on_output_drag_motion(self, event: tk.Event) -> Optional[str]:
+        source_id = self._output_drag_id
+        target_id = self.outputs_tree.identify_row(event.y)
+        if not source_id or not target_id or source_id == target_id:
+            return None
+        self.outputs_tree.move(source_id, "", self.outputs_tree.index(target_id))
+        self._output_drag_moved = True
+        return "break"
+
+    def on_output_drag_end(self, _event: tk.Event) -> None:
+        if self._output_drag_id and self._output_drag_moved:
+            by_id = {variant.id: variant for variant in self.editing_outputs}
+            ordered_ids = [str(item) for item in self.outputs_tree.get_children()]
+            self.editing_outputs = [by_id[item] for item in ordered_ids if item in by_id]
+            self.outputs_tree.selection_set(self._output_drag_id)
+            self.selected_output_id = self._output_drag_id
+            self.on_output_select()
+        self._output_drag_id = None
+        self._output_drag_moved = False
+
     def on_outputs_tree_context(self, event: tk.Event) -> str:
         row_id = self.outputs_tree.identify_row(event.y)
         if row_id:
@@ -3297,6 +3368,9 @@ class EncoderApp:
                 self.outputs_tree.selection_set(row_id)
             self.selected_output_id = row_id
             self.on_output_select()
+        else:
+            self.outputs_tree.selection_remove(*self.outputs_tree.selection())
+            self.selected_output_id = None
         try:
             self.output_context_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -3769,23 +3843,117 @@ class EncoderApp:
         else:
             self.log(f"{self.profile_display_label(profile)}: {len(self.files)} file(s) scanned.")
 
+    @staticmethod
+    def progress_order_key(src: Path | str, variant_id: str) -> tuple[str, str]:
+        return (str(Path(src).resolve()), str(variant_id))
+
+    def reconcile_progress_order(self, profile: EncodeProfile) -> List[tuple[str, str]]:
+        available = [
+            self.progress_order_key(item.path, variant.id)
+            for item in self.files
+            for variant in profile.outputs
+            if variant.enabled and variant.id in item.outputs
+        ]
+        available_set = set(available)
+        custom_profiles = getattr(self, "custom_progress_order_profiles", set())
+        current = self.progress_order_by_profile.get(profile.id, []) if profile.id in custom_profiles else []
+        ordered = [key for key in current if key in available_set]
+        ordered_set = set(ordered)
+        ordered.extend(key for key in available if key not in ordered_set)
+        self.progress_order_by_profile[profile.id] = ordered
+        return ordered
+
+    def order_job_specs(self, profile: EncodeProfile, specs: List[JobSpec]) -> List[JobSpec]:
+        ordered_keys = self.reconcile_progress_order(profile)
+        positions = {key: index for index, key in enumerate(ordered_keys)}
+        return sorted(
+            specs,
+            key=lambda spec: positions.get(
+                self.progress_order_key(spec.src, spec.variant_id),
+                len(positions),
+            ),
+        )
+
     def render_scan_rows(self, profile: EncodeProfile) -> None:
         self.progress_tree.delete(*self.progress_tree.get_children())
-        for item in self.files:
-            for variant in profile.outputs:
-                if not variant.enabled or variant.id not in item.outputs:
-                    continue
-                done = item.outputs.get(variant.id, False)
-                self.progress_tree.insert(
-                    "",
-                    tk.END,
-                    values=(
-                        item.path.name,
-                        variant.name,
-                        "完了" if done else "待機",
-                        "100%" if done else "0%",
-                    ),
-                )
+        self.progress_row_keys = {}
+        items = {str(item.path.resolve()): item for item in self.files}
+        variants = {variant.id: variant for variant in profile.outputs}
+        for index, key in enumerate(self.reconcile_progress_order(profile)):
+            source, variant_id = key
+            item = items.get(source)
+            variant = variants.get(variant_id)
+            if item is None or variant is None:
+                continue
+            done = item.outputs.get(variant.id, False)
+            row_id = f"scan_{index}"
+            self.progress_row_keys[row_id] = key
+            self.progress_tree.insert(
+                "",
+                tk.END,
+                iid=row_id,
+                values=(
+                    item.path.name,
+                    variant.name,
+                    "完了" if done else "待機",
+                    "100%" if done else "0%",
+                ),
+            )
+
+    def on_progress_drag_start(self, event: tk.Event) -> None:
+        row_id = self.progress_tree.identify_row(event.y)
+        if not row_id or getattr(self, "preparing", False):
+            self._progress_drag_id = None
+            return
+        if getattr(self, "running", False):
+            job_id = next((job_id for job_id, item in self.job_rows.items() if item == row_id), None)
+            job = self.all_jobs.get(job_id) if job_id is not None else None
+            if job is None or job.status != "待機":
+                self._progress_drag_id = None
+                return
+        self._progress_drag_id = str(row_id)
+        self._progress_drag_moved = False
+
+    def on_progress_drag_motion(self, event: tk.Event) -> Optional[str]:
+        source_id = self._progress_drag_id
+        target_id = self.progress_tree.identify_row(event.y)
+        if not source_id or not target_id or source_id == target_id:
+            return None
+        self.progress_tree.move(source_id, "", self.progress_tree.index(target_id))
+        self._progress_drag_moved = True
+        return "break"
+
+    def on_progress_drag_end(self, _event: tk.Event) -> None:
+        if self._progress_drag_id and self._progress_drag_moved:
+            row_ids = [str(item) for item in self.progress_tree.get_children()]
+            if getattr(self, "running", False):
+                self.reorder_pending_jobs(row_ids)
+            else:
+                profile = self.current_profile()
+                keys = [self.progress_row_keys[item] for item in row_ids if item in self.progress_row_keys]
+                self.progress_order_by_profile[profile.id] = keys
+                self.custom_progress_order_profiles.add(profile.id)
+        self._progress_drag_id = None
+        self._progress_drag_moved = False
+
+    def reorder_pending_jobs(self, row_ids: List[str]) -> None:
+        positions = {row_id: index for index, row_id in enumerate(row_ids)}
+        with self.lock:
+            pending: List[RuntimeJob] = []
+            while not self.pending_jobs.empty():
+                try:
+                    pending.append(self.pending_jobs.get_nowait())
+                except queue.Empty:
+                    break
+            pending.sort(key=lambda job: positions.get(self.job_rows.get(job.job_id, ""), len(positions)))
+            for job in pending:
+                self.pending_jobs.put(job)
+            ordered_jobs = sorted(
+                self.all_jobs.values(),
+                key=lambda job: positions.get(self.job_rows.get(job.job_id, ""), len(positions)),
+            )
+        if self.has_saved_state() and ordered_jobs:
+            save_state(self.paths, ordered_jobs[0].profile, [job.spec for job in ordered_jobs])
 
     def open_log_dir(self) -> None:
         self.paths.log_dir.mkdir(parents=True, exist_ok=True)
@@ -4019,7 +4187,7 @@ class EncoderApp:
             self.scan_files()
             return
 
-        specs = build_job_specs(profile, [item.path for item in self.files])
+        specs = self.order_job_specs(profile, build_job_specs(profile, [item.path for item in self.files]))
         if not specs:
             messagebox.showinfo("対象なし", "このプロファイルの出力はすべて完了しています。")
             self.scan_files()
@@ -4104,13 +4272,16 @@ class EncoderApp:
             save_state(self.paths, profile, specs)
 
         self.progress_tree.delete(*self.progress_tree.get_children())
+        self.progress_row_keys = {}
         for spec in specs:
             job = self.create_runtime_job(spec, profile)
             self.pending_jobs.put(job)
             self.all_jobs[job.job_id] = job
+            row_id = f"job_{job.job_id}"
             self.job_rows[job.job_id] = self.progress_tree.insert(
                 "",
                 tk.END,
+                iid=row_id,
                 values=(Path(spec.src).name, job.variant.name, "待機", "0%"),
             )
 
@@ -4544,7 +4715,6 @@ class EncoderApp:
         segment_index: Optional[int] = None,
         log_lock: Optional[threading.Lock] = None,
     ) -> int:
-        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -4553,7 +4723,7 @@ class EncoderApp:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            creationflags=creationflags,
+            **no_window_subprocess_kwargs(),
         )
         process_slot = segment_index if segment_index is not None else -1
         with self.lock:

@@ -16,6 +16,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from .subprocess_utils import no_window_subprocess_kwargs
+
 VIDEO_EXTS = {".mkv", ".m2ts", ".mp4", ".mov", ".ts"}
 RESOLUTION_PRESETS: Dict[str, Optional[int]] = {
     "Original": None,
@@ -840,6 +842,7 @@ def _detect_cpu_resources_cached(timeout: int = 5) -> Tuple[HardwareResource, ..
             errors="replace",
             timeout=timeout,
             check=False,
+            **no_window_subprocess_kwargs(),
         )
     except Exception:
         return (fallback_cpu_resource(),)
@@ -939,6 +942,7 @@ def detect_nvidia_gpus(timeout: int = 5) -> List[GpuInfo]:
             errors="replace",
             timeout=timeout,
             check=False,
+            **no_window_subprocess_kwargs(),
         )
     except Exception:
         return []
@@ -1015,6 +1019,7 @@ def detect_wmi_gpus(timeout: int = 5, existing: Optional[Iterable[GpuInfo]] = No
             errors="replace",
             timeout=timeout,
             check=False,
+            **no_window_subprocess_kwargs(),
         )
     except Exception:
         return []
@@ -1846,6 +1851,7 @@ def probe_duration(ffprobe_path: Path, src: Path) -> Optional[float]:
             errors="replace",
             timeout=30,
             check=False,
+            **no_window_subprocess_kwargs(),
         )
     except Exception:
         return None
@@ -1885,6 +1891,7 @@ def probe_has_audio(ffprobe_path: Path, src: Path) -> bool:
             errors="replace",
             timeout=30,
             check=False,
+            **no_window_subprocess_kwargs(),
         )
     except Exception as exc:
         raise RuntimeError(f"ffprobe audio probe failed: {exc}") from exc

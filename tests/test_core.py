@@ -1,5 +1,7 @@
 import inspect
 import json
+import os
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -7,6 +9,7 @@ from pathlib import Path
 import ffmpeg_nvenc_gui.app as app_module
 import ffmpeg_nvenc_gui.core as core_module
 import ffmpeg_nvenc_gui.ffmpeg_downloader as downloader
+import ffmpeg_nvenc_gui.subprocess_utils as subprocess_utils
 from ffmpeg_nvenc_gui.app import (
     EncoderApp,
     RuntimeJob,
@@ -561,6 +564,12 @@ def test_output_and_archive_paths_expand_filename_token_with_safe_folder_names(t
 
     assert output == (tmp_path / "Encoded" / "Clip-01" / "Clip-01-outputs" / "Clip 01-2160.mp4").resolve()
     assert profile_archive_dir(profile, src) == (tmp_path / "Archive" / "Clip-01").resolve()
+
+    profile.output_dir = str(tmp_path / "EncodedSource" / "{source}")
+    profile.archive_dir = str(tmp_path / "ArchiveSource" / "{source}")
+
+    assert output_path_for(profile, src, variant).parent.parent == (tmp_path / "EncodedSource" / "Clip-01").resolve()
+    assert profile_archive_dir(profile, src) == (tmp_path / "ArchiveSource" / "Clip-01").resolve()
 
 
 def test_audio_codec_and_container_choices_are_normalized():
@@ -1640,6 +1649,119 @@ def test_output_bulk_enable_disable_duplicate_and_remove(tmp_path: Path):
     assert [item.id for item in app.editing_outputs] == ["second", copied[1].id]
 
 
+def test_output_drag_order_updates_profile_default_priority():
+    class FakeTree:
+        def get_children(self):
+            return ("second", "first")
+
+        def selection_set(self, *_items):
+            pass
+
+    app = EncoderApp.__new__(EncoderApp)
+    first = OutputVariant(id="first", name="First", folder_name="first")
+    second = OutputVariant(id="second", name="Second", folder_name="second")
+    app.editing_outputs = [first, second]
+    app.outputs_tree = FakeTree()
+    app.selected_output_id = None
+    app._output_drag_id = "second"
+    app._output_drag_moved = True
+    app.on_output_select = lambda: None
+
+    app.on_output_drag_end(None)
+
+    assert [item.id for item in app.editing_outputs] == ["second", "first"]
+    assert app.selected_output_id == "second"
+
+
+def test_output_menu_only_shows_valid_enable_state_action():
+    class FakeTree:
+        selected = ("first",)
+
+        def selection(self):
+            return self.selected
+
+    class FakeMenu:
+        def __init__(self):
+            self.labels = []
+
+        def index(self, _index):
+            return None
+
+        def add_command(self, *, label, **_kwargs):
+            self.labels.append(label)
+
+        def add_separator(self):
+            pass
+
+    app = EncoderApp.__new__(EncoderApp)
+    variant = OutputVariant(id="first", name="First", folder_name="first", enabled=True)
+    app.editing_outputs = [variant]
+    app.outputs_tree = FakeTree()
+    app.selected_output_id = None
+    menu = FakeMenu()
+
+    app.populate_output_menu(menu)
+
+    assert "無効化" in menu.labels
+    assert "有効化" not in menu.labels
+
+    variant.enabled = False
+    menu.labels.clear()
+    app.populate_output_menu(menu)
+
+    assert "有効化" in menu.labels
+    assert "無効化" not in menu.labels
+
+
+def test_file_progress_order_overrides_output_profile_default(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    first_source = tmp_path / "a.mkv"
+    second_source = tmp_path / "b.mkv"
+    app = EncoderApp.__new__(EncoderApp)
+    app.files = [
+        core_module.FileStatus(first_source, {variant.id: False for variant in profile.outputs}),
+        core_module.FileStatus(second_source, {variant.id: False for variant in profile.outputs}),
+    ]
+    app.progress_order_by_profile = {
+        profile.id: [
+            app.progress_order_key(second_source, profile.outputs[1].id),
+            app.progress_order_key(first_source, profile.outputs[0].id),
+        ]
+    }
+    app.custom_progress_order_profiles = {profile.id}
+    specs = [
+        JobSpec(str(first_source), profile.id, profile.outputs[0].id),
+        JobSpec(str(first_source), profile.id, profile.outputs[1].id),
+        JobSpec(str(second_source), profile.id, profile.outputs[0].id),
+        JobSpec(str(second_source), profile.id, profile.outputs[1].id),
+    ]
+
+    ordered = app.order_job_specs(profile, specs)
+
+    assert [(Path(item.src).name, item.variant_id) for item in ordered] == [
+        ("b.mkv", profile.outputs[1].id),
+        ("a.mkv", profile.outputs[0].id),
+        ("a.mkv", profile.outputs[1].id),
+        ("b.mkv", profile.outputs[0].id),
+    ]
+
+
+def test_unmodified_file_priority_follows_changed_output_profile_order(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    source = tmp_path / "a.mkv"
+    app = EncoderApp.__new__(EncoderApp)
+    app.files = [core_module.FileStatus(source, {variant.id: False for variant in profile.outputs})]
+    app.progress_order_by_profile = {}
+    app.custom_progress_order_profiles = set()
+
+    initial = app.reconcile_progress_order(profile)
+    profile.outputs.reverse()
+    changed = app.reconcile_progress_order(profile)
+
+    assert [variant_id for _source, variant_id in initial] == ["master", "review"]
+    assert [variant_id for _source, variant_id in changed] == ["review", "master"]
+
+
 def test_selected_resource_labels_only_reports_selected_resources(tmp_path: Path):
     app = EncoderApp.__new__(EncoderApp)
     profile = make_profile(tmp_path)
@@ -2258,6 +2380,29 @@ def test_verify_binaries_wrap_oserror():
                 raise AssertionError(f"{binary_name} OSError was not wrapped")
     finally:
         downloader.subprocess.run = original_run
+
+
+def test_windows_subprocesses_use_no_console_window(monkeypatch, tmp_path: Path):
+    assert os.name == "nt"
+    assert subprocess_utils.no_window_subprocess_kwargs() == {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+    }
+
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = "ffmpeg version test"
+
+    def fake_run(_command, **kwargs):
+        calls.append(kwargs)
+        return Result()
+
+    monkeypatch.setattr(downloader.subprocess, "run", fake_run)
+    downloader.verify_binary_basic(tmp_path / "ffmpeg.exe", "ffmpeg.exe")
+
+    assert calls[0]["creationflags"] == subprocess.CREATE_NO_WINDOW
+    assert "no_window_subprocess_kwargs" in inspect.getsource(EncoderApp.run_process)
 
 
 def test_encoder_app_filesystem_errors_show_messagebox(tmp_path: Path):

@@ -32,6 +32,7 @@ work-folder
 |-- Incoming
 |-- output
 |   `-- {source}
+|       |-- {source}.mp4
 |       |-- up-convert-4k
 |       `-- reencode-original-pixel
 |-- profiles.json

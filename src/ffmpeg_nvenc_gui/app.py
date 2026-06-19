@@ -702,7 +702,7 @@ class OutputEditorSession:
             if resource.detected_encoder_engines:
                 detail = f"NVENC {resource.detected_encoder_engines} engine(s)"
             elif resource.detection_error:
-                detail = "NVENC engine count unavailable; slots are manual"
+                detail = "NVENCエンジン数未検出、slotsは手動調整"
             ttk.Label(row, text=detail, style="Muted.TLabel").pack(side=tk.RIGHT)
 
         buttons = ttk.Frame(body, style="App.TFrame")

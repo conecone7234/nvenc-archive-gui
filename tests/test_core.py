@@ -2214,6 +2214,54 @@ def test_state_resume_filters_completed_jobs(tmp_path: Path):
     assert load_state(paths) is None
 
 
+def test_reorder_pending_jobs_updates_queue_and_saved_resume_order(tmp_path: Path, monkeypatch):
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    app.paths = build_paths(tmp_path)
+    app.pending_jobs = app_module.queue.Queue()
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+
+    def make_job(job_id: int) -> RuntimeJob:
+        spec = JobSpec(
+            src=str(tmp_path / f"input-{job_id}.mkv"),
+            profile_id=profile.id,
+            variant_id=variant.id,
+        )
+        return RuntimeJob(
+            job_id=job_id,
+            spec=spec,
+            profile=profile,
+            variant=variant,
+            tmp_out=tmp_path / f"tmp-{job_id}.mp4",
+            out_file=tmp_path / f"out-{job_id}.mp4",
+            log_file=tmp_path / f"job-{job_id}.log",
+        )
+
+    jobs = [make_job(job_id) for job_id in (1, 2, 3)]
+    for job in jobs:
+        app.pending_jobs.put(job)
+    app.all_jobs = {job.job_id: job for job in jobs}
+    app.job_rows = {1: "row-1", 2: "row-2", 3: "row-3"}
+    app.has_saved_state = lambda: True
+    saved = []
+    monkeypatch.setattr(
+        app_module,
+        "save_state",
+        lambda paths, saved_profile, specs: saved.append((paths, saved_profile, specs)),
+    )
+
+    app.reorder_pending_jobs(["row-3", "row-1", "row-2"])
+
+    queued = [app.pending_jobs.get_nowait() for _item in jobs]
+    assert [job.job_id for job in queued] == [3, 1, 2]
+    assert len(saved) == 1
+    saved_paths, saved_profile, saved_specs = saved[0]
+    assert saved_paths == app.paths
+    assert saved_profile is profile
+    assert [Path(spec.src).name for spec in saved_specs] == ["input-3.mkv", "input-1.mkv", "input-2.mkv"]
+
+
 def test_scheduler_stop_discard_clears_state_and_temporary_outputs(tmp_path: Path):
     paths = build_paths(tmp_path)
     profile = make_profile(tmp_path)

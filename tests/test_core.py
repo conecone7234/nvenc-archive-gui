@@ -6,6 +6,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 import ffmpeg_nvenc_gui.app as app_module
 import ffmpeg_nvenc_gui.core as core_module
 import ffmpeg_nvenc_gui.ffmpeg_downloader as downloader
@@ -2382,8 +2384,8 @@ def test_verify_binaries_wrap_oserror():
         downloader.subprocess.run = original_run
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows 専用")
 def test_windows_subprocesses_use_no_console_window(monkeypatch, tmp_path: Path):
-    assert os.name == "nt"
     assert subprocess_utils.no_window_subprocess_kwargs() == {
         "creationflags": subprocess.CREATE_NO_WINDOW,
     }

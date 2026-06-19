@@ -41,6 +41,7 @@ from ffmpeg_nvenc_gui.core import (
     detect_cpu_resources,
     duplicate_output_targets,
     ensure_profile_dirs,
+    estimate_remaining_seconds,
     format_eta_duration,
     format_seconds,
     hardware_resources_from_gpus,
@@ -221,6 +222,17 @@ def test_format_eta_duration_uses_japanese_units_and_handles_edge_cases():
     assert format_eta_duration(0) == "0秒"
     assert format_eta_duration(-5) == ""
     assert format_eta_duration(float("inf")) == ""
+
+
+def test_estimate_remaining_seconds_uses_progress_rate_and_guards_edge_cases():
+    # 30% gained over 60s -> 0.5%/s; 60% remaining -> 120s.
+    assert estimate_remaining_seconds(60.0, 30.0, 40.0) == 120.0
+    # Not enough elapsed time yet.
+    assert estimate_remaining_seconds(0.5, 30.0, 40.0) is None
+    # No forward progress.
+    assert estimate_remaining_seconds(60.0, 0.0, 40.0) is None
+    # Already complete.
+    assert estimate_remaining_seconds(60.0, 30.0, 100.0) is None
 
 
 def test_audio_and_mux_commands_are_separate_from_video_segments(tmp_path: Path):

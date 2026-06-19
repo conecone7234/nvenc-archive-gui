@@ -1796,7 +1796,7 @@ def parse_ffmpeg_time(line: str) -> Optional[float]:
 
 def format_eta_duration(seconds: float) -> str:
     """Format a remaining-time estimate (in seconds) as a Japanese label."""
-    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+    if not math.isfinite(seconds) or seconds < 0:
         return ""
     total = int(round(seconds))
     if total <= 0:
@@ -1808,6 +1808,20 @@ def format_eta_duration(seconds: float) -> str:
     if minutes > 0:
         return f"{minutes}分{secs}秒"
     return f"{secs}秒"
+
+
+def estimate_remaining_seconds(elapsed: float, progress_delta: float, value: float) -> Optional[float]:
+    """Estimate remaining seconds from elapsed time and overall progress (0-100).
+
+    Returns None when there is not enough signal yet (too little elapsed time or
+    no forward progress), so callers can show a "calculating" placeholder.
+    """
+    if elapsed < 1.0 or progress_delta <= 0.0 or value >= 100.0:
+        return None
+    rate = progress_delta / elapsed
+    if rate <= 0.0:
+        return None
+    return (100.0 - value) / rate
 
 
 def probe_duration(ffprobe_path: Path, src: Path) -> Optional[float]:

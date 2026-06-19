@@ -46,6 +46,7 @@ try:
         encoder_codec,
         ensure_dirs,
         ensure_profile_dirs,
+        estimate_remaining_seconds,
         format_eta_duration,
         joined_video_path_for,
         load_profiles,
@@ -120,6 +121,7 @@ except ModuleNotFoundError:
         encoder_codec,
         ensure_dirs,
         ensure_profile_dirs,
+        estimate_remaining_seconds,
         format_eta_duration,
         joined_video_path_for,
         load_profiles,
@@ -3710,12 +3712,14 @@ class EncoderApp:
             return
         elapsed = now - self._eta_start_time
         delta = value - self._eta_start_progress
-        if elapsed < 1.0 or delta <= 0.0:
+        if delta < 0.0:
+            # Progress went backwards (e.g. a job restarted); re-baseline.
+            self._eta_start_time = now
+            self._eta_start_progress = value
             self.eta_text_var.set("計算中…")
             return
-        rate = delta / elapsed
-        remaining = (100.0 - value) / rate
-        label = format_eta_duration(remaining)
+        remaining = estimate_remaining_seconds(elapsed, delta, value)
+        label = format_eta_duration(remaining) if remaining is not None else ""
         self.eta_text_var.set(f"約{label}" if label else "計算中…")
 
     def _update_runtime_rows(self, jobs: List[RuntimeJob]) -> None:

@@ -731,16 +731,16 @@ def default_outputs() -> List[OutputVariant]:
     return [
         OutputVariant(
             id="master_2160p",
-            name="Master 2160p",
-            folder_name="master-2160p",
+            name="UP Convert 4K",
+            folder_name="up-convert-4k",
             height=2160,
             container="mp4",
         ),
         OutputVariant(
             id="reference_1080p",
-            name="Reference 1080p",
-            folder_name="reference-1080p",
-            height=1080,
+            name="ReEncode Original Pixel",
+            folder_name="reencode-original-pixel",
+            height=None,
             container="mp4",
         ),
     ]
@@ -1141,8 +1141,8 @@ def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> En
     return EncodeProfile(
         id="default",
         input_dir=str(paths.base_dir / "Incoming"),
-        output_dir=str(paths.base_dir / "Encoded"),
-        archive_dir=str(paths.base_dir / "SourceArchive"),
+        output_dir=str(paths.base_dir / "output" / "{source}"),
+        archive_dir=str(paths.base_dir / "output" / "{source}"),
         max_parallel_jobs=2 if gpu else 1,
         segment_minutes=10,
         use_gpu=gpu is not None,
@@ -1152,7 +1152,7 @@ def default_profile(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> En
         cpu_codec="libx264",
         cpu_preset="medium",
         cpu_tune="none",
-        cq_value=18 if gpu else 23,
+        cq_value=15 if gpu else 23,
         bitrate="25000k" if gpu else "8000k",
         maxrate="40000k" if gpu else "12000k",
         bufsize="80000k" if gpu else "24000k",

@@ -681,6 +681,22 @@ def test_hardware_resources_only_include_detected_devices_by_default():
     assert all(resource.backend == BACKEND_CPU for resource in resources)
 
 
+def test_default_outputs_match_archive_profile(tmp_path: Path):
+    profile = core_module.default_profile(
+        build_paths(tmp_path),
+        [GpuInfo(index=0, name="NVIDIA GeForce RTX 5080")],
+    )
+
+    assert profile.cq_value == 15
+    assert Path(profile.output_dir) == tmp_path / "output" / "{source}"
+    assert Path(profile.archive_dir) == tmp_path / "output" / "{source}"
+    names = [(output.id, output.name, output.folder_name, output.height) for output in profile.outputs]
+    assert names == [
+        ("master_2160p", "UP Convert 4K", "up-convert-4k", 2160),
+        ("reference_1080p", "ReEncode Original Pixel", "reencode-original-pixel", None),
+    ]
+
+
 def test_default_profile_outputs_follow_detected_non_nvenc_backend(tmp_path: Path):
     profile = core_module.default_profile(
         build_paths(tmp_path),
@@ -833,7 +849,7 @@ def test_load_profiles_defaults_missing_fields_from_supplied_paths(tmp_path: Pat
 
     assert len(profiles) == 1
     assert Path(profiles[0].input_dir) == paths.base_dir / "Incoming"
-    assert Path(profiles[0].output_dir) == paths.base_dir / "Encoded"
+    assert Path(profiles[0].output_dir) == paths.base_dir / "output" / "{source}"
     assert profiles[0].use_gpu is False
 
 

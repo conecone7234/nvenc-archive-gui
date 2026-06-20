@@ -7,6 +7,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -51,6 +52,25 @@ NVIDIA_NVENC_ENGINE_HINTS = [
     (re.compile(r"\brtx\s+4070\s*ti\b", re.IGNORECASE), 2),
 ]
 AUDIO_CODEC_CHOICES = ["copy", "aac", "alac", "libmp3lame", "mp3", "opus", "vorbis", "flac"]
+STREAM_KINDS = {"video", "audio", "subtitle", "attachment", "data"}
+STREAM_ACTIONS = {"transcode", "copy", "auto", "exclude"}
+VOLATILE_STREAM_METADATA_TAGS = {"encoder", "duration", "number_of_bytes", "number_of_frames"}
+STREAM_SCOPED_EXTRA_OPTIONS = {
+    "-ar",
+    "-ac",
+    "-af",
+    "-aq",
+    "-b",
+    "-bsf",
+    "-channel_layout",
+    "-compression_level",
+    "-filter",
+    "-frames",
+    "-metadata",
+    "-profile",
+    "-q",
+    "-sample_fmt",
+}
 AUDIO_CONTAINERS_BY_CODEC = {
     "copy": ["mka", "mkv"],
     "aac": ["m4a", "mp4", "mov"],
@@ -147,6 +167,264 @@ class HardwareResource:
 
 
 @dataclass
+class ChapterInfo:
+    id: int = 0
+    start_time: float = 0.0
+    end_time: float = 0.0
+    tags: Dict[str, str] = field(default_factory=dict)
+
+    @staticmethod
+    def from_ffprobe(data: object) -> "ChapterInfo":
+        item = data if isinstance(data, dict) else {}
+        return ChapterInfo(
+            id=normalize_int(item.get("id", 0), minimum=0, default=0),
+            start_time=normalize_float(item.get("start_time", 0.0), default=0.0),
+            end_time=normalize_float(item.get("end_time", 0.0), default=0.0),
+            tags=normalize_tags(item.get("tags")),
+        )
+
+
+@dataclass
+class MediaStream:
+    index: int
+    codec_type: str
+    codec_name: str = ""
+    ordinal: int = 0
+    width: Optional[int] = None
+    height: Optional[int] = None
+    channels: Optional[int] = None
+    sample_rate: str = ""
+    start_time: float = 0.0
+    duration: Optional[float] = None
+    tags: Dict[str, str] = field(default_factory=dict)
+    disposition: Dict[str, bool] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.index = normalize_int(self.index, minimum=0, default=0)
+        self.codec_type = str(self.codec_type or "data").strip().lower()
+        self.codec_name = str(self.codec_name or "").strip().lower()
+        self.ordinal = normalize_int(self.ordinal, minimum=0, default=0)
+        self.width = normalize_optional_int(self.width, minimum=1)
+        self.height = normalize_optional_int(self.height, minimum=1)
+        self.channels = normalize_optional_int(self.channels, minimum=1)
+        self.sample_rate = str(self.sample_rate or "").strip()
+        self.start_time = normalize_float(self.start_time, default=0.0)
+        self.duration = normalize_optional_float(self.duration, minimum=0.0)
+        self.tags = normalize_tags(self.tags)
+        raw_disposition = self.disposition if isinstance(self.disposition, dict) else {}
+        self.disposition = {str(key): bool(value) for key, value in raw_disposition.items() if bool(value)}
+
+    @property
+    def attached_pic(self) -> bool:
+        return bool(self.disposition.get("attached_pic"))
+
+    @property
+    def language(self) -> str:
+        return self.tags.get("language", "").strip().lower()
+
+    @property
+    def title(self) -> str:
+        return self.tags.get("title", "").strip()
+
+    @staticmethod
+    def from_ffprobe(data: object, ordinal: int) -> "MediaStream":
+        item = data if isinstance(data, dict) else {}
+        return MediaStream(
+            index=normalize_int(item.get("index", 0), minimum=0, default=0),
+            codec_type=str(item.get("codec_type", "data")),
+            codec_name=str(item.get("codec_name", "")),
+            ordinal=ordinal,
+            width=item.get("width"),
+            height=item.get("height"),
+            channels=item.get("channels"),
+            sample_rate=str(item.get("sample_rate", "")),
+            start_time=item.get("start_time", 0.0),
+            duration=item.get("duration"),
+            tags=normalize_tags(item.get("tags")),
+            disposition=item.get("disposition", {}) if isinstance(item.get("disposition"), dict) else {},
+        )
+
+
+@dataclass
+class MediaProbe:
+    path: str
+    format_name: str = ""
+    duration: Optional[float] = None
+    streams: List[MediaStream] = field(default_factory=list)
+    chapters: List[ChapterInfo] = field(default_factory=list)
+    tags: Dict[str, str] = field(default_factory=dict)
+
+    @staticmethod
+    def from_ffprobe(path: Path, data: object) -> "MediaProbe":
+        root = data if isinstance(data, dict) else {}
+        raw_streams = root.get("streams", []) if isinstance(root.get("streams"), list) else []
+        ordinals: Dict[str, int] = {}
+        streams: List[MediaStream] = []
+        for raw in raw_streams:
+            codec_type = str(raw.get("codec_type", "data")) if isinstance(raw, dict) else "data"
+            ordinal = ordinals.get(codec_type, 0)
+            ordinals[codec_type] = ordinal + 1
+            streams.append(MediaStream.from_ffprobe(raw, ordinal))
+        raw_format = root.get("format", {}) if isinstance(root.get("format"), dict) else {}
+        return MediaProbe(
+            path=str(path),
+            format_name=str(raw_format.get("format_name", "")),
+            duration=normalize_optional_float(raw_format.get("duration"), minimum=0.0),
+            streams=streams,
+            chapters=[ChapterInfo.from_ffprobe(item) for item in root.get("chapters", []) if isinstance(item, dict)],
+            tags=normalize_tags(raw_format.get("tags")),
+        )
+
+
+@dataclass
+class StreamSelector:
+    kind: str = "video"
+    ordinal: Optional[int] = None
+    codec_names: List[str] = field(default_factory=list)
+    languages: List[str] = field(default_factory=list)
+    title_contains: str = ""
+    dispositions: List[str] = field(default_factory=list)
+    attached_pic: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        self.kind = str(self.kind or "video").strip().lower()
+        if self.kind not in STREAM_KINDS:
+            self.kind = "data"
+        self.ordinal = normalize_optional_int(self.ordinal, minimum=0)
+        self.codec_names = normalize_string_list(self.codec_names)
+        self.languages = normalize_string_list(self.languages)
+        self.title_contains = str(self.title_contains or "").strip().lower()
+        self.dispositions = normalize_string_list(self.dispositions)
+        self.attached_pic = normalize_optional_bool(self.attached_pic)
+
+    def matches(self, stream: MediaStream) -> bool:
+        if stream.codec_type != self.kind:
+            return False
+        if self.ordinal is not None and stream.ordinal != self.ordinal:
+            return False
+        if self.codec_names and stream.codec_name not in self.codec_names:
+            return False
+        if self.languages and stream.language not in self.languages:
+            return False
+        if self.title_contains and self.title_contains not in stream.title.lower():
+            return False
+        if self.dispositions and any(not stream.disposition.get(name, False) for name in self.dispositions):
+            return False
+        if self.attached_pic is not None and stream.attached_pic != self.attached_pic:
+            return False
+        return True
+
+    @staticmethod
+    def from_dict(data: object) -> "StreamSelector":
+        return StreamSelector(**dataclass_values(StreamSelector, data))
+
+
+@dataclass
+class StreamEncodingOverride:
+    action: str = "auto"
+    backend: str = ""
+    ffmpeg_encoder: str = ""
+    resource_ids: List[str] = field(default_factory=list)
+    height: Optional[int] = None
+    rate_mode: str = ""
+    cq_value: Optional[int] = None
+    bitrate: str = ""
+    maxrate: str = ""
+    bufsize: str = ""
+    preset: str = ""
+    tune: str = ""
+    pix_fmt: str = ""
+    scale_flags: str = ""
+    codec: str = ""
+    extra_args: str = ""
+
+    def __post_init__(self) -> None:
+        self.action = str(self.action or "auto").strip().lower()
+        if self.action not in STREAM_ACTIONS:
+            self.action = "auto"
+        self.backend = normalize_backend(self.backend) if self.backend else ""
+        self.ffmpeg_encoder = str(self.ffmpeg_encoder or "").strip()
+        self.resource_ids = normalize_resource_id_list(self.resource_ids)
+        self.height = normalize_optional_int(self.height, minimum=1)
+        self.rate_mode = str(self.rate_mode or "").strip().upper()
+        self.cq_value = normalize_optional_int(self.cq_value)
+        self.bitrate = str(self.bitrate or "").strip()
+        self.maxrate = str(self.maxrate or "").strip()
+        self.bufsize = str(self.bufsize or "").strip()
+        self.preset = str(self.preset or "").strip()
+        self.tune = str(self.tune or "").strip()
+        self.pix_fmt = str(self.pix_fmt or "").strip()
+        self.scale_flags = str(self.scale_flags or "").strip()
+        self.codec = str(self.codec or "").strip()
+        self.extra_args = str(self.extra_args or "").strip()
+
+    @staticmethod
+    def from_dict(data: object) -> "StreamEncodingOverride":
+        return StreamEncodingOverride(**dataclass_values(StreamEncodingOverride, data))
+
+
+@dataclass
+class StreamRule:
+    id: str = ""
+    name: str = ""
+    selector: StreamSelector = field(default_factory=StreamSelector)
+    encoding: StreamEncodingOverride = field(default_factory=StreamEncodingOverride)
+
+    def __post_init__(self) -> None:
+        self.id = str(self.id or "").strip() or new_id("stream-rule")
+        if not isinstance(self.selector, StreamSelector):
+            self.selector = StreamSelector.from_dict(self.selector)
+        if not isinstance(self.encoding, StreamEncodingOverride):
+            self.encoding = StreamEncodingOverride.from_dict(self.encoding)
+        self.name = str(self.name or "").strip() or self.selector.kind
+
+    @staticmethod
+    def from_dict(data: object) -> "StreamRule":
+        item = data if isinstance(data, dict) else {}
+        return StreamRule(
+            id=str(item.get("id", "")),
+            name=str(item.get("name", "")),
+            selector=StreamSelector.from_dict(item.get("selector", {})),
+            encoding=StreamEncodingOverride.from_dict(item.get("encoding", {})),
+        )
+
+
+def default_stream_rules() -> List[StreamRule]:
+    return [
+        StreamRule(
+            name="すべての通常映像",
+            selector=StreamSelector(kind="video", attached_pic=False),
+            encoding=StreamEncodingOverride(action="transcode"),
+        ),
+        StreamRule(
+            name="カバー画像",
+            selector=StreamSelector(kind="video", attached_pic=True),
+            encoding=StreamEncodingOverride(action="auto"),
+        ),
+        StreamRule(
+            name="すべての音声",
+            selector=StreamSelector(kind="audio"),
+            encoding=StreamEncodingOverride(action="auto"),
+        ),
+        StreamRule(
+            name="すべての字幕",
+            selector=StreamSelector(kind="subtitle"),
+            encoding=StreamEncodingOverride(action="auto"),
+        ),
+        StreamRule(
+            name="すべての添付",
+            selector=StreamSelector(kind="attachment"),
+            encoding=StreamEncodingOverride(action="copy"),
+        ),
+        StreamRule(
+            name="すべてのデータ",
+            selector=StreamSelector(kind="data"),
+            encoding=StreamEncodingOverride(action="copy"),
+        ),
+    ]
+
+
+@dataclass
 class OutputVariant:
     id: str
     name: str
@@ -188,6 +466,9 @@ class OutputVariant:
     extra_output_args: str = ""
     extra_concat_args: str = ""
     extra_mux_args: str = ""
+    stream_rules: List[StreamRule] = field(default_factory=default_stream_rules)
+    preserve_metadata: bool = True
+    preserve_chapters: bool = True
 
     def __post_init__(self) -> None:
         self.id = str(self.id or "").strip()
@@ -277,6 +558,21 @@ class OutputVariant:
         self.extra_output_args = str(self.extra_output_args or "").strip()
         self.extra_concat_args = str(self.extra_concat_args or "").strip()
         self.extra_mux_args = str(self.extra_mux_args or "").strip()
+        raw_rules = self.stream_rules if isinstance(self.stream_rules, list) else []
+        self.stream_rules = [
+            item if isinstance(item, StreamRule) else StreamRule.from_dict(item)
+            for item in raw_rules
+            if isinstance(item, (StreamRule, dict))
+        ]
+        if not self.stream_rules:
+            self.stream_rules = default_stream_rules()
+        seen_rule_ids: set[str] = set()
+        for rule in self.stream_rules:
+            while rule.id in seen_rule_ids:
+                rule.id = new_id("stream-rule")
+            seen_rule_ids.add(rule.id)
+        self.preserve_metadata = normalize_bool(self.preserve_metadata, default=True)
+        self.preserve_chapters = normalize_bool(self.preserve_chapters, default=True)
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "OutputVariant":
@@ -292,6 +588,12 @@ class OutputVariant:
             "segment_minutes": None,
         }
         base.update(dataclass_values(OutputVariant, data))
+        raw_rules = base.get("stream_rules")
+        base["stream_rules"] = (
+            [StreamRule.from_dict(item) for item in raw_rules if isinstance(item, dict)]
+            if isinstance(raw_rules, list)
+            else default_stream_rules()
+        )
         return OutputVariant(**base)
 
 
@@ -432,12 +734,192 @@ class EncodeProfile:
 
 
 @dataclass
+class VideoStreamTask:
+    input_stream_index: int
+    input_ordinal: int
+    output_ordinal: int
+    source_codec: str = ""
+    start_time: float = 0.0
+    duration: Optional[float] = None
+    expected_codec: str = ""
+    expected_width: Optional[int] = None
+    expected_height: Optional[int] = None
+    settings: StreamEncodingOverride = field(default_factory=lambda: StreamEncodingOverride(action="transcode"))
+    use_muxer_default: bool = False
+    fallback_reason: str = ""
+    tags: Dict[str, str] = field(default_factory=dict)
+    disposition: Dict[str, bool] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.input_stream_index = normalize_int(self.input_stream_index, minimum=0, default=0)
+        self.input_ordinal = normalize_int(self.input_ordinal, minimum=0, default=0)
+        self.output_ordinal = normalize_int(self.output_ordinal, minimum=0, default=0)
+        self.source_codec = str(self.source_codec or "").strip().lower()
+        self.start_time = normalize_float(self.start_time, default=0.0)
+        self.duration = normalize_optional_float(self.duration, minimum=0.0)
+        self.expected_codec = str(self.expected_codec or "").strip().lower()
+        self.expected_width = normalize_optional_int(self.expected_width, minimum=1)
+        self.expected_height = normalize_optional_int(self.expected_height, minimum=1)
+        if not isinstance(self.settings, StreamEncodingOverride):
+            self.settings = StreamEncodingOverride.from_dict(self.settings)
+        self.use_muxer_default = normalize_bool(self.use_muxer_default)
+        self.fallback_reason = str(self.fallback_reason or "").strip()
+        self.tags = normalize_tags(self.tags)
+        raw_disposition = self.disposition if isinstance(self.disposition, dict) else {}
+        self.disposition = {str(key): bool(value) for key, value in raw_disposition.items() if bool(value)}
+
+    @staticmethod
+    def from_dict(data: object) -> "VideoStreamTask":
+        item = data if isinstance(data, dict) else {}
+        return VideoStreamTask(
+            input_stream_index=item.get("input_stream_index", 0),
+            input_ordinal=item.get("input_ordinal", 0),
+            output_ordinal=item.get("output_ordinal", 0),
+            source_codec=str(item.get("source_codec", "")),
+            start_time=item.get("start_time", 0.0),
+            duration=item.get("duration"),
+            expected_codec=str(item.get("expected_codec", "")),
+            expected_width=item.get("expected_width"),
+            expected_height=item.get("expected_height"),
+            settings=StreamEncodingOverride.from_dict(item.get("settings", {})),
+            use_muxer_default=item.get("use_muxer_default", False),
+            fallback_reason=str(item.get("fallback_reason", "")),
+            tags=normalize_tags(item.get("tags")),
+            disposition=item.get("disposition", {}) if isinstance(item.get("disposition"), dict) else {},
+        )
+
+
+@dataclass
+class ResolvedMuxStream:
+    input_stream_index: int
+    input_ordinal: int
+    output_ordinal: int
+    codec_type: str
+    source_codec: str = ""
+    expected_codec: str = ""
+    expected_width: Optional[int] = None
+    expected_height: Optional[int] = None
+    action: str = "copy"
+    codec: str = ""
+    bitrate: str = ""
+    extra_args: str = ""
+    fallback_reason: str = ""
+    tags: Dict[str, str] = field(default_factory=dict)
+    disposition: Dict[str, bool] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.input_stream_index = normalize_int(self.input_stream_index, minimum=0, default=0)
+        self.input_ordinal = normalize_int(self.input_ordinal, minimum=0, default=0)
+        self.output_ordinal = normalize_int(self.output_ordinal, minimum=0, default=0)
+        self.codec_type = str(self.codec_type or "data").strip().lower()
+        self.source_codec = str(self.source_codec or "").strip().lower()
+        self.expected_codec = str(self.expected_codec or "").strip().lower()
+        self.expected_width = normalize_optional_int(self.expected_width, minimum=1)
+        self.expected_height = normalize_optional_int(self.expected_height, minimum=1)
+        self.action = str(self.action or "copy").strip().lower()
+        self.codec = str(self.codec or "").strip()
+        self.bitrate = str(self.bitrate or "").strip()
+        self.extra_args = str(self.extra_args or "").strip()
+        self.fallback_reason = str(self.fallback_reason or "").strip()
+        self.tags = normalize_tags(self.tags)
+        raw_disposition = self.disposition if isinstance(self.disposition, dict) else {}
+        self.disposition = {str(key): bool(value) for key, value in raw_disposition.items() if bool(value)}
+
+    @staticmethod
+    def from_dict(data: object) -> "ResolvedMuxStream":
+        item = data if isinstance(data, dict) else {}
+        return ResolvedMuxStream(
+            input_stream_index=item.get("input_stream_index", 0),
+            input_ordinal=item.get("input_ordinal", 0),
+            output_ordinal=item.get("output_ordinal", 0),
+            codec_type=str(item.get("codec_type", "data")),
+            source_codec=str(item.get("source_codec", "")),
+            expected_codec=str(item.get("expected_codec", "")),
+            expected_width=item.get("expected_width"),
+            expected_height=item.get("expected_height"),
+            action=str(item.get("action", "copy")),
+            codec=str(item.get("codec", "")),
+            bitrate=str(item.get("bitrate", "")),
+            extra_args=str(item.get("extra_args", "")),
+            fallback_reason=str(item.get("fallback_reason", "")),
+            tags=normalize_tags(item.get("tags")),
+            disposition=item.get("disposition", {}) if isinstance(item.get("disposition"), dict) else {},
+        )
+
+
+@dataclass
+class ResolvedStreamPlan:
+    source_fingerprint: str
+    video_tasks: List[VideoStreamTask] = field(default_factory=list)
+    mux_streams: List[ResolvedMuxStream] = field(default_factory=list)
+    preserve_metadata: bool = True
+    preserve_chapters: bool = True
+    source_tags: Dict[str, str] = field(default_factory=dict)
+    chapters: List[ChapterInfo] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.source_fingerprint = str(self.source_fingerprint or "").strip()
+        self.video_tasks = [
+            item if isinstance(item, VideoStreamTask) else VideoStreamTask.from_dict(item)
+            for item in self.video_tasks
+            if isinstance(item, (VideoStreamTask, dict))
+        ]
+        self.mux_streams = [
+            item if isinstance(item, ResolvedMuxStream) else ResolvedMuxStream.from_dict(item)
+            for item in self.mux_streams
+            if isinstance(item, (ResolvedMuxStream, dict))
+        ]
+        self.preserve_metadata = normalize_bool(self.preserve_metadata, default=True)
+        self.preserve_chapters = normalize_bool(self.preserve_chapters, default=True)
+        self.source_tags = normalize_tags(self.source_tags)
+        self.chapters = [
+            item if isinstance(item, ChapterInfo) else ChapterInfo.from_ffprobe(item)
+            for item in self.chapters
+            if isinstance(item, (ChapterInfo, dict))
+        ]
+        self.warnings = [str(item) for item in self.warnings if str(item).strip()]
+
+    @property
+    def fallbacks(self) -> List[str]:
+        result = [task.fallback_reason for task in self.video_tasks if task.fallback_reason]
+        result.extend(stream.fallback_reason for stream in self.mux_streams if stream.fallback_reason)
+        return result
+
+    def fingerprint(self) -> str:
+        data = asdict(self)
+        data.pop("warnings", None)
+        encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def from_dict(data: object) -> Optional["ResolvedStreamPlan"]:
+        if not isinstance(data, dict):
+            return None
+        return ResolvedStreamPlan(
+            source_fingerprint=str(data.get("source_fingerprint", "")),
+            video_tasks=[
+                VideoStreamTask.from_dict(item) for item in data.get("video_tasks", []) if isinstance(item, dict)
+            ],
+            mux_streams=[
+                ResolvedMuxStream.from_dict(item) for item in data.get("mux_streams", []) if isinstance(item, dict)
+            ],
+            preserve_metadata=data.get("preserve_metadata", True),
+            preserve_chapters=data.get("preserve_chapters", True),
+            source_tags=normalize_tags(data.get("source_tags")),
+            chapters=[ChapterInfo.from_ffprobe(item) for item in data.get("chapters", []) if isinstance(item, dict)],
+            warnings=[str(item) for item in data.get("warnings", []) if str(item).strip()],
+        )
+
+
+@dataclass
 class JobSpec:
     src: str
     profile_id: str
     variant_id: str
     assigned_resource_id: str = ""
     assigned_slot: int = 0
+    resolved_stream_plan: Optional[ResolvedStreamPlan] = None
 
     def __post_init__(self) -> None:
         self.src = str(self.src or "")
@@ -445,6 +927,8 @@ class JobSpec:
         self.variant_id = str(self.variant_id or "")
         self.assigned_resource_id = str(self.assigned_resource_id or "").strip().lower()
         self.assigned_slot = normalize_int(self.assigned_slot, minimum=0, default=0)
+        if self.resolved_stream_plan is not None and not isinstance(self.resolved_stream_plan, ResolvedStreamPlan):
+            self.resolved_stream_plan = ResolvedStreamPlan.from_dict(self.resolved_stream_plan)
 
 
 @dataclass
@@ -480,6 +964,51 @@ def normalize_optional_bool(value: object) -> Optional[bool]:
             return None
         return text not in {"0", "false", "no", "off", "none", "auto"}
     return bool(value)
+
+
+def normalize_bool(value: object, default: bool = False) -> bool:
+    normalized = normalize_optional_bool(value)
+    return default if normalized is None else normalized
+
+
+def normalize_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_optional_float(value: object, minimum: Optional[float] = None) -> Optional[float]:
+    if value in ("", None):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if minimum is not None:
+        number = max(minimum, number)
+    return number
+
+
+def normalize_tags(value: object) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key).strip().lower(): str(item) for key, item in value.items() if str(key).strip()}
+
+
+def normalize_string_list(value: object) -> List[str]:
+    if isinstance(value, str):
+        items = re.split(r"[,;+]", value)
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        return []
+    result: List[str] = []
+    for item in items:
+        text = str(item or "").strip().lower()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def normalize_int(value: object, minimum: Optional[int] = None, default: int = 0) -> int:
@@ -1177,6 +1706,87 @@ def read_json_object(path: Path) -> Optional[Dict[str, Any]]:
     return data
 
 
+def stream_override_store_path(paths: AppPaths) -> Path:
+    return paths.tmp_dir / "stream_overrides.json"
+
+
+def stream_override_key(src: Path, profile_id: str, variant_id: str) -> str:
+    value = f"{source_fingerprint(src)}\0{profile_id}\0{variant_id}"
+    return hashlib.sha1(value.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def load_stream_override_store(paths: AppPaths) -> Dict[str, Any]:
+    data = read_json_object(stream_override_store_path(paths))
+    if not data or data.get("version") != 1 or not isinstance(data.get("entries"), dict):
+        return {"version": 1, "entries": {}}
+    return data
+
+
+def load_stream_overrides(
+    paths: AppPaths,
+    src: Path,
+    profile_id: str,
+    variant_id: str,
+) -> Dict[int, StreamEncodingOverride]:
+    store = load_stream_override_store(paths)
+    entry = store["entries"].get(stream_override_key(src, profile_id, variant_id), {})
+    if not isinstance(entry, dict) or entry.get("source_fingerprint") != source_fingerprint(src):
+        return {}
+    raw = entry.get("overrides", {})
+    if not isinstance(raw, dict):
+        return {}
+    result: Dict[int, StreamEncodingOverride] = {}
+    for key, value in raw.items():
+        try:
+            stream_index = int(key)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, dict):
+            result[stream_index] = StreamEncodingOverride.from_dict(value)
+    return result
+
+
+def save_stream_overrides(
+    paths: AppPaths,
+    src: Path,
+    profile_id: str,
+    variant_id: str,
+    overrides: Dict[int, StreamEncodingOverride],
+) -> None:
+    ensure_dirs(paths)
+    store = load_stream_override_store(paths)
+    key = stream_override_key(src, profile_id, variant_id)
+    if overrides:
+        store["entries"][key] = {
+            "source_path": str(src.resolve()),
+            "source_fingerprint": source_fingerprint(src),
+            "profile_id": profile_id,
+            "variant_id": variant_id,
+            "overrides": {str(index): asdict(value) for index, value in overrides.items()},
+        }
+    else:
+        store["entries"].pop(key, None)
+    path = stream_override_store_path(paths)
+    tmp_file = path.with_suffix(".json.tmp")
+    tmp_file.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_file.replace(path)
+
+
+def remove_stream_overrides_for_source(paths: AppPaths, src: Path) -> None:
+    store = load_stream_override_store(paths)
+    resolved = str(src.resolve())
+    entries = store["entries"]
+    keys = [key for key, entry in entries.items() if isinstance(entry, dict) and entry.get("source_path") == resolved]
+    if not keys:
+        return
+    for key in keys:
+        entries.pop(key, None)
+    path = stream_override_store_path(paths)
+    tmp_file = path.with_suffix(".json.tmp")
+    tmp_file.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_file.replace(path)
+
+
 def load_profiles(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> List[EncodeProfile]:
     if not paths.config_file.exists():
         return [default_profile(paths, gpus)]
@@ -1193,8 +1803,13 @@ def load_profiles(paths: AppPaths, gpus: Optional[List[GpuInfo]] = None) -> List
 
 def save_profiles(paths: AppPaths, profiles: List[EncodeProfile]) -> None:
     ensure_dirs(paths)
+    existing = read_json_object(paths.config_file) if paths.config_file.exists() else None
+    if existing and normalize_int(existing.get("version", 0), minimum=0, default=0) < 3:
+        backup = paths.config_file.with_name(f"{paths.config_file.stem}.v2.json.bak")
+        if not backup.exists():
+            shutil.copy2(paths.config_file, backup)
     data = {
-        "version": 2,
+        "version": 3,
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "profiles": [profile_to_dict(profile) for profile in profiles],
     }
@@ -1430,6 +2045,229 @@ def variant_audio_container(profile: EncodeProfile, variant: OutputVariant) -> s
     return normalize_audio_container_for_codec(variant_audio_codec(profile, variant), configured)
 
 
+def validate_stream_extra_args(value: object) -> List[str]:
+    errors: List[str] = []
+    try:
+        tokens = parse_ffmpeg_args(value)
+    except ValueError as exc:
+        return [str(exc)]
+    for token in tokens:
+        if not token.startswith("-") or token == "-":
+            continue
+        base = token.split(":", 1)[0]
+        if base not in STREAM_SCOPED_EXTRA_OPTIONS:
+            errors.append(f"stream別追加引数では使用できません: {token}")
+    return errors
+
+
+def scope_stream_extra_args(value: object, codec_type: str, output_ordinal: int) -> List[str]:
+    errors = validate_stream_extra_args(value)
+    if errors:
+        raise ValueError("; ".join(errors))
+    stream_letter = {"video": "v", "audio": "a", "subtitle": "s"}.get(codec_type, codec_type[:1])
+    scoped: List[str] = []
+    for token in parse_ffmpeg_args(value):
+        if token.startswith("-") and token != "-":
+            base = token.split(":", 1)[0]
+            token = (
+                f"-metadata:s:{stream_letter}:{output_ordinal}"
+                if base == "-metadata"
+                else f"{base}:{stream_letter}:{output_ordinal}"
+            )
+        scoped.append(token)
+    return scoped
+
+
+def validate_stream_rules(variant: OutputVariant) -> List[str]:
+    errors: List[str] = []
+    ids: set[str] = set()
+    fallback_kinds: set[tuple[str, Optional[bool]]] = set()
+    for rule in variant.stream_rules:
+        if rule.id in ids:
+            errors.append(f"stream rule IDが重複しています: {rule.id}")
+        ids.add(rule.id)
+        selector = rule.selector
+        if (
+            selector.ordinal is None
+            and not selector.codec_names
+            and not selector.languages
+            and not selector.title_contains
+            and not selector.dispositions
+        ):
+            if selector.kind == "video" and selector.attached_pic is None:
+                fallback_kinds.update({("video", False), ("video", True)})
+            else:
+                fallback_kinds.add((selector.kind, selector.attached_pic if selector.kind == "video" else None))
+        errors.extend(f"{rule.name}: {message}" for message in validate_stream_extra_args(rule.encoding.extra_args))
+        if rule.encoding.resource_ids and rule.encoding.backend:
+            if any(
+                resource_backend(resource_id) != rule.encoding.backend for resource_id in rule.encoding.resource_ids
+            ):
+                errors.append(f"{rule.name}: backendとresource_idsが一致しません")
+    required = {
+        ("video", False),
+        ("video", True),
+        ("audio", None),
+        ("subtitle", None),
+        ("attachment", None),
+        ("data", None),
+    }
+    for kind, attached in sorted(required - fallback_kinds, key=lambda item: (item[0], str(item[1]))):
+        label = "cover" if kind == "video" and attached else kind
+        errors.append(f"{label}のfallback ruleがありません")
+    return errors
+
+
+def matching_stream_rule(variant: OutputVariant, stream: MediaStream) -> Optional[StreamRule]:
+    return next((rule for rule in variant.stream_rules if rule.selector.matches(stream)), None)
+
+
+def resolved_video_settings(
+    profile: EncodeProfile,
+    variant: OutputVariant,
+    configured: StreamEncodingOverride,
+) -> StreamEncodingOverride:
+    backend = configured.backend or variant.backend or resource_backend(variant_resource_ids(profile, variant)[0])
+    encoder = configured.ffmpeg_encoder or encoder_codec(profile, variant)
+    resources = configured.resource_ids or [
+        resource_id
+        for resource_id in variant_resource_ids(profile, variant)
+        if resource_backend(resource_id) == backend
+    ]
+    if not resources:
+        resources = [CPU_RESOURCE_ID] if backend == BACKEND_CPU else [resource_id_for_backend(backend, 0)]
+    if configured.action in {"copy", "auto"}:
+        backend = BACKEND_CPU
+        encoder = ""
+        resources = [CPU_RESOURCE_ID]
+    preset_default = (
+        variant_setting(profile, variant, "cpu_preset", profile.cpu_preset)
+        if backend == BACKEND_CPU
+        else variant_setting(profile, variant, "preset", profile.preset)
+    )
+    tune_default = (
+        variant_setting(profile, variant, "cpu_tune", profile.cpu_tune)
+        if backend == BACKEND_CPU
+        else variant_setting(profile, variant, "tune", profile.tune)
+    )
+    return StreamEncodingOverride(
+        action=configured.action if configured.action in {"copy", "auto"} else "transcode",
+        backend=backend,
+        ffmpeg_encoder=encoder,
+        resource_ids=resources,
+        height=configured.height if configured.height is not None else variant.height,
+        rate_mode=configured.rate_mode or str(variant_setting(profile, variant, "rate_mode", profile.rate_mode)),
+        cq_value=(
+            configured.cq_value
+            if configured.cq_value is not None
+            else normalize_optional_int(variant_setting(profile, variant, "cq_value", profile.cq_value))
+        ),
+        bitrate=configured.bitrate or str(variant_setting(profile, variant, "bitrate", profile.bitrate)),
+        maxrate=configured.maxrate or str(variant_setting(profile, variant, "maxrate", profile.maxrate)),
+        bufsize=configured.bufsize or str(variant_setting(profile, variant, "bufsize", profile.bufsize)),
+        preset=configured.preset or str(preset_default),
+        tune=configured.tune or str(tune_default),
+        pix_fmt=configured.pix_fmt or output_pix_fmt(profile, variant, resources[0] if resources else ""),
+        scale_flags=configured.scale_flags
+        or str(variant_setting(profile, variant, "scale_flags", profile.scale_flags)),
+        codec=configured.codec,
+        extra_args=configured.extra_args,
+    )
+
+
+def resolve_stream_plan(
+    profile: EncodeProfile,
+    variant: OutputVariant,
+    probe: MediaProbe,
+    file_overrides: Optional[Dict[int, StreamEncodingOverride]] = None,
+) -> ResolvedStreamPlan:
+    overrides = file_overrides or {}
+    video_tasks: List[VideoStreamTask] = []
+    mux_streams: List[ResolvedMuxStream] = []
+    output_ordinals: Dict[str, int] = {kind: 0 for kind in STREAM_KINDS}
+    warnings: List[str] = []
+
+    for stream in probe.streams:
+        rule = matching_stream_rule(variant, stream)
+        if rule is None:
+            warnings.append(f"stream {stream.index} ({stream.codec_type}) に一致するruleがないため除外しました")
+            continue
+        configured = overrides.get(stream.index, rule.encoding)
+        action = configured.action
+        if action == "exclude":
+            continue
+
+        if stream.codec_type == "video" and not stream.attached_pic:
+            settings = resolved_video_settings(profile, variant, configured)
+            video_tasks.append(
+                VideoStreamTask(
+                    input_stream_index=stream.index,
+                    input_ordinal=stream.ordinal,
+                    output_ordinal=len(video_tasks),
+                    source_codec=stream.codec_name,
+                    start_time=stream.start_time,
+                    duration=stream.duration,
+                    settings=settings,
+                    tags=stream.tags,
+                    disposition=stream.disposition,
+                )
+            )
+            output_ordinals["video"] += 1
+            continue
+
+        codec = configured.codec
+        if stream.codec_type == "audio" and not codec:
+            codec = variant_audio_codec(profile, variant)
+        elif action == "auto" and not codec:
+            codec = "copy"
+        mux_action = action
+        if mux_action == "transcode" and not codec:
+            mux_action = "auto"
+        mux_streams.append(
+            ResolvedMuxStream(
+                input_stream_index=stream.index,
+                input_ordinal=stream.ordinal,
+                output_ordinal=output_ordinals.get(stream.codec_type, 0),
+                codec_type=stream.codec_type,
+                source_codec=stream.codec_name,
+                expected_width=stream.width if stream.codec_type == "video" else None,
+                expected_height=stream.height if stream.codec_type == "video" else None,
+                action=mux_action,
+                codec=codec,
+                bitrate=(
+                    configured.bitrate
+                    or (
+                        str(variant_setting(profile, variant, "audio_bitrate", "") or "").strip()
+                        if stream.codec_type == "audio"
+                        else ""
+                    )
+                ),
+                extra_args=configured.extra_args,
+                tags=stream.tags,
+                disposition=stream.disposition,
+            )
+        )
+        output_ordinals[stream.codec_type] = output_ordinals.get(stream.codec_type, 0) + 1
+
+    if not video_tasks:
+        raise ValueError("通常Video streamが1つも選択されていません")
+    cover_ordinal = len(video_tasks)
+    for stream in mux_streams:
+        if stream.codec_type == "video":
+            stream.output_ordinal = cover_ordinal
+            cover_ordinal += 1
+    return ResolvedStreamPlan(
+        source_fingerprint=source_fingerprint(Path(probe.path)),
+        video_tasks=video_tasks,
+        mux_streams=mux_streams,
+        preserve_metadata=variant.preserve_metadata,
+        preserve_chapters=variant.preserve_chapters,
+        source_tags=probe.tags,
+        chapters=probe.chapters,
+        warnings=warnings,
+    )
+
+
 def is_nvenc_codec(codec: str) -> bool:
     return codec.lower().endswith("_nvenc")
 
@@ -1629,6 +2467,10 @@ def build_ffmpeg_command(
     start_seconds: Optional[float] = None,
     duration_seconds: Optional[float] = None,
     resource_id: str = "",
+    input_stream_index: Optional[int] = None,
+    omit_video_encoder: bool = False,
+    copy_video_stream: bool = False,
+    pix_fmt_override: str = "",
 ) -> List[str]:
     cmd: List[str] = [
         str(ffmpeg_path),
@@ -1651,25 +2493,83 @@ def build_ffmpeg_command(
         str(src),
         "-y",
         "-map",
-        "0:v:0",
+        f"0:{input_stream_index}" if input_stream_index is not None else "0:v:0",
         "-an",
-        "-pix_fmt",
-        output_pix_fmt(profile, variant, resource_id),
     ]
-    cmd += build_video_encoder_args(profile, variant, resource_id)
+    if copy_video_stream:
+        cmd += ["-c:v", "copy"]
+    elif not omit_video_encoder:
+        cmd += ["-pix_fmt", pix_fmt_override or output_pix_fmt(profile, variant, resource_id)]
+        cmd += build_video_encoder_args(profile, variant, resource_id)
 
-    if variant.height is not None and variant.height > 0:
+    if not copy_video_stream and variant.height is not None and variant.height > 0:
         scale_flags = str(
             variant_setting(profile, variant, "scale_flags", profile.scale_flags) or "lanczos+accurate_rnd"
         )
         scale = f"scale=-2:{variant.height}:flags={scale_flags}"
         cmd += ["-vf", scale]
 
-    cmd += extra_video_args
+    if not omit_video_encoder and not copy_video_stream:
+        cmd += extra_video_args
     cmd += faststart_args_unless_overridden(variant.container, extra_output_args)
     cmd += extra_output_args
     cmd += [str(tmp_out)]
     return cmd
+
+
+def variant_for_video_task(profile: EncodeProfile, variant: OutputVariant, task: VideoStreamTask) -> OutputVariant:
+    cloned = OutputVariant.from_dict(output_variant_to_dict(variant))
+    settings = task.settings
+    cloned.backend = settings.backend or variant.backend
+    cloned.ffmpeg_encoder = settings.ffmpeg_encoder or variant.ffmpeg_encoder
+    cloned.resource_ids = list(settings.resource_ids or variant.resource_ids)
+    cloned.height = settings.height
+    cloned.rate_mode = settings.rate_mode or variant.rate_mode
+    cloned.cq_value = settings.cq_value
+    cloned.bitrate = settings.bitrate or variant.bitrate
+    cloned.maxrate = settings.maxrate or variant.maxrate
+    cloned.bufsize = settings.bufsize or variant.bufsize
+    cloned.pix_fmt = settings.pix_fmt or variant.pix_fmt
+    cloned.scale_flags = settings.scale_flags or variant.scale_flags
+    if cloned.backend == BACKEND_CPU:
+        cloned.cpu_codec = cloned.ffmpeg_encoder or profile.cpu_codec
+        cloned.cpu_preset = settings.preset or variant.cpu_preset or profile.cpu_preset
+        cloned.cpu_tune = settings.tune or variant.cpu_tune or profile.cpu_tune
+    else:
+        cloned.codec = cloned.ffmpeg_encoder or profile.codec
+        cloned.preset = settings.preset or variant.preset or profile.preset
+        cloned.tune = settings.tune or variant.tune or profile.tune
+    extra_parts = [part for part in (variant.extra_video_args, settings.extra_args) if str(part).strip()]
+    cloned.extra_video_args = " ".join(extra_parts)
+    return cloned
+
+
+def build_video_stream_command(
+    ffmpeg_path: Path,
+    src: Path,
+    tmp_out: Path,
+    profile: EncodeProfile,
+    variant: OutputVariant,
+    task: VideoStreamTask,
+    start_seconds: Optional[float] = None,
+    duration_seconds: Optional[float] = None,
+    resource_id: str = "",
+) -> List[str]:
+    task_variant = variant_for_video_task(profile, variant, task)
+    return build_ffmpeg_command(
+        ffmpeg_path,
+        src,
+        tmp_out,
+        profile,
+        task_variant,
+        start_seconds=start_seconds,
+        duration_seconds=duration_seconds,
+        resource_id=resource_id,
+        input_stream_index=task.input_stream_index,
+        omit_video_encoder=task.use_muxer_default,
+        copy_video_stream=task.settings.action in {"copy", "auto"} and not task.use_muxer_default,
+        pix_fmt_override=task.settings.pix_fmt,
+    )
 
 
 def build_concat_command(
@@ -1763,6 +2663,120 @@ def build_mux_command(
     ]
     cmd += faststart_args_unless_overridden(tmp_out.suffix, extra_args)
     cmd += extra_args
+    cmd += [str(tmp_out)]
+    return cmd
+
+
+def ffmpeg_stream_letter(codec_type: str) -> str:
+    return {
+        "video": "v",
+        "audio": "a",
+        "subtitle": "s",
+        "attachment": "t",
+        "data": "d",
+    }.get(str(codec_type).lower(), str(codec_type)[:1].lower() or "d")
+
+
+def append_stream_attributes(
+    cmd: List[str],
+    codec_type: str,
+    output_ordinal: int,
+    tags: Dict[str, str],
+    disposition: Dict[str, bool],
+) -> None:
+    letter = ffmpeg_stream_letter(codec_type)
+    for key, raw_value in tags.items():
+        if key in VOLATILE_STREAM_METADATA_TAGS:
+            continue
+        value = str(raw_value).strip()
+        if value:
+            cmd += [f"-metadata:s:{letter}:{output_ordinal}", f"{key}={value}"]
+    active = [name for name, enabled in disposition.items() if enabled]
+    cmd += [f"-disposition:{letter}:{output_ordinal}", "+".join(active) if active else "0"]
+
+
+def build_stream_mux_command(
+    ffmpeg_path: Path,
+    video_inputs: List[Path],
+    src: Path,
+    tmp_out: Path,
+    profile: EncodeProfile,
+    variant: OutputVariant,
+    plan: ResolvedStreamPlan,
+    sample_duration: Optional[float] = None,
+) -> List[str]:
+    cmd: List[str] = [str(ffmpeg_path), "-hide_banner"]
+    for index, video_input in enumerate(video_inputs):
+        if index < len(plan.video_tasks) and plan.video_tasks[index].start_time > 0:
+            cmd += ["-itsoffset", format_seconds(plan.video_tasks[index].start_time)]
+        cmd += ["-i", str(video_input)]
+    source_input_index = len(video_inputs)
+    cmd += ["-i", str(src), "-y"]
+
+    for index, task in enumerate(plan.video_tasks):
+        cmd += ["-map", f"{index}:v:0", f"-c:v:{task.output_ordinal}", "copy"]
+
+    for stream in plan.mux_streams:
+        letter = ffmpeg_stream_letter(stream.codec_type)
+        cmd += ["-map", f"{source_input_index}:{stream.input_stream_index}"]
+        codec_option = f"-c:{letter}:{stream.output_ordinal}"
+        if stream.action == "copy" or stream.codec.lower() == "copy":
+            cmd += [codec_option, "copy"]
+        elif stream.codec:
+            cmd += [codec_option, stream.codec]
+        if stream.codec_type == "audio" and stream.action != "copy" and stream.codec.lower() != "copy":
+            audio_bitrate = stream.bitrate or str(variant_setting(profile, variant, "audio_bitrate", "") or "").strip()
+            if audio_bitrate:
+                cmd += [f"-b:a:{stream.output_ordinal}", audio_bitrate]
+        cmd += scope_stream_extra_args(stream.extra_args, stream.codec_type, stream.output_ordinal)
+
+    if plan.preserve_metadata:
+        cmd += ["-map_metadata", str(source_input_index)]
+    else:
+        cmd += ["-map_metadata", "-1"]
+    if plan.preserve_chapters:
+        cmd += ["-map_chapters", str(source_input_index)]
+    else:
+        cmd += ["-map_chapters", "-1"]
+    for task in plan.video_tasks:
+        append_stream_attributes(cmd, "video", task.output_ordinal, task.tags, task.disposition)
+    for stream in plan.mux_streams:
+        append_stream_attributes(cmd, stream.codec_type, stream.output_ordinal, stream.tags, stream.disposition)
+    if sample_duration is not None and sample_duration > 0:
+        cmd += ["-t", format_seconds(sample_duration)]
+    extra_args = parse_ffmpeg_args(variant_setting(profile, variant, "extra_mux_args", ""))
+    cmd += faststart_args_unless_overridden(tmp_out.suffix, extra_args)
+    cmd += extra_args
+    cmd += [str(tmp_out)]
+    return cmd
+
+
+def build_aux_stream_sample_command(
+    ffmpeg_path: Path,
+    src: Path,
+    tmp_out: Path,
+    stream: ResolvedMuxStream,
+    use_muxer_default: bool = False,
+    start_seconds: Optional[float] = None,
+) -> List[str]:
+    cmd = [str(ffmpeg_path), "-hide_banner"]
+    if start_seconds is not None and start_seconds > 0:
+        cmd += ["-ss", format_seconds(max(0.0, start_seconds - 0.1))]
+    cmd += ["-i", str(src), "-y", "-map", f"0:{stream.input_stream_index}"]
+    letter = ffmpeg_stream_letter(stream.codec_type)
+    if not use_muxer_default:
+        if stream.action == "copy" or stream.codec.lower() == "copy":
+            cmd += [f"-c:{letter}", "copy"]
+        elif stream.codec:
+            cmd += [f"-c:{letter}", stream.codec]
+    if stream.codec_type == "audio" and stream.bitrate and (use_muxer_default or stream.codec.lower() != "copy"):
+        cmd += ["-b:a", stream.bitrate]
+    cmd += scope_stream_extra_args(stream.extra_args, stream.codec_type, 0)
+    if stream.codec_type == "video":
+        cmd += ["-frames:v", "1"]
+    elif stream.codec_type != "attachment":
+        cmd += ["-t", "5.000"]
+    append_stream_attributes(cmd, stream.codec_type, 0, stream.tags, stream.disposition)
     cmd += [str(tmp_out)]
     return cmd
 
@@ -1867,6 +2881,182 @@ def probe_duration(ffprobe_path: Path, src: Path) -> Optional[float]:
     return duration
 
 
+def probe_media(ffprobe_path: Path, src: Path) -> MediaProbe:
+    if not ffprobe_path.exists():
+        raise RuntimeError(f"FFprobe unavailable: {ffprobe_path}")
+    try:
+        result = subprocess.run(
+            [
+                str(ffprobe_path),
+                "-v",
+                "error",
+                "-show_format",
+                "-show_streams",
+                "-show_chapters",
+                "-of",
+                "json",
+                str(src),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+            **no_window_subprocess_kwargs(),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"ffprobe media probe failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"ffprobe media probe failed: exit {result.returncode}{suffix}")
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ffprobe media probe returned invalid JSON: {exc}") from exc
+    probe = MediaProbe.from_ffprobe(src, data)
+    if not probe.streams:
+        raise RuntimeError("ffprobe did not report any streams")
+    return probe
+
+
+def probe_stream_first_packet_time(
+    ffprobe_path: Path,
+    src: Path,
+    codec_type: str,
+    ordinal: int,
+) -> Optional[float]:
+    letter = ffmpeg_stream_letter(codec_type)
+    if codec_type == "attachment":
+        return 0.0
+    try:
+        result = subprocess.run(
+            [
+                str(ffprobe_path),
+                "-v",
+                "error",
+                "-select_streams",
+                f"{letter}:{max(0, int(ordinal))}",
+                "-show_packets",
+                "-show_entries",
+                "packet=pts_time",
+                "-read_intervals",
+                "%+#1",
+                "-of",
+                "json",
+                str(src),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+            **no_window_subprocess_kwargs(),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    packets = data.get("packets", []) if isinstance(data, dict) else []
+    if not packets or not isinstance(packets[0], dict):
+        return None
+    return normalize_optional_float(packets[0].get("pts_time"), minimum=0.0)
+
+
+def validate_output_against_plan(
+    ffprobe_path: Path,
+    output_path: Path,
+    plan: ResolvedStreamPlan,
+) -> Tuple[List[str], List[str]]:
+    actual = probe_media(ffprobe_path, output_path)
+    errors: List[str] = []
+    warnings: List[str] = []
+    expected_by_type: Dict[
+        str,
+        List[Tuple[str, Optional[int], Optional[int], Dict[str, str], Dict[str, bool]]],
+    ] = {kind: [] for kind in STREAM_KINDS}
+    for task in plan.video_tasks:
+        expected_by_type["video"].append(
+            (task.expected_codec, task.expected_width, task.expected_height, task.tags, task.disposition)
+        )
+    for stream in plan.mux_streams:
+        expected_by_type.setdefault(stream.codec_type, []).append(
+            (
+                stream.expected_codec,
+                stream.expected_width,
+                stream.expected_height,
+                stream.tags,
+                stream.disposition,
+            )
+        )
+
+    for codec_type, expected_items in expected_by_type.items():
+        actual_items = [stream for stream in actual.streams if stream.codec_type == codec_type]
+        if len(actual_items) != len(expected_items):
+            errors.append(f"{codec_type} stream数: expected={len(expected_items)}, actual={len(actual_items)}")
+            continue
+        for ordinal, (expected_codec, expected_width, expected_height, tags, disposition) in enumerate(expected_items):
+            stream = actual_items[ordinal]
+            if expected_codec and stream.codec_name != expected_codec:
+                errors.append(
+                    f"{codec_type}:{ordinal} codec: expected={expected_codec}, actual={stream.codec_name or '-'}"
+                )
+            if expected_width is not None and stream.width != expected_width:
+                errors.append(f"{codec_type}:{ordinal} width: expected={expected_width}, actual={stream.width or '-'}")
+            if expected_height is not None and stream.height != expected_height:
+                errors.append(
+                    f"{codec_type}:{ordinal} height: expected={expected_height}, actual={stream.height or '-'}"
+                )
+            for key in ("language", "title"):
+                expected_value = str(tags.get(key, "")).strip()
+                if expected_value and stream.tags.get(key, "") != expected_value:
+                    errors.append(
+                        f"{codec_type}:{ordinal} {key}: expected={expected_value}, actual={stream.tags.get(key, '-') or '-'}"
+                    )
+            for key, expected_value in tags.items():
+                if key in {"language", "title"} or key in VOLATILE_STREAM_METADATA_TAGS:
+                    continue
+                if expected_value and stream.tags.get(key) != expected_value:
+                    warnings.append(f"{codec_type}:{ordinal} metadata {key} は保持されませんでした")
+            expected_dispositions = {name for name, enabled in disposition.items() if enabled}
+            actual_dispositions = {name for name, enabled in stream.disposition.items() if enabled}
+            if actual_dispositions != expected_dispositions:
+                errors.append(
+                    f"{codec_type}:{ordinal} disposition: "
+                    f"expected={','.join(sorted(expected_dispositions)) or '-'}, "
+                    f"actual={','.join(sorted(actual_dispositions)) or '-'}"
+                )
+
+    if plan.preserve_chapters:
+        if len(actual.chapters) != len(plan.chapters):
+            errors.append(f"chapter数: expected={len(plan.chapters)}, actual={len(actual.chapters)}")
+        else:
+            for index, expected in enumerate(plan.chapters):
+                actual_chapter = actual.chapters[index]
+                if abs(actual_chapter.start_time - expected.start_time) > 0.05:
+                    errors.append(f"chapter:{index} start_timeが保持されていません")
+                if abs(actual_chapter.end_time - expected.end_time) > 0.05:
+                    errors.append(f"chapter:{index} end_timeが保持されていません")
+                title = expected.tags.get("title", "")
+                if title and actual_chapter.tags.get("title", "") != title:
+                    errors.append(f"chapter:{index} titleが保持されていません")
+    if plan.preserve_metadata:
+        for key, value in plan.source_tags.items():
+            if key in {"encoder", "duration", "compatible_brands", "major_brand", "minor_version"}:
+                continue
+            if value and actual.tags.get(key) != value:
+                warnings.append(f"metadata {key} は出力コンテナで保持されませんでした")
+    return errors, warnings
+
+
 def probe_has_audio(ffprobe_path: Path, src: Path) -> bool:
     if not ffprobe_path.exists():
         return False
@@ -1956,6 +3146,9 @@ def job_fingerprint(profile: EncodeProfile, variant: OutputVariant) -> str:
         "extra_output_args": variant_setting(profile, variant, "extra_output_args", ""),
         "extra_concat_args": variant_setting(profile, variant, "extra_concat_args", ""),
         "extra_mux_args": variant_setting(profile, variant, "extra_mux_args", ""),
+        "stream_rules": [asdict(rule) for rule in variant.stream_rules],
+        "preserve_metadata": variant.preserve_metadata,
+        "preserve_chapters": variant.preserve_chapters,
     }
     encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:10]
@@ -1993,6 +3186,17 @@ def segment_dir_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant:
     return paths.tmp_dir / "segments" / job_key(src, profile, variant)
 
 
+def stream_segment_dir_for(
+    paths: AppPaths,
+    src: Path,
+    profile: EncodeProfile,
+    variant: OutputVariant,
+    task: VideoStreamTask,
+    plan: ResolvedStreamPlan,
+) -> Path:
+    return segment_dir_for(paths, src, profile, variant) / (f"video-{task.input_stream_index:03d}-{plan.fingerprint()}")
+
+
 def segment_file_name(
     variant: OutputVariant,
     index: int,
@@ -2012,6 +3216,20 @@ def segment_file_name(
 def joined_video_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant) -> Path:
     container = normalize_container_extension(variant.container)
     return paths.tmp_dir / f"{job_key(src, profile, variant)}.video.{container}"
+
+
+def stream_joined_video_path_for(
+    paths: AppPaths,
+    src: Path,
+    profile: EncodeProfile,
+    variant: OutputVariant,
+    task: VideoStreamTask,
+    plan: ResolvedStreamPlan,
+) -> Path:
+    container = normalize_container_extension(variant.container)
+    return paths.tmp_dir / (
+        f"{job_key(src, profile, variant)}.video-{task.input_stream_index:03d}-{plan.fingerprint()}.{container}"
+    )
 
 
 def temp_audio_path_for(paths: AppPaths, src: Path, profile: EncodeProfile, variant: OutputVariant) -> Path:
@@ -2040,7 +3258,7 @@ def escape_concat_path(path: Path) -> str:
 def save_state(paths: AppPaths, profile: EncodeProfile, specs: List[JobSpec]) -> None:
     ensure_dirs(paths)
     data = {
-        "version": 3,
+        "version": 4,
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "profile": profile_to_dict(profile),
         "jobs": [asdict(spec) for spec in specs],
@@ -2081,6 +3299,7 @@ def resumable_specs(profile: EncodeProfile, data: Dict[str, Any]) -> List[JobSpe
                 variant_id=str(item["variant_id"]),
                 assigned_resource_id=str(item.get("assigned_resource_id", "")),
                 assigned_slot=normalize_int(item.get("assigned_slot", 0), minimum=0, default=0),
+                resolved_stream_plan=ResolvedStreamPlan.from_dict(item.get("resolved_stream_plan")),
             )
         except KeyError:
             continue

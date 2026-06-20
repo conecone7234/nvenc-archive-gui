@@ -13,7 +13,11 @@ Windows native GUI encoder for FFmpeg/NVENC archive jobs.
 - Detected hardware resources by default, with advanced manual GPU resource registration when needed
 - Segment parallelism follows the selected resource's slot count
 - One-source-at-a-time processing order, with each source's output profiles completed before the next source starts
-- Video-only segment encoding, video concat, source audio processing once, then final video/audio mux
+- FFprobe-based inventory and preflight for every video, audio, subtitle, attachment, data, chapter, and metadata stream
+- Ordered stream rules per output profile plus persistent per-file overrides from the progress list
+- Every normal video stream is encoded as an independently resumable child job, then all selected streams are muxed into one output
+- Container compatibility fallback through the local FFmpeg muxer default, with confirmation before encoding
+- Post-mux verification of stream counts, codecs, chapters, language/title metadata, and dispositions
 - Automatic FFmpeg and FFprobe install when the bundled executables are missing
 - Segment-based fault tolerance: completed time slices are kept and unfinished work can be resumed
 - Source files move to the archive folder only after all requested outputs are complete
@@ -38,6 +42,7 @@ work-folder
 |-- profiles.json
 `-- tmp
     |-- encoder_state.json
+    |-- stream_overrides.json
     |-- logs
     `-- segments
 ```
@@ -47,12 +52,14 @@ Folders are created when the setting is executed, not at app startup.
 ## Resume Behavior
 
 The app does not pause an active video encoder process in the middle of a write.
-Instead, each output profile is encoded as fixed-duration video-only segments.
+Instead, each normal video stream in an output profile is encoded as fixed-duration video-only segments.
 The segment length is configured per output profile, with the setting default used
 when the output profile leaves it blank. Segments for one output profile can run
-in parallel according to the selected resource's slot count. After the video
-segments are concatenated, audio is processed once from the original source and
-muxed with the joined video. Pause waits before launching more segments, and the
+in parallel according to the selected resource's slot count. Each video stream
+may use its own encoder, backend, and resource. After every video stream is
+concatenated, the selected audio, subtitle, cover, attachment, and data streams
+are muxed with chapters and metadata. The output is FFprobe-validated before it
+replaces the final file. Pause waits before launching more segments, and the
 primary run button changes to Resume while resumable state exists. Stop is the
 explicit restart path: it clears the saved state and removes temporary segment
 files for the current run.

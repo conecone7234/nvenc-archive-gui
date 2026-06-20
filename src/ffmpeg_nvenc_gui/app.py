@@ -29,17 +29,25 @@ try:
         GpuInfo,
         HardwareResource,
         JobSpec,
+        MediaProbe,
+        MediaStream,
         OutputVariant,
+        ResolvedStreamPlan,
+        StreamEncodingOverride,
+        StreamRule,
+        StreamSelector,
+        VideoStreamTask,
         audio_containers_for_codec,
-        build_audio_command,
+        build_aux_stream_sample_command,
         build_concat_command,
-        build_ffmpeg_command,
         build_job_specs,
-        build_mux_command,
         build_paths,
+        build_stream_mux_command,
+        build_video_stream_command,
         clear_state,
         command_to_text,
         default_profile,
+        default_stream_rules,
         detect_gpus,
         duplicate_output_targets,
         duplicate_output_targets_for_outputs,
@@ -51,6 +59,7 @@ try:
         joined_video_path_for,
         load_profiles,
         load_state,
+        load_stream_overrides,
         missing_profile_dirs,
         missing_rate_fields,
         new_id,
@@ -61,11 +70,13 @@ try:
         normalize_profile_gpu,
         output_path_for,
         parse_ffmpeg_time,
-        probe_duration,
-        probe_has_audio,
+        probe_media,
+        probe_stream_first_packet_time,
         profile_archive_dir,
         profile_from_state,
         profile_input_dir,
+        remove_stream_overrides_for_source,
+        resolve_stream_plan,
         resource_backend,
         resource_id_for_backend,
         resource_index,
@@ -73,12 +84,19 @@ try:
         safe_folder_name,
         save_profiles,
         save_state,
+        save_stream_overrides,
         scan_profile_files,
         segment_dir_for,
         segment_file_name,
         segment_ranges,
+        source_fingerprint,
+        stream_joined_video_path_for,
+        stream_segment_dir_for,
         temp_audio_path_for,
         temp_output_path_for,
+        validate_output_against_plan,
+        validate_stream_rules,
+        variant_audio_codec,
         variant_by_id,
         variant_resource_ids,
         variant_segment_minutes,
@@ -105,17 +123,25 @@ except ModuleNotFoundError:
         GpuInfo,
         HardwareResource,
         JobSpec,
+        MediaProbe,
+        MediaStream,
         OutputVariant,
+        ResolvedStreamPlan,
+        StreamEncodingOverride,
+        StreamRule,
+        StreamSelector,
+        VideoStreamTask,
         audio_containers_for_codec,
-        build_audio_command,
+        build_aux_stream_sample_command,
         build_concat_command,
-        build_ffmpeg_command,
         build_job_specs,
-        build_mux_command,
         build_paths,
+        build_stream_mux_command,
+        build_video_stream_command,
         clear_state,
         command_to_text,
         default_profile,
+        default_stream_rules,
         detect_gpus,
         duplicate_output_targets,
         duplicate_output_targets_for_outputs,
@@ -127,6 +153,7 @@ except ModuleNotFoundError:
         joined_video_path_for,
         load_profiles,
         load_state,
+        load_stream_overrides,
         missing_profile_dirs,
         missing_rate_fields,
         new_id,
@@ -137,11 +164,13 @@ except ModuleNotFoundError:
         normalize_profile_gpu,
         output_path_for,
         parse_ffmpeg_time,
-        probe_duration,
-        probe_has_audio,
+        probe_media,
+        probe_stream_first_packet_time,
         profile_archive_dir,
         profile_from_state,
         profile_input_dir,
+        remove_stream_overrides_for_source,
+        resolve_stream_plan,
         resource_backend,
         resource_id_for_backend,
         resource_index,
@@ -149,12 +178,19 @@ except ModuleNotFoundError:
         safe_folder_name,
         save_profiles,
         save_state,
+        save_stream_overrides,
         scan_profile_files,
         segment_dir_for,
         segment_file_name,
         segment_ranges,
+        source_fingerprint,
+        stream_joined_video_path_for,
+        stream_segment_dir_for,
         temp_audio_path_for,
         temp_output_path_for,
+        validate_output_against_plan,
+        validate_stream_rules,
+        variant_audio_codec,
         variant_by_id,
         variant_resource_ids,
         variant_segment_minutes,
@@ -533,6 +569,9 @@ class OutputEditorSession:
         self.extra_output_args_var = tk.StringVar(master=app.root)
         self.extra_concat_args_var = tk.StringVar(master=app.root)
         self.extra_mux_args_var = tk.StringVar(master=app.root)
+        self.preserve_metadata_var = tk.BooleanVar(master=app.root, value=True)
+        self.preserve_chapters_var = tk.BooleanVar(master=app.root, value=True)
+        self.stream_rules: List[StreamRule] = []
 
         if variant is None:
             self.load_defaults(profile)
@@ -582,6 +621,9 @@ class OutputEditorSession:
         self.extra_output_args_var.set("")
         self.extra_concat_args_var.set("")
         self.extra_mux_args_var.set("")
+        self.preserve_metadata_var.set(True)
+        self.preserve_chapters_var.set(True)
+        self.stream_rules = [StreamRule.from_dict(asdict(rule)) for rule in default_stream_rules()]
         selected = [rid for rid in profile.resource_ids if resource_backend(rid) == default_backend]
         self.set_resource_selection(profile, default_backend, selected)
 
@@ -631,6 +673,9 @@ class OutputEditorSession:
         self.extra_output_args_var.set(variant.extra_output_args)
         self.extra_concat_args_var.set(variant.extra_concat_args)
         self.extra_mux_args_var.set(variant.extra_mux_args)
+        self.preserve_metadata_var.set(variant.preserve_metadata)
+        self.preserve_chapters_var.set(variant.preserve_chapters)
+        self.stream_rules = [StreamRule.from_dict(asdict(rule)) for rule in variant.stream_rules]
         self.set_resource_selection(profile, backend, list(variant.resource_ids))
 
     def set_resource_selection(self, profile: EncodeProfile, backend: str, selected: List[str]) -> None:
@@ -683,6 +728,9 @@ class OutputEditorSession:
             self.extra_output_args_var.get(),
             self.extra_concat_args_var.get(),
             self.extra_mux_args_var.get(),
+            self.preserve_metadata_var.get(),
+            self.preserve_chapters_var.get(),
+            tuple(str(asdict(rule)) for rule in self.stream_rules),
             tuple(sorted(self.selected_resource_ids())),
         )
 
@@ -951,9 +999,11 @@ class OutputEditorSession:
         tabs.pack(fill=tk.BOTH, expand=True)
         video_tab = ttk.Frame(tabs, padding=10, style="App.TFrame")
         audio_tab = ttk.Frame(tabs, padding=10, style="App.TFrame")
+        stream_tab = ttk.Frame(tabs, padding=10, style="App.TFrame")
         ffmpeg_tab = ttk.Frame(tabs, padding=10, style="App.TFrame")
         tabs.add(video_tab, text="映像")
         tabs.add(audio_tab, text="音声")
+        tabs.add(stream_tab, text="ストリーム")
         tabs.add(ffmpeg_tab, text="FFmpeg")
 
         self.engine_panel_container = ttk.Frame(video_tab, style="App.TFrame")
@@ -1033,15 +1083,59 @@ class OutputEditorSession:
         )
         self.audio_codec_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_audio_container_choices())
         self.app._dialog_entry(audio, "Audio bitrate", self.audio_bitrate_var, 1, 1)
-        self.audio_container_combo = self.app._dialog_search_combo(
-            audio,
-            "一時音声コンテナ",
-            self.audio_container_var,
-            audio_containers_for_codec(self.audio_codec_var.get()),
-            2,
-            0,
+
+        stream_surface = self.app._dialog_surface(stream_tab, "stream rule（上から最初に一致した設定を使用）")
+        stream_surface.pack(fill=tk.BOTH, expand=True)
+        policy_row = ttk.Frame(stream_surface, style="Surface.TFrame")
+        policy_row.grid(row=1, column=0, columnspan=4, sticky=tk.EW, pady=(0, 8))
+        ttk.Checkbutton(
+            policy_row,
+            text="metadataを保持",
+            variable=self.preserve_metadata_var,
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            policy_row,
+            text="chapterを保持",
+            variable=self.preserve_chapters_var,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        columns = ("name", "selector", "action", "encoding")
+        self.stream_rules_tree = ttk.Treeview(stream_surface, columns=columns, show="headings", height=11)
+        for key, text, width in [
+            ("name", "名前", 150),
+            ("selector", "条件", 230),
+            ("action", "処理", 80),
+            ("encoding", "変換設定", 190),
+        ]:
+            self.stream_rules_tree.heading(key, text=text)
+            self.stream_rules_tree.column(key, width=width, anchor=tk.W)
+        self.stream_rules_tree.grid(row=2, column=0, columnspan=4, sticky=tk.NSEW)
+        self.stream_rules_tree.bind("<Double-1>", lambda _event: self.edit_selected_stream_rule())
+        stream_surface.rowconfigure(2, weight=1)
+        stream_surface.columnconfigure(0, weight=1)
+        rule_buttons = ttk.Frame(stream_surface, style="Surface.TFrame")
+        rule_buttons.grid(row=3, column=0, columnspan=4, sticky=tk.EW, pady=(8, 0))
+        ttk.Button(rule_buttons, text="追加", width=6, command=self.add_stream_rule).pack(side=tk.LEFT)
+        ttk.Button(rule_buttons, text="編集", width=6, command=self.edit_selected_stream_rule).pack(
+            side=tk.LEFT, padx=(6, 0)
         )
-        self.audio_container_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_audio_container_choices())
+        ttk.Button(rule_buttons, text="削除", width=6, command=self.delete_selected_stream_rule).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        ttk.Button(rule_buttons, text="↑", width=3, command=lambda: self.move_stream_rule(-1)).pack(
+            side=tk.LEFT, padx=(12, 0)
+        )
+        ttk.Button(rule_buttons, text="↓", width=3, command=lambda: self.move_stream_rule(1)).pack(
+            side=tk.LEFT, padx=(4, 0)
+        )
+        ttk.Button(rule_buttons, text="既定へ戻す", width=10, command=self.reset_stream_rules).pack(side=tk.RIGHT)
+        ttk.Button(
+            rule_buttons,
+            text="Incomingを検証",
+            width=14,
+            style="Accent.TButton",
+            command=self.validate_incoming_streams,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+        self.refresh_stream_rules_tree()
 
         ffmpeg = self.app._dialog_surface(ffmpeg_tab, "追加引数")
         ffmpeg.pack(fill=tk.X)
@@ -1059,6 +1153,217 @@ class OutputEditorSession:
         self.update_audio_container_choices()
         self.update_resolution_controls()
         self.update_encoder_controls()
+
+    @staticmethod
+    def _stream_rule_selector_text(rule: StreamRule) -> str:
+        selector = rule.selector
+        parts = [selector.kind]
+        if selector.kind == "video" and selector.attached_pic is not None:
+            parts.append("attached_pic" if selector.attached_pic else "通常")
+        if selector.ordinal is not None:
+            parts.append(f"#{selector.ordinal}")
+        if selector.codec_names:
+            parts.append("codec=" + ",".join(selector.codec_names))
+        if selector.languages:
+            parts.append("lang=" + ",".join(selector.languages))
+        if selector.title_contains:
+            parts.append("title~" + selector.title_contains)
+        if selector.dispositions:
+            parts.append("disp=" + ",".join(selector.dispositions))
+        return " / ".join(parts)
+
+    def refresh_stream_rules_tree(self, selected_id: str = "") -> None:
+        tree = getattr(self, "stream_rules_tree", None)
+        if not self.app._widget_exists(tree):
+            return
+        tree.delete(*tree.get_children())
+        for rule in self.stream_rules:
+            encoding = rule.encoding
+            detail_parts = [part for part in (encoding.ffmpeg_encoder, encoding.codec, encoding.backend) if part]
+            tree.insert(
+                "",
+                tk.END,
+                iid=rule.id,
+                values=(
+                    rule.name,
+                    self._stream_rule_selector_text(rule),
+                    encoding.action,
+                    " / ".join(detail_parts) or "inherit/auto",
+                ),
+            )
+        if selected_id and tree.exists(selected_id):
+            tree.selection_set(selected_id)
+            tree.see(selected_id)
+
+    def add_stream_rule(self) -> None:
+        self.open_stream_rule_editor(None)
+
+    def edit_selected_stream_rule(self) -> None:
+        tree = getattr(self, "stream_rules_tree", None)
+        selection = tree.selection() if self.app._widget_exists(tree) else ()
+        if selection:
+            self.open_stream_rule_editor(str(selection[0]))
+
+    def delete_selected_stream_rule(self) -> None:
+        tree = getattr(self, "stream_rules_tree", None)
+        selection = tree.selection() if self.app._widget_exists(tree) else ()
+        if not selection:
+            return
+        rule_id = str(selection[0])
+        self.stream_rules = [rule for rule in self.stream_rules if rule.id != rule_id]
+        self.refresh_stream_rules_tree()
+
+    def move_stream_rule(self, delta: int) -> None:
+        tree = getattr(self, "stream_rules_tree", None)
+        selection = tree.selection() if self.app._widget_exists(tree) else ()
+        if not selection:
+            return
+        rule_id = str(selection[0])
+        index = next((idx for idx, rule in enumerate(self.stream_rules) if rule.id == rule_id), -1)
+        target = index + delta
+        if index < 0 or target < 0 or target >= len(self.stream_rules):
+            return
+        self.stream_rules[index], self.stream_rules[target] = self.stream_rules[target], self.stream_rules[index]
+        self.refresh_stream_rules_tree(rule_id)
+
+    def reset_stream_rules(self) -> None:
+        self.stream_rules = [StreamRule.from_dict(asdict(rule)) for rule in default_stream_rules()]
+        self.refresh_stream_rules_tree()
+
+    def open_stream_rule_editor(self, rule_id: Optional[str]) -> None:
+        existing = next((rule for rule in self.stream_rules if rule.id == rule_id), None)
+        rule = StreamRule.from_dict(asdict(existing)) if existing else StreamRule()
+        dialog = tk.Toplevel(self.advanced_window or self.dialog or self.app.root)
+        dialog.title("stream rule")
+        dialog.transient(self.advanced_window or self.dialog or self.app.root)
+        dialog.geometry("760x680")
+        dialog.configure(bg=self.app.colors["bg"])
+        shell = ttk.Frame(dialog, style="App.TFrame")
+        shell.pack(fill=tk.BOTH, expand=True)
+        body = self.app._scrollable_tab(shell)
+
+        name_var = tk.StringVar(value=rule.name)
+        kind_var = tk.StringVar(value=rule.selector.kind)
+        ordinal_var = tk.StringVar(value="" if rule.selector.ordinal is None else str(rule.selector.ordinal))
+        codec_names_var = tk.StringVar(value=",".join(rule.selector.codec_names))
+        languages_var = tk.StringVar(value=",".join(rule.selector.languages))
+        title_var = tk.StringVar(value=rule.selector.title_contains)
+        dispositions_var = tk.StringVar(value=",".join(rule.selector.dispositions))
+        attached_var = tk.StringVar(
+            value="任意"
+            if rule.selector.attached_pic is None
+            else ("attached_pic" if rule.selector.attached_pic else "通常Video")
+        )
+        action_var = tk.StringVar(value=rule.encoding.action)
+        backend_var = tk.StringVar(value=rule.encoding.backend)
+        encoder_var = tk.StringVar(value=rule.encoding.ffmpeg_encoder)
+        resources_var = tk.StringVar(value=",".join(rule.encoding.resource_ids))
+        height_var = tk.StringVar(value="" if rule.encoding.height is None else str(rule.encoding.height))
+        rate_var = tk.StringVar(value=rule.encoding.rate_mode)
+        cq_var = tk.StringVar(value="" if rule.encoding.cq_value is None else str(rule.encoding.cq_value))
+        bitrate_var = tk.StringVar(value=rule.encoding.bitrate)
+        maxrate_var = tk.StringVar(value=rule.encoding.maxrate)
+        bufsize_var = tk.StringVar(value=rule.encoding.bufsize)
+        preset_var = tk.StringVar(value=rule.encoding.preset)
+        tune_var = tk.StringVar(value=rule.encoding.tune)
+        pix_fmt_var = tk.StringVar(value=rule.encoding.pix_fmt)
+        scale_var = tk.StringVar(value=rule.encoding.scale_flags)
+        codec_var = tk.StringVar(value=rule.encoding.codec)
+        extra_var = tk.StringVar(value=rule.encoding.extra_args)
+
+        selector_frame = self.app._dialog_surface(body, "照合条件（空欄は任意）")
+        selector_frame.pack(fill=tk.X, padx=12, pady=(12, 6))
+        self.app._dialog_entry(selector_frame, "名前", name_var, 1, 0)
+        self.app._dialog_combo(
+            selector_frame, "種別", kind_var, sorted({"video", "audio", "subtitle", "attachment", "data"}), 1, 1
+        )
+        self.app._dialog_entry(selector_frame, "stream順(0始まり)", ordinal_var, 2, 0)
+        self.app._dialog_combo(selector_frame, "Video分類", attached_var, ["任意", "通常Video", "attached_pic"], 2, 1)
+        self.app._dialog_entry(selector_frame, "入力codec（カンマ区切り）", codec_names_var, 3, 0)
+        self.app._dialog_entry(selector_frame, "language（カンマ区切り）", languages_var, 3, 1)
+        self.app._dialog_entry(selector_frame, "titleに含む文字", title_var, 4, 0)
+        self.app._dialog_entry(selector_frame, "disposition（カンマ区切り）", dispositions_var, 4, 1)
+
+        encode_frame = self.app._dialog_surface(body, "処理・変換設定（空欄は出力設定を継承）")
+        encode_frame.pack(fill=tk.X, padx=12, pady=6)
+        self.app._dialog_combo(encode_frame, "処理", action_var, ["transcode", "copy", "auto", "exclude"], 1, 0)
+        self.app._dialog_combo(
+            encode_frame, "Backend", backend_var, ["", BACKEND_CPU, BACKEND_NVENC, BACKEND_QSV, BACKEND_AMF], 1, 1
+        )
+        self.app._dialog_entry(encode_frame, "Video encoder", encoder_var, 2, 0)
+        self.app._dialog_entry(encode_frame, "resource_ids（カンマ区切り）", resources_var, 2, 1)
+        self.app._dialog_entry(encode_frame, "高さ", height_var, 3, 0)
+        self.app._dialog_entry(encode_frame, "Audio/Subtitle codec", codec_var, 3, 1)
+        self.app._dialog_combo(encode_frame, "Rate", rate_var, ["", "CQ", "VBR", "ABR", "CBR"], 4, 0)
+        self.app._dialog_entry(encode_frame, "CQ/CRF", cq_var, 4, 1)
+        self.app._dialog_entry(encode_frame, "Bitrate", bitrate_var, 5, 0)
+        self.app._dialog_entry(encode_frame, "Maxrate", maxrate_var, 5, 1)
+        self.app._dialog_entry(encode_frame, "Bufsize", bufsize_var, 6, 0)
+        self.app._dialog_entry(encode_frame, "Preset", preset_var, 6, 1)
+        self.app._dialog_entry(encode_frame, "Tune", tune_var, 7, 0)
+        self.app._dialog_entry(encode_frame, "Pix fmt", pix_fmt_var, 7, 1)
+        self.app._dialog_entry(encode_frame, "Scale flags", scale_var, 8, 0)
+        self.app._dialog_entry(encode_frame, "stream別追加引数", extra_var, 8, 1)
+
+        buttons = ttk.Frame(body, style="App.TFrame")
+        buttons.pack(fill=tk.X, padx=12, pady=(8, 14))
+
+        def apply_rule() -> None:
+            try:
+                ordinal = int(ordinal_var.get()) if ordinal_var.get().strip() else None
+                height = int(height_var.get()) if height_var.get().strip() else None
+                cq_value = int(cq_var.get()) if cq_var.get().strip() else None
+            except ValueError:
+                messagebox.showerror("入力エラー", "stream順、高さ、CQ/CRFは整数で入力してください。", parent=dialog)
+                return
+            attached = {"任意": None, "通常Video": False, "attached_pic": True}[attached_var.get()]
+            updated = StreamRule(
+                id=rule.id,
+                name=name_var.get().strip(),
+                selector=StreamSelector(
+                    kind=kind_var.get(),
+                    ordinal=ordinal,
+                    codec_names=codec_names_var.get(),
+                    languages=languages_var.get(),
+                    title_contains=title_var.get(),
+                    dispositions=dispositions_var.get(),
+                    attached_pic=attached,
+                ),
+                encoding=StreamEncodingOverride(
+                    action=action_var.get(),
+                    backend=backend_var.get(),
+                    ffmpeg_encoder=encoder_var.get(),
+                    resource_ids=resources_var.get().split(","),
+                    height=height,
+                    rate_mode=rate_var.get(),
+                    cq_value=cq_value,
+                    bitrate=bitrate_var.get(),
+                    maxrate=maxrate_var.get(),
+                    bufsize=bufsize_var.get(),
+                    preset=preset_var.get(),
+                    tune=tune_var.get(),
+                    pix_fmt=pix_fmt_var.get(),
+                    scale_flags=scale_var.get(),
+                    codec=codec_var.get(),
+                    extra_args=extra_var.get(),
+                ),
+            )
+            index = next((idx for idx, item in enumerate(self.stream_rules) if item.id == updated.id), -1)
+            if index >= 0:
+                self.stream_rules[index] = updated
+            else:
+                self.stream_rules.insert(0, updated)
+            self.refresh_stream_rules_tree(updated.id)
+            dialog.destroy()
+
+        ttk.Button(buttons, text="適用", style="Accent.TButton", command=apply_rule).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="キャンセル", command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+
+    def validate_incoming_streams(self) -> None:
+        variant = self.build_variant()
+        profile = self.profile()
+        if variant is not None and profile is not None:
+            self.app.validate_variant_incoming(profile, variant, self.advanced_window or self.dialog)
 
     def _set_grid_pair_visible(self, widget: object, visible: bool) -> None:
         self.app._set_grid_pair_visible(widget, visible)
@@ -1316,12 +1621,35 @@ class OutputEditorSession:
             extra_output_args=self.extra_output_args_var.get().strip(),
             extra_concat_args=self.extra_concat_args_var.get().strip(),
             extra_mux_args=self.extra_mux_args_var.get().strip(),
+            stream_rules=[StreamRule.from_dict(asdict(rule)) for rule in self.stream_rules],
+            preserve_metadata=self.preserve_metadata_var.get(),
+            preserve_chapters=self.preserve_chapters_var.get(),
         )
         missing = missing_rate_fields(profile, variant)
         if missing:
             messagebox.showerror(
                 "入力エラー", f"{variant.name}: {', '.join(missing)} を入力してください。", parent=self.dialog
             )
+            return None
+        stream_errors = validate_stream_rules(variant)
+        known_resources = {resource.id for resource in profile.hardware_resources}
+        for rule in variant.stream_rules:
+            unknown = [resource_id for resource_id in rule.encoding.resource_ids if resource_id not in known_resources]
+            if unknown:
+                stream_errors.append(f"{rule.name}: 未登録resource: {', '.join(unknown)}")
+            if rule.encoding.backend and rule.encoding.rate_mode:
+                if not backend_accepts_rate_mode(rule.encoding.backend, rule.encoding.rate_mode):
+                    stream_errors.append(
+                        f"{rule.name}: {rule.encoding.backend}では{rule.encoding.rate_mode}を使用できません"
+                    )
+        if stream_errors:
+            messagebox.showerror(
+                "入力エラー",
+                "stream設定を修正してください。\n" + "\n".join(stream_errors),
+                parent=self.advanced_window or self.dialog,
+            )
+            return None
+        if not self.app.validate_variant_static(profile, variant, self.dialog):
             return None
         return variant
 
@@ -1437,6 +1765,7 @@ class EncoderApp:
         self.active_resource_slot_indexes: Dict[str, set[int]] = {}
         self.encoder_capabilities: Dict[str, Dict[str, object]] = {}
         self.encoder_smoke_cache: Dict[tuple[str, str, str], tuple[bool, str]] = {}
+        self.preflight_cache: Dict[str, ResolvedStreamPlan] = {}
 
         self.lock = threading.Lock()
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -1940,6 +2269,13 @@ class EncoderApp:
         self.progress_tree.bind("<ButtonPress-1>", self.on_progress_drag_start, add="+")
         self.progress_tree.bind("<B1-Motion>", self.on_progress_drag_motion, add="+")
         self.progress_tree.bind("<ButtonRelease-1>", self.on_progress_drag_end, add="+")
+        self.progress_tree.bind("<Double-1>", self.open_selected_file_stream_settings, add="+")
+        self.progress_tree.bind("<Button-3>", self.on_progress_context_menu, add="+")
+        self.progress_context_menu = tk.Menu(self.root, tearoff=False)
+        self.progress_context_menu.add_command(
+            label="stream設定",
+            command=self.open_selected_file_stream_settings,
+        )
 
         log_box = self._surface(tab)
         log_box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
@@ -3217,6 +3553,27 @@ class EncoderApp:
         for variant in profile.outputs:
             if not variant.enabled:
                 continue
+            stream_errors = validate_stream_rules(variant)
+            known_resources = {resource.id for resource in profile.hardware_resources}
+            for rule in variant.stream_rules:
+                unknown = [
+                    resource_id for resource_id in rule.encoding.resource_ids if resource_id not in known_resources
+                ]
+                if unknown:
+                    stream_errors.append(f"{rule.name}: 未登録resource: {', '.join(unknown)}")
+                if rule.encoding.backend and rule.encoding.rate_mode:
+                    if not backend_accepts_rate_mode(rule.encoding.backend, rule.encoding.rate_mode):
+                        stream_errors.append(
+                            f"{rule.name}: {rule.encoding.backend}では{rule.encoding.rate_mode}を使用できません"
+                        )
+            if stream_errors:
+                messagebox.showerror(
+                    "入力エラー",
+                    f"{variant.name}: stream設定を修正してください。\n" + "\n".join(stream_errors),
+                )
+                return False
+            if not self.validate_variant_static(profile, variant):
+                return None
             resources = variant_resource_ids(profile, variant)
             if not resources:
                 messagebox.showerror("入力エラー", f"{variant.name}: 使用可能なリソースを選択してください。")
@@ -3936,6 +4293,241 @@ class EncoderApp:
         self._progress_drag_id = None
         self._progress_drag_moved = False
 
+    def on_progress_context_menu(self, event: tk.Event) -> str:
+        row_id = self.progress_tree.identify_row(event.y)
+        if row_id:
+            self.progress_tree.selection_set(row_id)
+        try:
+            self.progress_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.progress_context_menu.grab_release()
+        return "break"
+
+    def open_selected_file_stream_settings(self, _event: Optional[tk.Event] = None) -> None:
+        if self.running or self.preparing:
+            messagebox.showwarning("変更できません", "実行開始後のstream計画は変更できません。")
+            return
+        selection = self.progress_tree.selection()
+        if not selection:
+            return
+        key = self.progress_row_keys.get(str(selection[0]))
+        if key is None:
+            return
+        source, variant_id = key
+        profile = self.current_profile()
+        try:
+            variant = variant_by_id(profile, variant_id)
+            src = Path(source)
+            probe = probe_media(self.paths.ffprobe_path, src)
+        except Exception as exc:
+            messagebox.showerror("stream取得エラー", str(exc))
+            return
+        overrides = load_stream_overrides(self.paths, src, profile.id, variant.id)
+        self._show_file_stream_dialog(profile, variant, src, probe, overrides)
+
+    def _show_file_stream_dialog(
+        self,
+        profile: EncodeProfile,
+        variant: OutputVariant,
+        src: Path,
+        probe: MediaProbe,
+        overrides: Dict[int, StreamEncodingOverride],
+    ) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"stream設定 - {src.name} / {variant.name}")
+        dialog.transient(self.root)
+        dialog.geometry("920x520")
+        dialog.configure(bg=self.colors["bg"])
+        body = ttk.Frame(dialog, padding=12, style="App.TFrame")
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            body,
+            text="このファイルと出力プロファイルだけに適用します。設定は処理完了まで保持されます。",
+            style="Muted.TLabel",
+        ).pack(anchor=tk.W, pady=(0, 8))
+        columns = ("index", "type", "codec", "language", "title", "action", "setting")
+        tree = ttk.Treeview(body, columns=columns, show="headings", height=15)
+        for key, text, width in [
+            ("index", "index", 55),
+            ("type", "種別", 90),
+            ("codec", "入力codec", 105),
+            ("language", "language", 80),
+            ("title", "title", 150),
+            ("action", "処理", 90),
+            ("setting", "変換設定", 250),
+        ]:
+            tree.heading(key, text=text)
+            tree.column(key, width=width, anchor=tk.W)
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        def effective_encoding(stream: MediaStream) -> StreamEncodingOverride:
+            if stream.index in overrides:
+                return overrides[stream.index]
+            rule = next((item for item in variant.stream_rules if item.selector.matches(stream)), None)
+            if rule is None:
+                return StreamEncodingOverride(action="exclude")
+            if rule.encoding.action == "exclude":
+                return StreamEncodingOverride.from_dict(asdict(rule.encoding))
+            if stream.codec_type == "video" and not stream.attached_pic:
+                plan = resolve_stream_plan(profile, variant, probe, overrides)
+                task = next(item for item in plan.video_tasks if item.input_stream_index == stream.index)
+                return StreamEncodingOverride.from_dict(asdict(task.settings))
+            return StreamEncodingOverride.from_dict(asdict(rule.encoding))
+
+        def refresh(selected_index: Optional[int] = None) -> None:
+            tree.delete(*tree.get_children())
+            for stream in probe.streams:
+                encoding = effective_encoding(stream)
+                marker = "個別" if stream.index in overrides else "profile"
+                setting = encoding.ffmpeg_encoder or encoding.codec or "inherit/auto"
+                if encoding.backend:
+                    setting += f" / {encoding.backend}"
+                tree.insert(
+                    "",
+                    tk.END,
+                    iid=str(stream.index),
+                    values=(
+                        stream.index,
+                        "cover" if stream.attached_pic else stream.codec_type,
+                        stream.codec_name,
+                        stream.language or "-",
+                        stream.title or "-",
+                        encoding.action,
+                        f"{setting} ({marker})",
+                    ),
+                )
+            if selected_index is not None and tree.exists(str(selected_index)):
+                tree.selection_set(str(selected_index))
+                tree.see(str(selected_index))
+
+        def edit_selected() -> None:
+            selection = tree.selection()
+            if not selection:
+                return
+            index = int(selection[0])
+            stream = next(item for item in probe.streams if item.index == index)
+            current = effective_encoding(stream)
+            self._edit_file_stream_override(
+                dialog,
+                profile,
+                variant,
+                src,
+                stream,
+                current,
+                overrides,
+                lambda: refresh(index),
+            )
+
+        def reset_selected() -> None:
+            selection = tree.selection()
+            if not selection:
+                return
+            index = int(selection[0])
+            overrides.pop(index, None)
+            save_stream_overrides(self.paths, src, profile.id, variant.id, overrides)
+            refresh(index)
+
+        tree.bind("<Double-1>", lambda _event: edit_selected())
+        buttons = ttk.Frame(body, style="App.TFrame")
+        buttons.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(buttons, text="個別設定を編集", style="Accent.TButton", command=edit_selected).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="profile設定へ戻す", command=reset_selected).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="閉じる", command=dialog.destroy).pack(side=tk.RIGHT)
+        refresh()
+
+    def _edit_file_stream_override(
+        self,
+        parent: tk.Misc,
+        profile: EncodeProfile,
+        variant: OutputVariant,
+        src: Path,
+        stream: MediaStream,
+        current: StreamEncodingOverride,
+        overrides: Dict[int, StreamEncodingOverride],
+        on_saved,
+    ) -> None:
+        dialog = tk.Toplevel(parent)
+        dialog.title(f"stream {stream.index} 個別設定")
+        dialog.transient(parent)
+        dialog.geometry("700x590")
+        dialog.configure(bg=self.colors["bg"])
+        shell = ttk.Frame(dialog, style="App.TFrame")
+        shell.pack(fill=tk.BOTH, expand=True)
+        body = self._scrollable_tab(shell)
+        action_var = tk.StringVar(value=current.action)
+        backend_var = tk.StringVar(value=current.backend)
+        encoder_var = tk.StringVar(value=current.ffmpeg_encoder)
+        resources_var = tk.StringVar(value=",".join(current.resource_ids))
+        height_var = tk.StringVar(value="" if current.height is None else str(current.height))
+        rate_var = tk.StringVar(value=current.rate_mode)
+        cq_var = tk.StringVar(value="" if current.cq_value is None else str(current.cq_value))
+        bitrate_var = tk.StringVar(value=current.bitrate)
+        maxrate_var = tk.StringVar(value=current.maxrate)
+        bufsize_var = tk.StringVar(value=current.bufsize)
+        preset_var = tk.StringVar(value=current.preset)
+        tune_var = tk.StringVar(value=current.tune)
+        pix_fmt_var = tk.StringVar(value=current.pix_fmt)
+        scale_var = tk.StringVar(value=current.scale_flags)
+        codec_var = tk.StringVar(value=current.codec)
+        extra_var = tk.StringVar(value=current.extra_args)
+        frame = self._dialog_surface(
+            body,
+            f"{stream.codec_type}:{stream.ordinal} / index={stream.index} / {stream.codec_name}",
+        )
+        frame.pack(fill=tk.X, padx=12, pady=12)
+        self._dialog_combo(frame, "処理", action_var, ["transcode", "copy", "auto", "exclude"], 1, 0)
+        self._dialog_combo(
+            frame, "Backend", backend_var, ["", BACKEND_CPU, BACKEND_NVENC, BACKEND_QSV, BACKEND_AMF], 1, 1
+        )
+        self._dialog_entry(frame, "Video encoder", encoder_var, 2, 0)
+        self._dialog_entry(frame, "resource_ids", resources_var, 2, 1)
+        self._dialog_entry(frame, "高さ", height_var, 3, 0)
+        self._dialog_entry(frame, "Audio/Subtitle codec", codec_var, 3, 1)
+        self._dialog_combo(frame, "Rate", rate_var, ["", "CQ", "VBR", "ABR", "CBR"], 4, 0)
+        self._dialog_entry(frame, "CQ/CRF", cq_var, 4, 1)
+        self._dialog_entry(frame, "Bitrate", bitrate_var, 5, 0)
+        self._dialog_entry(frame, "Maxrate", maxrate_var, 5, 1)
+        self._dialog_entry(frame, "Bufsize", bufsize_var, 6, 0)
+        self._dialog_entry(frame, "Preset", preset_var, 6, 1)
+        self._dialog_entry(frame, "Tune", tune_var, 7, 0)
+        self._dialog_entry(frame, "Pix fmt", pix_fmt_var, 7, 1)
+        self._dialog_entry(frame, "Scale flags", scale_var, 8, 0)
+        self._dialog_entry(frame, "stream別追加引数", extra_var, 8, 1)
+        buttons = ttk.Frame(body, style="App.TFrame")
+        buttons.pack(fill=tk.X, padx=12, pady=(0, 12))
+
+        def save_override() -> None:
+            try:
+                height = int(height_var.get()) if height_var.get().strip() else None
+                cq_value = int(cq_var.get()) if cq_var.get().strip() else None
+            except ValueError:
+                messagebox.showerror("入力エラー", "高さとCQ/CRFは整数で入力してください。", parent=dialog)
+                return
+            overrides[stream.index] = StreamEncodingOverride(
+                action=action_var.get(),
+                backend=backend_var.get(),
+                ffmpeg_encoder=encoder_var.get(),
+                resource_ids=resources_var.get().split(","),
+                height=height,
+                rate_mode=rate_var.get(),
+                cq_value=cq_value,
+                bitrate=bitrate_var.get(),
+                maxrate=maxrate_var.get(),
+                bufsize=bufsize_var.get(),
+                preset=preset_var.get(),
+                tune=tune_var.get(),
+                pix_fmt=pix_fmt_var.get(),
+                scale_flags=scale_var.get(),
+                codec=codec_var.get(),
+                extra_args=extra_var.get(),
+            )
+            save_stream_overrides(self.paths, src, profile.id, variant.id, overrides)
+            on_saved()
+            dialog.destroy()
+
+        ttk.Button(buttons, text="保存", style="Accent.TButton", command=save_override).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="キャンセル", command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+
     def reorder_pending_jobs(self, row_ids: List[str]) -> None:
         positions = {row_id: index for index, row_id in enumerate(row_ids)}
         with self.lock:
@@ -3982,6 +4574,357 @@ class EncoderApp:
             self.root.after(0, self.update_output_encoder_controls)
         return True
 
+    def _run_preflight_command(self, command: List[str], output_path: Path) -> tuple[bool, str]:
+        output_path.unlink(missing_ok=True)
+        self.log(f"Preflight: {command_to_text(command)}")
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=False,
+                **no_window_subprocess_kwargs(),
+            )
+        except Exception as exc:
+            return False, str(exc)
+        detail = (result.stderr or result.stdout or "").strip()
+        if result.returncode != 0 or not output_path.exists():
+            tail = "\n".join(detail.splitlines()[-12:])
+            return False, f"exit {result.returncode}: {tail}".strip()
+        return True, detail
+
+    def _ffmpeg_preflight_identity(self) -> str:
+        try:
+            result = subprocess.run(
+                [str(self.paths.ffmpeg_path), "-version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+                **no_window_subprocess_kwargs(),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"FFmpeg version check failed: {exc}") from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"FFmpeg version check failed: exit {result.returncode}: {detail}")
+        first_line = (result.stdout or "").splitlines()
+        if not first_line:
+            raise RuntimeError("FFmpeg version check returned no version")
+        return f"{self.paths.ffmpeg_path.resolve()}|{first_line[0].strip()}"
+
+    def validate_output_container_static(
+        self,
+        container: str,
+        parent: Optional[tk.Misc] = None,
+    ) -> bool:
+        if not self.paths.ffmpeg_path.exists():
+            return True
+        probe_dir = self.paths.tmp_dir / "preflight"
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        output = probe_dir / f"{new_id('muxer')}.{normalize_container_extension(container)}"
+        command = [
+            str(self.paths.ffmpeg_path),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=size=16x16:rate=1:duration=0.1",
+            "-frames:v",
+            "1",
+            "-an",
+            "-y",
+            str(output),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+                **no_window_subprocess_kwargs(),
+            )
+        except Exception as exc:
+            messagebox.showerror("コンテナ検証エラー", str(exc), parent=parent)
+            return False
+        finally:
+            output.unlink(missing_ok=True)
+        if result.returncode != 0:
+            detail = "\n".join((result.stderr or "").strip().splitlines()[-8:])
+            messagebox.showerror(
+                "コンテナ検証エラー",
+                f".{container} をFFmpegの出力形式として使用できません。\n{detail}",
+                parent=parent,
+            )
+            return False
+        return True
+
+    def validate_variant_static(
+        self,
+        profile: EncodeProfile,
+        variant: OutputVariant,
+        parent: Optional[tk.Misc] = None,
+    ) -> bool:
+        if not self.validate_output_container_static(variant.container, parent):
+            return False
+        if not self.paths.ffmpeg_path.exists():
+            return True
+        capabilities = self.encoder_capabilities
+        if not capabilities:
+            try:
+                capabilities = encoder_capabilities(self.paths.ffmpeg_path)
+            except Exception as exc:
+                messagebox.showerror("Encoder検証エラー", str(exc), parent=parent)
+                return False
+        required = {encoder_codec(profile, variant)}
+        audio_encoder = variant_audio_codec(profile, variant)
+        if audio_encoder != "copy":
+            required.add(audio_encoder)
+        required.update(
+            rule.encoding.ffmpeg_encoder
+            for rule in variant.stream_rules
+            if rule.encoding.action == "transcode" and rule.encoding.ffmpeg_encoder
+        )
+        required.update(
+            rule.encoding.codec
+            for rule in variant.stream_rules
+            if rule.encoding.action in {"auto", "transcode"} and rule.encoding.codec and rule.encoding.codec != "copy"
+        )
+        missing = sorted(encoder for encoder in required if encoder not in capabilities)
+        if missing:
+            messagebox.showerror(
+                "Encoder検証エラー",
+                f"{variant.name}: FFmpegで使用できないencoderがあります: {', '.join(missing)}",
+                parent=parent,
+            )
+            return False
+        return True
+
+    def _sample_stream(self, path: Path, codec_type: str):
+        sample = probe_media(self.paths.ffprobe_path, path)
+        stream = next((item for item in sample.streams if item.codec_type == codec_type), None)
+        if stream is None and codec_type == "attachment":
+            stream = next((item for item in sample.streams if item.codec_type == "video" and item.attached_pic), None)
+        if stream is None:
+            raise RuntimeError(f"preflight output did not contain {codec_type} stream")
+        return stream
+
+    def _preflight_stream_plan(
+        self,
+        profile: EncodeProfile,
+        variant: OutputVariant,
+        src: Path,
+        plan: ResolvedStreamPlan,
+    ) -> ResolvedStreamPlan:
+        preflight_dir = self.paths.tmp_dir / "preflight"
+        preflight_dir.mkdir(parents=True, exist_ok=True)
+        samples: List[Path] = []
+        created: List[Path] = []
+        container = normalize_container_extension(variant.container)
+        try:
+            for task in plan.video_tasks:
+                sample = preflight_dir / f"{new_id('video')}.{container}"
+                created.append(sample)
+                resource_id = task.settings.resource_ids[0] if task.settings.resource_ids else CPU_RESOURCE_ID
+                command = build_video_stream_command(
+                    self.paths.ffmpeg_path,
+                    src,
+                    sample,
+                    profile,
+                    variant,
+                    task,
+                    start_seconds=task.start_time,
+                    duration_seconds=0.5,
+                    resource_id=resource_id,
+                )
+                ok, detail = self._run_preflight_command(command, sample)
+                if not ok:
+                    requested = (
+                        f"{task.settings.ffmpeg_encoder or 'configured encoder'} / "
+                        f"{task.settings.backend or resource_backend(resource_id)}"
+                    )
+                    task.use_muxer_default = True
+                    task.settings.backend = BACKEND_CPU
+                    task.settings.resource_ids = [CPU_RESOURCE_ID]
+                    task.settings.ffmpeg_encoder = ""
+                    fallback_command = build_video_stream_command(
+                        self.paths.ffmpeg_path,
+                        src,
+                        sample,
+                        profile,
+                        variant,
+                        task,
+                        start_seconds=task.start_time,
+                        duration_seconds=0.5,
+                        resource_id=CPU_RESOURCE_ID,
+                    )
+                    fallback_ok, fallback_detail = self._run_preflight_command(fallback_command, sample)
+                    if not fallback_ok:
+                        raise RuntimeError(
+                            f"{src.name} / {variant.name} / video:{task.input_ordinal} preflight failed\n"
+                            f"requested: {detail}\nfallback: {fallback_detail}"
+                        )
+                    task.fallback_reason = (
+                        f"{src.name} / {variant.name} / video:{task.input_ordinal}: {requested} → FFmpeg muxer default"
+                    )
+                sample_stream = self._sample_stream(sample, "video")
+                task.expected_codec = sample_stream.codec_name
+                task.expected_width = sample_stream.width
+                task.expected_height = sample_stream.height
+                if task.fallback_reason:
+                    requested_label = task.fallback_reason.split(" →", 1)[0]
+                    task.fallback_reason = f"{requested_label} → {task.expected_codec} / {BACKEND_CPU}"
+                samples.append(sample)
+
+            for stream in plan.mux_streams:
+                if stream.codec_type in {"attachment", "data"}:
+                    # FFmpeg may not produce a valid file containing only an
+                    # attachment or data stream.  Their actual container
+                    # compatibility is exercised by the combined mux below.
+                    stream.expected_codec = stream.source_codec
+                    continue
+                sample = preflight_dir / f"{new_id(stream.codec_type)}.{container}"
+                created.append(sample)
+                first_packet = probe_stream_first_packet_time(
+                    self.paths.ffprobe_path,
+                    src,
+                    stream.codec_type,
+                    stream.input_ordinal,
+                )
+                command = build_aux_stream_sample_command(
+                    self.paths.ffmpeg_path,
+                    src,
+                    sample,
+                    stream,
+                    start_seconds=first_packet,
+                )
+                ok, detail = self._run_preflight_command(command, sample)
+                if not ok and stream.action == "auto":
+                    requested = stream.codec or "copy"
+                    fallback_command = build_aux_stream_sample_command(
+                        self.paths.ffmpeg_path,
+                        src,
+                        sample,
+                        stream,
+                        use_muxer_default=True,
+                        start_seconds=first_packet,
+                    )
+                    fallback_ok, fallback_detail = self._run_preflight_command(fallback_command, sample)
+                    fallback_label = "FFmpeg muxer default"
+                    if not fallback_ok and stream.codec_type == "subtitle":
+                        original_codec = stream.codec
+                        attempted: List[str] = []
+                        for candidate in ("mov_text", "webvtt", "ass", "srt"):
+                            if candidate == stream.source_codec or candidate == original_codec:
+                                continue
+                            stream.codec = candidate
+                            candidate_command = build_aux_stream_sample_command(
+                                self.paths.ffmpeg_path,
+                                src,
+                                sample,
+                                stream,
+                                start_seconds=first_packet,
+                            )
+                            candidate_ok, candidate_detail = self._run_preflight_command(candidate_command, sample)
+                            attempted.append(f"{candidate}: {candidate_detail}")
+                            if candidate_ok:
+                                fallback_ok = True
+                                fallback_label = candidate
+                                break
+                        if not fallback_ok:
+                            stream.codec = original_codec
+                            fallback_detail += "\n" + "\n".join(attempted)
+                    if not fallback_ok:
+                        raise RuntimeError(
+                            f"{src.name} / {variant.name} / {stream.codec_type}:{stream.input_ordinal} "
+                            f"preflight failed\nrequested: {detail}\nfallback: {fallback_detail}"
+                        )
+                    if fallback_label == "FFmpeg muxer default":
+                        stream.codec = ""
+                    stream.action = "transcode"
+                    stream.fallback_reason = (
+                        f"{src.name} / {variant.name} / {stream.codec_type}:{stream.input_ordinal}: "
+                        f"{requested} → {fallback_label}"
+                    )
+                elif not ok:
+                    raise RuntimeError(
+                        f"{src.name} / {variant.name} / {stream.codec_type}:{stream.input_ordinal} "
+                        f"cannot be preserved: {detail}"
+                    )
+                sample_stream = self._sample_stream(sample, stream.codec_type)
+                stream.expected_codec = sample_stream.codec_name
+                stream.expected_width = sample_stream.width
+                stream.expected_height = sample_stream.height
+                if stream.fallback_reason:
+                    requested_label = stream.fallback_reason.split(" →", 1)[0]
+                    stream.fallback_reason = f"{requested_label} → {stream.expected_codec} / {BACKEND_CPU}"
+
+            combined = preflight_dir / f"{new_id('combined')}.{container}"
+            created.append(combined)
+            mux_command = build_stream_mux_command(
+                self.paths.ffmpeg_path,
+                samples,
+                src,
+                combined,
+                profile,
+                variant,
+                plan,
+                sample_duration=max((task.start_time for task in plan.video_tasks), default=0.0) + 0.5,
+            )
+            ok, detail = self._run_preflight_command(mux_command, combined)
+            if not ok:
+                raise RuntimeError(f"{src.name} / {variant.name} combined mux preflight failed: {detail}")
+            return plan
+        finally:
+            for path in created:
+                path.unlink(missing_ok=True)
+
+    def preflight_specs(self, profile: EncodeProfile, specs: List[JobSpec]) -> List[str]:
+        fallbacks: List[str] = []
+        ffmpeg_identity = self._ffmpeg_preflight_identity()
+        for index, spec in enumerate(specs, start=1):
+            src = Path(spec.src)
+            variant = variant_by_id(profile, spec.variant_id)
+            self.log(f"Preflight {index}/{len(specs)}: {src.name} / {variant.name}")
+            if spec.resolved_stream_plan is not None:
+                requested_plan = ResolvedStreamPlan.from_dict(asdict(spec.resolved_stream_plan))
+                if requested_plan is None:
+                    raise RuntimeError("saved stream plan is invalid")
+                if requested_plan.source_fingerprint != source_fingerprint(src):
+                    raise RuntimeError(f"{src.name}: source changed after the saved preflight")
+            else:
+                probe = probe_media(self.paths.ffprobe_path, src)
+                overrides = load_stream_overrides(self.paths, src, profile.id, variant.id)
+                requested_plan = resolve_stream_plan(profile, variant, probe, overrides)
+            cache_key = f"{ffmpeg_identity}:{requested_plan.source_fingerprint}:{requested_plan.fingerprint()}"
+            cached = self.preflight_cache.get(cache_key)
+            if cached is not None:
+                plan = ResolvedStreamPlan.from_dict(asdict(cached))
+                if plan is None:
+                    raise RuntimeError("preflight cache is invalid")
+            else:
+                plan = self._preflight_stream_plan(profile, variant, src, requested_plan)
+                self.preflight_cache[cache_key] = ResolvedStreamPlan.from_dict(asdict(plan)) or plan
+            spec.resolved_stream_plan = plan
+            if plan.video_tasks:
+                resources = plan.video_tasks[0].settings.resource_ids
+                spec.assigned_resource_id = resources[0] if resources else CPU_RESOURCE_ID
+            fallbacks.extend(plan.fallbacks)
+        return fallbacks
+
     def prepare_ffmpeg_and_start(self, profile: EncodeProfile, specs: List[JobSpec]) -> None:
         with self.lock:
             busy = self.running or self.preparing
@@ -4006,16 +4949,70 @@ class EncoderApp:
         )
         thread.start()
 
+    def validate_variant_incoming(
+        self,
+        profile: EncodeProfile,
+        variant: OutputVariant,
+        parent: Optional[tk.Misc] = None,
+    ) -> None:
+        if self.running or self.preparing:
+            messagebox.showwarning("実行中", "実行または別の検証が進行中です。", parent=parent)
+            return
+        validation_profile = EncodeProfile.from_dict(asdict(profile), self.paths, self.gpus)
+        validation_profile.outputs = [OutputVariant.from_dict(asdict(variant))]
+        try:
+            files = scan_profile_files(validation_profile)
+        except OSError as exc:
+            messagebox.showerror("検証エラー", str(exc), parent=parent)
+            return
+        specs = build_job_specs(validation_profile, [item.path for item in files])
+        if not specs:
+            messagebox.showinfo("検証対象なし", "未完了のIncomingファイルがありません。", parent=parent)
+            return
+        self.preparing = True
+        self._sync_runtime_controls()
+
+        def worker() -> None:
+            try:
+                ensure_ffmpeg_available(self.paths, auto_download=True, progress=self.log)
+                fallbacks = self.preflight_specs(validation_profile, specs)
+            except Exception as exc:
+                self.root.after(0, lambda error=exc: finish_error(error))
+                return
+            self.root.after(0, lambda: finish_success(fallbacks))
+
+        def finish_error(error: Exception) -> None:
+            self.preparing = False
+            self._sync_runtime_controls()
+            messagebox.showerror("互換性検証エラー", str(error), parent=parent)
+
+        def finish_success(fallbacks: List[str]) -> None:
+            self.preparing = False
+            self._sync_runtime_controls()
+            detail = "\n".join(f"・{item}" for item in fallbacks)
+            message = f"{len(specs)}件の出力を検証しました。"
+            if detail:
+                message += "\n\n次のfallbackが必要です。\n" + detail
+            else:
+                message += "\n指定設定のまま変換できます。"
+            messagebox.showinfo("互換性検証", message, parent=parent)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _prepare_ffmpeg_worker(self, profile: EncodeProfile, specs: List[JobSpec], auto_download: bool) -> None:
         try:
             ensure_ffmpeg_available(self.paths, auto_download=auto_download, progress=self.log)
             if auto_download:
                 self.log("FFmpeg / FFprobe is ready.")
             capabilities = encoder_capabilities(self.paths.ffmpeg_path)
+            fallbacks = self.preflight_specs(profile, specs)
         except Exception as exc:
             self.root.after(0, lambda error=exc: self._finish_ffmpeg_prepare_error(error))
             return
-        self.root.after(0, lambda: self._finish_ffmpeg_prepare_success(profile, specs, capabilities))
+        self.root.after(
+            0,
+            lambda: self._finish_ffmpeg_prepare_success(profile, specs, capabilities, fallbacks),
+        )
 
     def _finish_ffmpeg_prepare_error(self, error: Exception) -> None:
         with self.lock:
@@ -4028,6 +5025,7 @@ class EncoderApp:
         profile: EncodeProfile,
         specs: List[JobSpec],
         capabilities: Dict[str, Dict[str, object]],
+        fallbacks: Optional[List[str]] = None,
     ) -> None:
         with self.lock:
             self.preparing = False
@@ -4040,6 +5038,13 @@ class EncoderApp:
             self.log("FFmpeg encoder capability scan returned no encoders.")
         self.update_output_encoder_controls()
         self._sync_runtime_controls()
+        if fallbacks:
+            detail = "\n".join(f"・{item}" for item in fallbacks)
+            if not messagebox.askyesno(
+                "互換変換の確認",
+                f"次のstreamでFFmpeg既定codecへのfallbackが必要です。\nこの内容で開始しますか？\n\n{detail}",
+            ):
+                return
         if not self.validate_encoder_capabilities_before_run(profile, specs):
             return
         self.start_specs(profile, specs, save=True)
@@ -4055,6 +5060,25 @@ class EncoderApp:
         for variant in profile.outputs:
             if not variant.enabled:
                 continue
+            stream_errors = validate_stream_rules(variant)
+            known_resources = {resource.id for resource in profile.hardware_resources}
+            for rule in variant.stream_rules:
+                unknown = [
+                    resource_id for resource_id in rule.encoding.resource_ids if resource_id not in known_resources
+                ]
+                if unknown:
+                    stream_errors.append(f"{rule.name}: 未登録resource: {', '.join(unknown)}")
+                if rule.encoding.backend and rule.encoding.rate_mode:
+                    if not backend_accepts_rate_mode(rule.encoding.backend, rule.encoding.rate_mode):
+                        stream_errors.append(
+                            f"{rule.name}: {rule.encoding.backend}では{rule.encoding.rate_mode}を使用できません"
+                        )
+            if stream_errors:
+                messagebox.showerror(
+                    "入力エラー",
+                    f"{variant.name}: stream設定を修正してください。\n" + "\n".join(stream_errors),
+                )
+                return False
             resources = variant_resource_ids(profile, variant)
             if not resources:
                 messagebox.showerror("入力エラー", f"{variant.name}: 使用可能なリソースを選択してください。")
@@ -4094,41 +5118,52 @@ class EncoderApp:
                 variant = variant_by_id(profile, spec.variant_id)
             except ValueError:
                 continue
-            encoder = encoder_codec(profile, variant)
-            if encoder not in self.encoder_capabilities:
-                messagebox.showerror("FFmpeg error", f"{variant.name}: FFmpeg encoder is not available: {encoder}")
-                return False
-
-            resource_ids = variant_resource_ids(profile, variant)
-            resource_id = (
-                spec.assigned_resource_id
-                if spec.assigned_resource_id in resource_ids
-                else (resource_ids[0] if resource_ids else "")
-            )
-            split_mode = str(variant.split_encode_mode or "").strip().lower()
-            split_mode_applies = encoder in {"hevc_nvenc", "av1_nvenc"}
-            if not split_mode_applies:
-                split_mode = ""
-            caps = self.encoder_capabilities.get(encoder, {})
-            supports_split = bool(caps.get("supports_split_encode_mode"))
-            split_modes = self.split_encode_modes_for_encoder(encoder)
-            if split_mode and split_mode not in {"auto", "default"}:
-                if not supports_split:
-                    messagebox.showerror(
-                        "FFmpeg error",
-                        f"{variant.name}: {encoder} does not expose -split_encode_mode in this FFmpeg build.",
+            plan = spec.resolved_stream_plan
+            encoder_targets: List[tuple[str, List[str], bool, str]] = []
+            if plan is not None:
+                for task in plan.video_tasks:
+                    if task.use_muxer_default or task.settings.action in {"copy", "auto"}:
+                        continue
+                    encoder_targets.append(
+                        (
+                            task.settings.ffmpeg_encoder,
+                            list(task.settings.resource_ids),
+                            True,
+                            f"{variant.name} video:{task.input_ordinal}",
+                        )
                     )
-                    return False
-                if split_modes and split_mode not in split_modes:
-                    messagebox.showerror(
-                        "FFmpeg error",
-                        f"{variant.name}: split_encode_mode={split_mode} is not exposed by this FFmpeg build.",
-                    )
-                    return False
+            else:
+                encoder_targets.append(
+                    (encoder_codec(profile, variant), variant_resource_ids(profile, variant), True, variant.name)
+                )
 
-            target_resource_ids = resource_ids if encoder.endswith("_nvenc") else [resource_id]
-            for target_resource_id in target_resource_ids:
-                smoke_targets[(encoder, target_resource_id, split_mode)] = variant.name
+            for encoder, resource_ids, _is_video, label in encoder_targets:
+                if encoder not in self.encoder_capabilities:
+                    messagebox.showerror("FFmpeg error", f"{label}: FFmpeg encoder is not available: {encoder}")
+                    return False
+                resource_id = resource_ids[0] if resource_ids else CPU_RESOURCE_ID
+                split_mode = str(variant.split_encode_mode or "").strip().lower()
+                if encoder not in {"hevc_nvenc", "av1_nvenc"}:
+                    split_mode = ""
+                caps = self.encoder_capabilities.get(encoder, {})
+                supports_split = bool(caps.get("supports_split_encode_mode"))
+                split_modes = self.split_encode_modes_for_encoder(encoder)
+                if split_mode and split_mode not in {"auto", "default"}:
+                    if not supports_split:
+                        messagebox.showerror(
+                            "FFmpeg error",
+                            f"{label}: {encoder} does not expose -split_encode_mode in this FFmpeg build.",
+                        )
+                        return False
+                    if split_modes and split_mode not in split_modes:
+                        messagebox.showerror(
+                            "FFmpeg error",
+                            f"{label}: split_encode_mode={split_mode} is not exposed by this FFmpeg build.",
+                        )
+                        return False
+                target_resource_ids = resource_ids if encoder.endswith("_nvenc") else [resource_id]
+                for target_resource_id in target_resource_ids:
+                    smoke_targets[(encoder, target_resource_id, split_mode)] = label
 
         for (encoder, resource_id, split_mode), variant_name in smoke_targets.items():
             self.log(f"Smoke test: {encoder} on {resource_id or 'default'}")
@@ -4222,7 +5257,14 @@ class EncoderApp:
                 joined_video_path_for(self.paths, src, job.profile, job.variant),
                 temp_audio_path_for(self.paths, src, job.profile, job.variant),
                 temp_output_path_for(self.paths, src, job.profile, job.variant),
+                job.tmp_out,
             ]
+            plan = job.spec.resolved_stream_plan
+            if plan is not None:
+                paths.extend(
+                    stream_joined_video_path_for(self.paths, src, job.profile, job.variant, task, plan)
+                    for task in plan.video_tasks
+                )
             for path in paths:
                 try:
                     path.unlink(missing_ok=True)
@@ -4240,7 +5282,12 @@ class EncoderApp:
                 variant = variant_by_id(profile, spec.variant_id)
             except ValueError:
                 continue
-            resource_ids = variant_resource_ids(profile, variant)
+            plan = spec.resolved_stream_plan
+            resource_ids = (
+                plan.video_tasks[0].settings.resource_ids
+                if plan is not None and plan.video_tasks
+                else variant_resource_ids(profile, variant)
+            )
             if spec.assigned_resource_id not in resource_ids:
                 spec.assigned_resource_id = resource_ids[0] if resource_ids else CPU_RESOURCE_ID
         return specs
@@ -4293,15 +5340,22 @@ class EncoderApp:
         self.job_counter += 1
         src = Path(spec.src)
         variant = variant_by_id(profile, spec.variant_id)
-        resource_ids = variant_resource_ids(profile, variant)
+        plan = spec.resolved_stream_plan
+        resource_ids = (
+            plan.video_tasks[0].settings.resource_ids
+            if plan is not None and plan.video_tasks
+            else variant_resource_ids(profile, variant)
+        )
         resource_id = (
             spec.assigned_resource_id
             if spec.assigned_resource_id in resource_ids
             else (resource_ids[0] if resource_ids else "")
         )
         spec.assigned_resource_id = resource_id
-        tmp_out = temp_output_path_for(self.paths, src, profile, variant)
         out_file = output_path_for(profile, src, variant)
+        tmp_out = out_file.with_name(
+            f".{out_file.stem}.{variant.id}.partial.{normalize_container_extension(variant.container)}"
+        )
         log_file = self.paths.log_dir / f"job_{self.job_counter}_{variant.folder_name}.log"
         return RuntimeJob(
             job_id=self.job_counter,
@@ -4369,6 +5423,51 @@ class EncoderApp:
                 self.active_resource_slot_indexes.pop(resource_id, None)
                 self.active_resource_slots.pop(resource_id, None)
             self.active_jobs.pop(job.job_id, None)
+
+    def switch_job_resource(
+        self,
+        job: RuntimeJob,
+        profile: EncodeProfile,
+        resource_id: str,
+        reserve_all: bool = True,
+    ) -> bool:
+        target = resource_id or CPU_RESOURCE_ID
+        limits = self.resource_slot_limits(profile)
+        limit = max(1, limits.get(target, 1))
+        required = limit if reserve_all else 1
+        if job.resource_id == target and len(job.resource_slot_indexes) == required:
+            return True
+
+        with self.lock:
+            current = job.resource_id or CPU_RESOURCE_ID
+            used_indexes = self.active_resource_slot_indexes.get(current, set())
+            for index in job.resource_slot_indexes:
+                used_indexes.discard(index)
+            if used_indexes:
+                self.active_resource_slot_indexes[current] = used_indexes
+                self.active_resource_slots[current] = len(used_indexes)
+            else:
+                self.active_resource_slot_indexes.pop(current, None)
+                self.active_resource_slots.pop(current, None)
+            job.resource_slot_indexes = []
+            job.resource_slots_reserved = 0
+
+        while not self.was_stopped():
+            with self.lock:
+                used = self.active_resource_slot_indexes.setdefault(target, set())
+                available = [index for index in range(limit) if index not in used]
+                if len(available) >= required:
+                    assigned = available[:required]
+                    used.update(assigned)
+                    self.active_resource_slots[target] = len(used)
+                    job.resource_id = target
+                    job.resource_slot = assigned[0]
+                    job.resource_slot_indexes = assigned
+                    job.resource_slots_reserved = len(assigned)
+                    self.active_jobs[job.job_id] = job
+                    return True
+            time.sleep(0.2)
+        return False
 
     def dequeue_runnable_jobs(self, profile: EncodeProfile) -> List[RuntimeJob]:
         slot_limits = self.resource_slot_limits(profile)
@@ -4454,129 +5553,135 @@ class EncoderApp:
     def run_job(self, job: RuntimeJob) -> None:
         src = Path(job.spec.src)
         segment_seconds = max(60, variant_segment_minutes(job.profile, job.variant) * 60)
-        # job_key includes source size/mtime, so keep one segment root for this run.
-        segment_root = segment_dir_for(self.paths, src, job.profile, job.variant)
-        joined_video = joined_video_path_for(self.paths, src, job.profile, job.variant)
-        audio_out = temp_audio_path_for(self.paths, src, job.profile, job.variant)
         resource_detail = self.resource_detail_label(job) or "default"
         self.log(f"Start {job.variant.name}: {src.name} / {resource_detail}")
         self.log(f"Log file: {job.log_file}")
 
-        segment_root.mkdir(parents=True, exist_ok=True)
-
         try:
             with open(job.log_file, "w", encoding="utf-8", errors="replace") as log_fp:
-                duration = probe_duration(self.paths.ffprobe_path, src)
-                ranges = segment_ranges(duration, segment_seconds)
+                probe = probe_media(self.paths.ffprobe_path, src)
+                plan = job.spec.resolved_stream_plan
+                if plan is None:
+                    raise RuntimeError("resolved stream plan is missing; run preflight before starting")
+                if plan.source_fingerprint != source_fingerprint(src):
+                    raise RuntimeError("source changed after preflight; run preflight again")
+
+                ranges_by_task: List[List[tuple[float, Optional[float]]]] = []
+                for task in plan.video_tasks:
+                    task_duration = task.duration
+                    if task_duration is None and probe.duration is not None:
+                        task_duration = max(0.0, probe.duration - task.start_time)
+                    base_ranges = segment_ranges(task_duration, segment_seconds)
+                    ranges_by_task.append([(start + task.start_time, duration) for start, duration in base_ranges])
 
                 with self.lock:
-                    job.total_segments = len(ranges)
-                    job.message = f"0/{len(ranges)} segments"
+                    job.total_segments = sum(len(ranges) for ranges in ranges_by_task)
+                    job.message = f"0/{job.total_segments} segments"
                     job.segment_progress = {}
                     job.completed_segment_indexes = set()
                     job.status = "実行中"
-
-                segment_files: List[Path] = [
-                    segment_root / segment_file_name(job.variant, index, src=src) for index, _range in enumerate(ranges)
-                ]
-                if not self.encode_segments_parallel(job, src, ranges, segment_files, segment_root, log_fp):
-                    return
-                if not self.wait_until_unpaused(job):
-                    self._mark_job_cancelled(job)
-                    return
-
-                concat_file = segment_root / "concat.txt"
-                write_concat_file(concat_file, segment_files)
-                if joined_video.exists():
-                    joined_video.unlink(missing_ok=True)
-                concat_command = build_concat_command(
-                    self.paths.ffmpeg_path,
-                    concat_file,
-                    joined_video,
-                    job.profile,
-                    job.variant,
-                )
-                log_fp.write("\nConcat command:\n")
-                log_fp.write(command_to_text(concat_command) + "\n\n")
-                log_fp.flush()
-
-                with self.lock:
-                    job.status = "結合中"
-                    job.message = "finalizing"
-
-                ret = self.run_process(job, concat_command, log_fp, None)
-                if self.was_stopped() or ret != 0 or not joined_video.exists():
-                    joined_video.unlink(missing_ok=True)
-                    if self.was_stopped():
+                joined_videos: List[Path] = []
+                segment_roots: List[Path] = []
+                progress_offset = 0
+                for task_index, task in enumerate(plan.video_tasks):
+                    ranges = ranges_by_task[task_index]
+                    resource_ids = task.settings.resource_ids or [CPU_RESOURCE_ID]
+                    resource_id = resource_ids[task_index % len(resource_ids)]
+                    if not self.switch_job_resource(job, job.profile, resource_id):
                         self._mark_job_cancelled(job)
-                    else:
-                        self._mark_job_failed(job, f"concat failed: exit {ret}")
-                    return
-
-                ffprobe_available = self.paths.ffprobe_path.exists()
-                has_audio = probe_has_audio(self.paths.ffprobe_path, src)
-                if has_audio:
+                        return
+                    segment_root = stream_segment_dir_for(self.paths, src, job.profile, job.variant, task, plan)
+                    joined_video = stream_joined_video_path_for(self.paths, src, job.profile, job.variant, task, plan)
+                    segment_roots.append(segment_root)
+                    joined_videos.append(joined_video)
+                    segment_root.mkdir(parents=True, exist_ok=True)
+                    segment_files = [
+                        segment_root / segment_file_name(job.variant, index, src=src)
+                        for index, _range in enumerate(ranges)
+                    ]
+                    if not self.encode_segments_parallel(
+                        job,
+                        src,
+                        ranges,
+                        segment_files,
+                        segment_root,
+                        log_fp,
+                        task,
+                        progress_offset,
+                    ):
+                        return
+                    progress_offset += len(ranges)
                     if not self.wait_until_unpaused(job):
                         self._mark_job_cancelled(job)
                         return
-                    if not audio_out.exists():
-                        audio_command = build_audio_command(
-                            self.paths.ffmpeg_path, src, audio_out, job.profile, job.variant
-                        )
-                        log_fp.write("\nAudio command:\n")
-                        log_fp.write(command_to_text(audio_command) + "\n\n")
-                        log_fp.flush()
-
-                        with self.lock:
-                            job.status = "音声処理中"
-                            job.message = "processing audio"
-
-                        ret = self.run_process(job, audio_command, log_fp, None)
-                        if self.was_stopped() or ret != 0 or not audio_out.exists():
-                            audio_out.unlink(missing_ok=True)
-                            if self.was_stopped():
-                                self._mark_job_cancelled(job)
-                            else:
-                                self._mark_job_failed(job, f"audio failed: exit {ret}")
-                            return
-
-                    if job.tmp_out.exists():
-                        job.tmp_out.unlink(missing_ok=True)
-                    mux_command = build_mux_command(
+                    concat_file = segment_root / "concat.txt"
+                    write_concat_file(concat_file, segment_files)
+                    joined_video.unlink(missing_ok=True)
+                    concat_command = build_concat_command(
                         self.paths.ffmpeg_path,
+                        concat_file,
                         joined_video,
-                        audio_out,
-                        job.tmp_out,
                         job.profile,
                         job.variant,
                     )
-                    log_fp.write("\nMux command:\n")
-                    log_fp.write(command_to_text(mux_command) + "\n\n")
+                    log_fp.write(f"\nVideo {task.input_ordinal} concat command:\n")
+                    log_fp.write(command_to_text(concat_command) + "\n\n")
                     log_fp.flush()
-
                     with self.lock:
-                        job.status = "Mux中"
-                        job.message = "muxing"
-
-                    ret = self.run_process(job, mux_command, log_fp, None)
-                    if self.was_stopped() or ret != 0 or not job.tmp_out.exists():
-                        job.tmp_out.unlink(missing_ok=True)
+                        job.status = "結合中"
+                        job.message = f"video {task_index + 1}/{len(plan.video_tasks)}"
+                    ret = self.run_process(job, concat_command, log_fp, None)
+                    if self.was_stopped() or ret != 0 or not joined_video.exists():
+                        joined_video.unlink(missing_ok=True)
                         if self.was_stopped():
                             self._mark_job_cancelled(job)
                         else:
-                            self._mark_job_failed(job, f"mux failed: exit {ret}")
+                            self._mark_job_failed(job, f"video {task.input_ordinal} concat failed: exit {ret}")
                         return
-                else:
-                    reason = "No audio stream detected" if ffprobe_available else "FFprobe unavailable"
-                    self.skip_audio_output(job, src, joined_video, log_fp, reason)
 
+                if not self.switch_job_resource(job, job.profile, CPU_RESOURCE_ID, reserve_all=False):
+                    self._mark_job_cancelled(job)
+                    return
                 job.out_file.parent.mkdir(parents=True, exist_ok=True)
-                if job.out_file.exists():
-                    job.out_file.unlink()
-                shutil.move(str(job.tmp_out), str(job.out_file))
-                joined_video.unlink(missing_ok=True)
-                audio_out.unlink(missing_ok=True)
-                shutil.rmtree(segment_root, ignore_errors=True)
+                job.tmp_out.unlink(missing_ok=True)
+                mux_command = build_stream_mux_command(
+                    self.paths.ffmpeg_path,
+                    joined_videos,
+                    src,
+                    job.tmp_out,
+                    job.profile,
+                    job.variant,
+                    plan,
+                )
+                log_fp.write("\nMux command:\n")
+                log_fp.write(command_to_text(mux_command) + "\n\n")
+                log_fp.flush()
+                with self.lock:
+                    job.status = "Mux中"
+                    job.message = "muxing all streams"
+                ret = self.run_process(job, mux_command, log_fp, None)
+                if self.was_stopped() or ret != 0 or not job.tmp_out.exists():
+                    job.tmp_out.unlink(missing_ok=True)
+                    if self.was_stopped():
+                        self._mark_job_cancelled(job)
+                    else:
+                        self._mark_job_failed(job, f"mux failed: exit {ret}")
+                    return
+
+                errors, warnings = validate_output_against_plan(self.paths.ffprobe_path, job.tmp_out, plan)
+                for warning in warnings:
+                    self.log(f"{src.name}: {warning}")
+                    log_fp.write(f"Validation warning: {warning}\n")
+                if errors:
+                    job.tmp_out.unlink(missing_ok=True)
+                    self._mark_job_failed(job, "output validation failed: " + "; ".join(errors))
+                    return
+
+                job.tmp_out.replace(job.out_file)
+                for joined_video in joined_videos:
+                    joined_video.unlink(missing_ok=True)
+                for segment_root in segment_roots:
+                    shutil.rmtree(segment_root, ignore_errors=True)
                 with self.lock:
                     job.status = "完了"
                     job.progress = 100.0
@@ -4596,11 +5701,13 @@ class EncoderApp:
         segment_files: List[Path],
         segment_root: Path,
         log_fp,
+        task: VideoStreamTask,
+        progress_offset: int,
     ) -> bool:
         pending: queue.Queue[int] = queue.Queue()
         for index, final_segment in enumerate(segment_files):
             if final_segment.exists():
-                self._mark_segment_done(job, index)
+                self._mark_segment_done(job, progress_offset + index)
                 continue
             pending.put(index)
 
@@ -4639,12 +5746,13 @@ class EncoderApp:
                     if partial_segment.exists():
                         partial_segment.unlink(missing_ok=True)
 
-                    command = build_ffmpeg_command(
+                    command = build_video_stream_command(
                         self.paths.ffmpeg_path,
                         src,
                         partial_segment,
                         job.profile,
                         job.variant,
+                        task,
                         start_seconds=start,
                         duration_seconds=duration_seconds,
                         resource_id=job.resource_id,
@@ -4657,14 +5765,14 @@ class EncoderApp:
                     with self.lock:
                         job.current_segment = index + 1
                         job.status = "実行中"
-                        job.message = f"segment {index + 1}/{len(ranges)}"
+                        job.message = f"video {task.input_ordinal} / segment {index + 1}/{len(ranges)}"
 
                     ret = self.run_process(
                         job,
                         command,
                         log_fp,
                         duration_seconds,
-                        segment_index=index,
+                        segment_index=progress_offset + index,
                         log_lock=log_lock,
                     )
                     if self.was_stopped():
@@ -4676,7 +5784,7 @@ class EncoderApp:
                         return
 
                     partial_segment.replace(final_segment)
-                    self._mark_segment_done(job, index)
+                    self._mark_segment_done(job, progress_offset + index)
                 finally:
                     pending.task_done()
 
@@ -4695,6 +5803,7 @@ class EncoderApp:
         return True
 
     def skip_audio_output(self, job: RuntimeJob, src: Path, joined_video: Path, log_fp, reason: str) -> None:
+        """Compatibility helper for legacy single-audio resume states."""
         message = f"{reason}; keeping video-only output."
         log_fp.write(f"\nAudio skipped: {message}\n\n")
         log_fp.flush()
@@ -4702,8 +5811,7 @@ class EncoderApp:
         with self.lock:
             job.status = "映像のみ"
             job.message = "video-only"
-        if job.tmp_out.exists():
-            job.tmp_out.unlink(missing_ok=True)
+        job.tmp_out.unlink(missing_ok=True)
         shutil.move(str(joined_video), str(job.tmp_out))
 
     def run_process(
@@ -4895,6 +6003,7 @@ class EncoderApp:
                         dest = archive_dir / f"{base}_{n}{suffix}"
                         n += 1
                 shutil.move(str(src), str(dest))
+                remove_stream_overrides_for_source(self.paths, src)
                 moved += 1
                 self.log(f"Move source: {src.name}")
             except Exception as exc:

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -32,7 +33,11 @@ from ffmpeg_nvenc_gui.core import (
     GpuInfo,
     HardwareResource,
     JobSpec,
+    MediaProbe,
     OutputVariant,
+    StreamEncodingOverride,
+    StreamRule,
+    StreamSelector,
     audio_containers_for_codec,
     build_audio_command,
     build_concat_command,
@@ -40,6 +45,8 @@ from ffmpeg_nvenc_gui.core import (
     build_job_specs,
     build_mux_command,
     build_paths,
+    build_stream_mux_command,
+    build_video_stream_command,
     clear_cpu_resource_cache,
     clear_state,
     cpu_resources_from_wmi_data,
@@ -52,6 +59,7 @@ from ffmpeg_nvenc_gui.core import (
     hardware_resources_from_gpus,
     load_profiles,
     load_state,
+    load_stream_overrides,
     missing_profile_dirs,
     missing_rate_fields,
     normalize_audio_codec,
@@ -62,17 +70,25 @@ from ffmpeg_nvenc_gui.core import (
     output_path_for,
     parse_ffmpeg_args,
     probe_has_audio,
+    probe_media,
+    probe_stream_first_packet_time,
     profile_archive_dir,
     profile_from_state,
     profile_input_dir,
     profile_output_dir,
     profile_to_dict,
+    resolve_stream_plan,
     resumable_specs,
+    save_profiles,
     save_state,
+    save_stream_overrides,
     scan_profile_files,
+    scope_stream_extra_args,
     segment_dir_for,
     segment_file_name,
     segment_ranges,
+    validate_output_against_plan,
+    validate_stream_rules,
     variant_input_dir,
     variant_output_dir,
     variant_resource_ids,
@@ -331,6 +347,521 @@ def test_probe_has_audio_fails_fast_on_probe_errors(tmp_path: Path, monkeypatch)
         assert "permission denied" in str(exc)
     else:
         raise AssertionError("expected ffprobe invocation failure to raise")
+
+
+def test_media_probe_parses_all_stream_types_chapters_and_metadata(tmp_path: Path):
+    probe = MediaProbe.from_ffprobe(
+        tmp_path / "multi.mkv",
+        {
+            "format": {"format_name": "matroska", "duration": "12.5", "tags": {"TITLE": "Archive"}},
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1920,
+                    "height": 1080,
+                    "tags": {"language": "jpn", "title": "Main"},
+                    "disposition": {"default": 1},
+                },
+                {"index": 1, "codec_type": "video", "codec_name": "hevc", "disposition": {}},
+                {
+                    "index": 2,
+                    "codec_type": "video",
+                    "codec_name": "mjpeg",
+                    "disposition": {"attached_pic": 1},
+                },
+                {"index": 3, "codec_type": "audio", "codec_name": "aac", "tags": {"language": "eng"}},
+                {"index": 4, "codec_type": "subtitle", "codec_name": "subrip"},
+                {"index": 5, "codec_type": "attachment", "codec_name": "ttf"},
+                {"index": 6, "codec_type": "data", "codec_name": "bin_data"},
+            ],
+            "chapters": [{"id": 0, "start_time": "0", "end_time": "5", "tags": {"title": "Intro"}}],
+        },
+    )
+
+    assert probe.duration == 12.5
+    assert [stream.ordinal for stream in probe.streams[:3]] == [0, 1, 2]
+    assert probe.streams[2].attached_pic is True
+    assert probe.streams[0].language == "jpn"
+    assert probe.tags["title"] == "Archive"
+    assert probe.chapters[0].tags["title"] == "Intro"
+
+
+def test_probe_stream_first_packet_time_uses_selected_stream(tmp_path: Path, monkeypatch):
+    captured = []
+
+    class Result:
+        returncode = 0
+        stdout = '{"packets":[{"pts_time":"42.25"}]}'
+        stderr = ""
+
+    def fake_run(command, **_kwargs):
+        captured.extend(command)
+        return Result()
+
+    monkeypatch.setattr(core_module.subprocess, "run", fake_run)
+
+    value = probe_stream_first_packet_time(tmp_path / "ffprobe.exe", tmp_path / "source.mkv", "subtitle", 2)
+
+    assert value == 42.25
+    assert captured[captured.index("-select_streams") + 1] == "s:2"
+
+
+def test_stream_rules_resolve_all_video_and_aux_streams_with_file_override(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    probe = MediaProbe.from_ffprobe(
+        tmp_path / "multi.mkv",
+        {
+            "format": {"format_name": "matroska", "duration": "2"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "disposition": {"default": 1}},
+                {
+                    "index": 1,
+                    "codec_type": "video",
+                    "codec_name": "hevc",
+                    "start_time": "0.5",
+                    "duration": "1.25",
+                },
+                {"index": 2, "codec_type": "audio", "codec_name": "aac", "tags": {"language": "jpn"}},
+                {"index": 3, "codec_type": "subtitle", "codec_name": "subrip"},
+                {
+                    "index": 4,
+                    "codec_type": "video",
+                    "codec_name": "mjpeg",
+                    "disposition": {"attached_pic": 1},
+                },
+                {"index": 5, "codec_type": "attachment", "codec_name": "ttf"},
+                {"index": 6, "codec_type": "data", "codec_name": "bin_data"},
+            ],
+        },
+    )
+    overrides = {
+        1: StreamEncodingOverride(
+            action="transcode",
+            backend=BACKEND_CPU,
+            ffmpeg_encoder="libx265",
+            resource_ids=[CPU_RESOURCE_ID],
+            height=720,
+            rate_mode="CQ",
+            cq_value=24,
+        ),
+        2: StreamEncodingOverride(action="transcode", codec="aac", bitrate="128k"),
+    }
+
+    plan = resolve_stream_plan(profile, variant, probe, overrides)
+
+    assert [task.input_stream_index for task in plan.video_tasks] == [0, 1]
+    assert plan.video_tasks[1].settings.ffmpeg_encoder == "libx265"
+    assert plan.video_tasks[1].settings.resource_ids == [CPU_RESOURCE_ID]
+    assert plan.video_tasks[1].settings.height == 720
+    assert plan.video_tasks[1].duration == 1.25
+    assert plan.video_tasks[1].start_time == 0.5
+    assert [(stream.input_stream_index, stream.action) for stream in plan.mux_streams] == [
+        (2, "transcode"),
+        (3, "auto"),
+        (4, "auto"),
+        (5, "copy"),
+        (6, "copy"),
+    ]
+    assert plan.mux_streams[0].bitrate == "128k"
+    assert plan.mux_streams[2].output_ordinal == 2
+
+
+def test_cover_before_normal_video_gets_non_conflicting_output_ordinal(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    probe = MediaProbe.from_ffprobe(
+        tmp_path / "cover-first.mkv",
+        {
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_type": "video",
+                    "codec_name": "mjpeg",
+                    "disposition": {"attached_pic": 1},
+                },
+                {"index": 1, "codec_type": "video", "codec_name": "h264"},
+            ]
+        },
+    )
+
+    plan = resolve_stream_plan(profile, profile.outputs[0], probe)
+
+    assert plan.video_tasks[0].output_ordinal == 0
+    assert plan.mux_streams[0].output_ordinal == 1
+
+
+def test_stream_extra_args_are_forced_to_the_resolved_stream_index():
+    assert scope_stream_extra_args("-b 192k -metadata title=Commentary", "audio", 2) == [
+        "-b:a:2",
+        "192k",
+        "-metadata:s:a:2",
+        "title=Commentary",
+    ]
+
+
+def test_stream_rule_order_and_static_validation(tmp_path: Path):
+    variant = make_profile(tmp_path).outputs[0]
+    preferred = StreamRule(
+        name="Japanese audio",
+        selector=StreamSelector(kind="audio", languages=["jpn"]),
+        encoding=StreamEncodingOverride(action="transcode", codec="flac"),
+    )
+    variant.stream_rules.insert(0, preferred)
+    probe = MediaProbe.from_ffprobe(
+        tmp_path / "audio.mkv",
+        {
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac", "tags": {"language": "jpn"}},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac", "tags": {"language": "eng"}},
+            ]
+        },
+    )
+
+    plan = resolve_stream_plan(make_profile(tmp_path), variant, probe)
+
+    assert plan.mux_streams[0].codec == "flac"
+    assert plan.mux_streams[1].codec == "copy"
+    assert validate_stream_rules(variant) == []
+    variant.stream_rules[0].encoding.extra_args = "-map 0"
+    assert any("使用できません" in error for error in validate_stream_rules(variant))
+
+
+def test_multistream_commands_use_absolute_indexes_and_preserve_structure(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    probe = MediaProbe.from_ffprobe(
+        tmp_path / "source.mkv",
+        {
+            "streams": [
+                {"index": 1, "codec_type": "video", "codec_name": "h264", "tags": {"title": "Main"}},
+                {"index": 3, "codec_type": "video", "codec_name": "hevc", "start_time": "0.5"},
+                {"index": 4, "codec_type": "audio", "codec_name": "aac", "tags": {"language": "jpn"}},
+                {"index": 7, "codec_type": "subtitle", "codec_name": "subrip", "disposition": {"forced": 1}},
+            ],
+            "chapters": [{"id": 0, "start_time": "0", "end_time": "1", "tags": {"title": "One"}}],
+        },
+    )
+    plan = resolve_stream_plan(profile, variant, probe)
+    video_command = build_video_stream_command(
+        tmp_path / "ffmpeg.exe",
+        Path(probe.path),
+        tmp_path / "video.mkv",
+        profile,
+        variant,
+        plan.video_tasks[1],
+    )
+    mux_command = build_stream_mux_command(
+        tmp_path / "ffmpeg.exe",
+        [tmp_path / "v0.mkv", tmp_path / "v1.mkv"],
+        Path(probe.path),
+        tmp_path / "out.mkv",
+        profile,
+        variant,
+        plan,
+    )
+
+    assert video_command[video_command.index("-map") : video_command.index("-map") + 2] == ["-map", "0:3"]
+    assert [mux_command[index + 1] for index, token in enumerate(mux_command) if token == "-map"] == [
+        "0:v:0",
+        "1:v:0",
+        "2:4",
+        "2:7",
+    ]
+    assert mux_command[mux_command.index("-map_metadata") + 1] == "2"
+    assert mux_command[mux_command.index("-map_chapters") + 1] == "2"
+    assert mux_command[mux_command.index("-itsoffset") + 1] == "00:00:00.500"
+    assert "-shortest" not in mux_command
+    assert "-metadata:s:a:0" in mux_command
+    assert "-disposition:s:0" in mux_command
+
+
+def test_stream_override_store_is_invalidated_when_source_changes(tmp_path: Path):
+    paths = build_paths(tmp_path)
+    src = tmp_path / "Incoming" / "clip.mkv"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(b"one")
+    overrides = {1: StreamEncodingOverride(action="exclude")}
+
+    save_stream_overrides(paths, src, "profile", "variant", overrides)
+
+    assert load_stream_overrides(paths, src, "profile", "variant")[1].action == "exclude"
+    src.write_bytes(b"changed-content")
+    assert load_stream_overrides(paths, src, "profile", "variant") == {}
+
+
+def test_profile_v3_backup_and_resolved_plan_state_round_trip(tmp_path: Path):
+    paths = build_paths(tmp_path)
+    profile = make_profile(tmp_path)
+    paths.config_file.write_text(
+        json.dumps({"version": 2, "profiles": [profile_to_dict(profile)]}),
+        encoding="utf-8",
+    )
+    save_profiles(paths, [profile])
+
+    assert json.loads(paths.config_file.read_text(encoding="utf-8"))["version"] == 3
+    assert paths.config_file.with_name(f"{paths.config_file.stem}.v2.json.bak").exists()
+
+    src = Path(profile.input_dir) / "clip.mkv"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"source")
+    probe = MediaProbe.from_ffprobe(src, {"streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]})
+    plan = resolve_stream_plan(profile, profile.outputs[0], probe)
+    spec = JobSpec(str(src), profile.id, profile.outputs[0].id, resolved_stream_plan=plan)
+    save_state(paths, profile, [spec])
+
+    loaded = load_state(paths)
+    assert loaded is not None and loaded["version"] == 4
+    restored = resumable_specs(profile_from_state(loaded, paths, []), loaded)
+    assert restored[0].resolved_stream_plan is not None
+    assert restored[0].resolved_stream_plan.source_fingerprint == plan.source_fingerprint
+
+
+def test_saved_stream_plan_is_preflighted_and_ffmpeg_change_invalidates_cache(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    src = tmp_path / "resume.mkv"
+    src.write_bytes(b"source")
+    probe = MediaProbe.from_ffprobe(
+        src,
+        {
+            "format": {"duration": "1.0"},
+            "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}],
+        },
+    )
+    plan = resolve_stream_plan(profile, variant, probe)
+    app = EncoderApp.__new__(EncoderApp)
+    app.paths = build_paths(tmp_path)
+    app.paths.ffmpeg_path.parent.mkdir(parents=True, exist_ok=True)
+    app.paths.ffmpeg_path.write_bytes(b"ffmpeg")
+    app.preflight_cache = {}
+    app.log = lambda _message: None
+    ffmpeg_identity = {"value": "ffmpeg version 1"}
+    app._ffmpeg_preflight_identity = lambda: ffmpeg_identity["value"]
+    calls = []
+
+    def fake_preflight(_profile, _variant, _src, requested_plan):
+        calls.append(requested_plan.fingerprint())
+        return requested_plan
+
+    app._preflight_stream_plan = fake_preflight
+    app.preflight_specs(
+        profile,
+        [JobSpec(str(src), profile.id, variant.id, resolved_stream_plan=plan)],
+    )
+    assert len(calls) == 1
+    app.preflight_specs(
+        profile,
+        [JobSpec(str(src), profile.id, variant.id, resolved_stream_plan=plan)],
+    )
+    assert len(calls) == 1
+
+    ffmpeg_identity["value"] = "ffmpeg version 2"
+    app.preflight_specs(
+        profile,
+        [JobSpec(str(src), profile.id, variant.id, resolved_stream_plan=plan)],
+    )
+    assert len(calls) == 2
+
+
+def test_real_ffmpeg_multistream_mux_and_validation(tmp_path: Path):
+    repo_root = Path(core_module.__file__).resolve().parents[2]
+    ffmpeg = repo_root / "ffmpeg" / "ffmpeg.exe"
+    ffprobe = repo_root / "ffmpeg" / "ffprobe.exe"
+    if not ffmpeg.exists() or not ffprobe.exists():
+        pytest.skip("bundled FFmpeg is not available")
+    subtitle = tmp_path / "subtitle.srt"
+    subtitle.write_text("1\n00:00:00,000 --> 00:00:00,800\nhello\n", encoding="utf-8")
+    metadata = tmp_path / "chapters.txt"
+    metadata.write_text(
+        ";FFMETADATA1\ntitle=Fixture\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=800\ntitle=Intro\n",
+        encoding="utf-8",
+    )
+    attachment = tmp_path / "font.txt"
+    attachment.write_text("font attachment fixture", encoding="utf-8")
+    source = tmp_path / "source.mkv"
+    create = [
+        str(ffmpeg),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=red:size=64x64:rate=5:duration=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=blue:size=64x64:rate=5:duration=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=880:duration=1",
+        "-i",
+        str(subtitle),
+        "-i",
+        str(metadata),
+        "-map",
+        "0:v",
+        "-map",
+        "1:v",
+        "-map",
+        "2:a",
+        "-map",
+        "3:a",
+        "-map",
+        "4:s",
+        "-map_metadata",
+        "5",
+        "-map_chapters",
+        "5",
+        "-attach",
+        str(attachment),
+        "-metadata:s:t:0",
+        "mimetype=text/plain",
+        "-metadata:s:t:0",
+        "filename=font.txt",
+        "-metadata:s:a:0",
+        "language=jpn",
+        "-metadata:s:a:1",
+        "language=eng",
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "aac",
+        "-c:s",
+        "srt",
+        "-y",
+        str(source),
+    ]
+    subprocess.run(create, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    profile = make_profile(tmp_path)
+    variant = profile.outputs[0]
+    variant.container = "mkv"
+    variant.backend = BACKEND_CPU
+    variant.ffmpeg_encoder = "libx264"
+    variant.cpu_codec = "libx264"
+    variant.resource_ids = [CPU_RESOURCE_ID]
+    variant.height = None
+    probe = probe_media(ffprobe, source)
+    plan = resolve_stream_plan(profile, variant, probe)
+    assert [stream.codec_type for stream in probe.streams].count("video") == 2
+    assert [stream.codec_type for stream in probe.streams].count("audio") == 2
+    assert [stream.codec_type for stream in probe.streams].count("attachment") == 1
+    assert len(probe.chapters) == 1
+
+    app = EncoderApp.__new__(EncoderApp)
+    app.paths = build_paths(tmp_path)
+    app.paths.ffmpeg_path = ffmpeg
+    app.paths.ffprobe_path = ffprobe
+    app.log = lambda _message: None
+    plan = app._preflight_stream_plan(profile, variant, source, plan)
+    assert {(task.expected_width, task.expected_height) for task in plan.video_tasks} == {(64, 64)}
+
+    mp4_variant = OutputVariant.from_dict(asdict(variant))
+    mp4_variant.id = "mp4-streams"
+    mp4_variant.container = "mp4"
+    attachment_index = next(stream.index for stream in probe.streams if stream.codec_type == "attachment")
+    with pytest.raises(RuntimeError, match="combined mux preflight failed"):
+        app._preflight_stream_plan(
+            profile,
+            mp4_variant,
+            source,
+            resolve_stream_plan(profile, mp4_variant, probe),
+        )
+    excluded_attachment = {attachment_index: StreamEncodingOverride(action="exclude")}
+    mp4_plan = app._preflight_stream_plan(
+        profile,
+        mp4_variant,
+        source,
+        resolve_stream_plan(profile, mp4_variant, probe, excluded_attachment),
+    )
+    mp4_subtitle = next(stream for stream in mp4_plan.mux_streams if stream.codec_type == "subtitle")
+    assert mp4_subtitle.expected_codec == "mov_text"
+    assert "mov_text" in mp4_subtitle.fallback_reason
+
+    webm_variant = OutputVariant.from_dict(asdict(variant))
+    webm_variant.id = "webm-streams"
+    webm_variant.container = "webm"
+    webm_variant.ffmpeg_encoder = "libvpx-vp9"
+    webm_variant.cpu_codec = "libvpx-vp9"
+    webm_plan = app._preflight_stream_plan(
+        profile,
+        webm_variant,
+        source,
+        resolve_stream_plan(profile, webm_variant, probe, excluded_attachment),
+    )
+    assert {task.expected_codec for task in webm_plan.video_tasks} == {"vp9"}
+    assert {stream.expected_codec for stream in webm_plan.mux_streams if stream.codec_type == "audio"} == {"opus"}
+    assert (
+        next(stream for stream in webm_plan.mux_streams if stream.codec_type == "subtitle").expected_codec == "webvtt"
+    )
+
+    ts_variant = OutputVariant.from_dict(asdict(variant))
+    ts_variant.id = "ts-streams"
+    ts_variant.container = "ts"
+    with pytest.raises(RuntimeError, match="subtitle"):
+        app._preflight_stream_plan(
+            profile,
+            ts_variant,
+            source,
+            resolve_stream_plan(profile, ts_variant, probe, excluded_attachment),
+        )
+
+    video_outputs = []
+    for task in plan.video_tasks:
+        output = tmp_path / f"video-{task.input_stream_index}.mkv"
+        command = build_video_stream_command(ffmpeg, source, output, profile, variant, task)
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        video_outputs.append(output)
+    output = tmp_path / "final.mkv"
+    subprocess.run(
+        build_stream_mux_command(ffmpeg, video_outputs, source, output, profile, variant, plan),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    errors, warnings = validate_output_against_plan(ffprobe, output, plan)
+    assert errors == []
+    assert not [warning for warning in warnings if "title" in warning]
+    invalid_resolution_plan = type(plan).from_dict(asdict(plan))
+    assert invalid_resolution_plan is not None
+    invalid_resolution_plan.video_tasks[0].expected_width = 65
+    resolution_errors, _warnings = validate_output_against_plan(ffprobe, output, invalid_resolution_plan)
+    assert any("width: expected=65, actual=64" in error for error in resolution_errors)
+
+    runtime_output = tmp_path / "runtime-final.mkv"
+    runtime_job = RuntimeJob(
+        job_id=1,
+        spec=JobSpec(str(source), profile.id, variant.id, CPU_RESOURCE_ID, resolved_stream_plan=plan),
+        profile=profile,
+        variant=variant,
+        tmp_out=tmp_path / ".runtime-final.partial.mkv",
+        out_file=runtime_output,
+        log_file=tmp_path / "runtime.log",
+        resource_id=CPU_RESOURCE_ID,
+        resource_slots_reserved=1,
+        resource_slot_indexes=[0],
+    )
+    app.lock = threading.Lock()
+    app.stop_requested = False
+    app.paused = False
+    app.active_jobs = {runtime_job.job_id: runtime_job}
+    app.active_resource_slots = {CPU_RESOURCE_ID: 1}
+    app.active_resource_slot_indexes = {CPU_RESOURCE_ID: {0}}
+    app.run_job(runtime_job)
+
+    assert runtime_job.status == "完了"
+    assert runtime_output.exists()
+    runtime_errors, _runtime_warnings = validate_output_against_plan(ffprobe, runtime_output, plan)
+    assert runtime_errors == []
 
 
 def test_faststart_is_only_used_for_mov_mp4_family(tmp_path: Path):
@@ -2133,6 +2664,41 @@ def test_resource_slot_indices_do_not_overlap_after_release(tmp_path: Path):
 
     assert app.reserve_resource_slots(third, {"nvidia:0": 3}) is True
     assert third.resource_slot_indexes == [0, 1, 2]
+
+
+def test_final_mux_resource_switch_reserves_one_cpu_slot(tmp_path: Path):
+    profile = make_profile(tmp_path)
+    profile.hardware_resources = [
+        HardwareResource(
+            id=CPU_RESOURCE_ID,
+            label="CPU",
+            kind="cpu",
+            backend=BACKEND_CPU,
+            concurrency_slots=4,
+        )
+    ]
+    app = EncoderApp.__new__(EncoderApp)
+    app.lock = threading.Lock()
+    app.stop_requested = False
+    app.active_jobs = {}
+    app.active_resource_slots = {CPU_RESOURCE_ID: 4}
+    app.active_resource_slot_indexes = {CPU_RESOURCE_ID: {0, 1, 2, 3}}
+    job = RuntimeJob(
+        job_id=1,
+        spec=JobSpec("source.mkv", profile.id, profile.outputs[0].id),
+        profile=profile,
+        variant=profile.outputs[0],
+        tmp_out=tmp_path / "tmp.mkv",
+        out_file=tmp_path / "out.mkv",
+        log_file=tmp_path / "job.log",
+        resource_id=CPU_RESOURCE_ID,
+        resource_slots_reserved=4,
+        resource_slot_indexes=[0, 1, 2, 3],
+    )
+
+    assert app.switch_job_resource(job, profile, CPU_RESOURCE_ID, reserve_all=False) is True
+    assert job.resource_slots_reserved == 1
+    assert len(job.resource_slot_indexes) == 1
 
 
 def test_run_process_publishes_process_under_lock_and_honors_stop(tmp_path: Path):
